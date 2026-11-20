@@ -83,8 +83,6 @@ impl SourceCard {
     }
 }
 
-// List
-
 #[derive(Template)]
 #[template(path = "sources/list.html")]
 struct SourcesListTemplate {
@@ -128,7 +126,7 @@ pub async fn sources_list(
     let f_q = params.get("q").cloned().unwrap_or_default();
 
     // The filter clause set lives once in the repo (`SourceListFilter`);
-    // every value flows through a bind.
+    // every value flows through a bind
     let filter = sources::SourceListFilter {
         enabled: enabled_filter_value(&f_enabled),
         with_errors: f_error,
@@ -141,7 +139,7 @@ pub async fn sources_list(
             .map(|mut row| {
                 // The list shows the URL of every source: the password
                 // of the userinfo and the value of a credential-bearing
-                // query pair are secrets and stay in the database.
+                // query pair are secrets and stay in the database
                 row.url = mask_url_secrets(&row.url);
                 row
             })
@@ -172,8 +170,6 @@ pub async fn sources_list(
         StatusCode::OK,
     )
 }
-
-// Form (create / edit)
 
 /// Display/edit values of the source form (all as strings, as typed). The
 /// pipeline is carried by the widget HTML, not by these values.
@@ -234,14 +230,14 @@ fn all_protocols_with_selection(selected: &[String]) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// Render one screen of the source editor. The four call sites — the two
-/// GET renders and the two validation-error replays — share the chrome
-/// and the response shape here; what differs between them (the form id,
-/// the action, the values, the protocol selection, the errors, the
-/// status, the header-note flag) rides in the arguments. A caller that
-/// re-renders a posted submission parses the form once
-/// ([`form_values_from`]) and hands the parsed value over, so the values
-/// and the protocol selection cannot drift apart.
+/// Render one screen of the source editor. The four call sites (the two
+/// GET renders and the two validation-error replays) share the chrome
+/// and the response shape here; what differs (the form id, the action,
+/// the values, the protocol selection, the errors, the status, the
+/// header-note flag) rides in the arguments. A caller that re-renders a
+/// posted submission parses the form once ([`form_values_from`]) and
+/// hands the parsed value over, so the values and the protocol selection
+/// cannot drift apart.
 #[allow(clippy::too_many_arguments)]
 fn render_source_form(
     state: &AdminState,
@@ -290,7 +286,7 @@ pub async fn source_form(State(state): State<AdminState>, headers: HeaderMap) ->
         cache_ttl_seconds: "3600".into(),
         ..Default::default()
     };
-    // New source: nothing stored yet, an empty builder widget.
+    // New source: nothing stored yet, an empty builder widget
     let widget_html = widget_from_stored(
         lang.clone(),
         &state.csrf_for(&headers),
@@ -329,7 +325,7 @@ pub async fn source_edit_form(
     };
     // The widget is prefilled from the stored pipeline when the builder can
     // represent it; otherwise it opens in raw mode with the stored JSON and
-    // the raw-mode warning.
+    // the raw-mode warning
     let raw_value = source
         .pipeline
         .as_ref()
@@ -345,10 +341,10 @@ pub async fn source_edit_form(
     let values = SourceFormValues {
         name: source.name.clone(),
         slug: source.slug.clone().unwrap_or_default(),
-        // The stored token is a hash, so the field shows a placeholder.
+        // The stored token is a hash, so the field shows a placeholder
         access_token: token_placeholder(source.access_token.as_deref()),
         // The secrets of the URL are masked: the form hands the masks
-        // back on submit, and the save puts the stored values under them.
+        // back on submit, and the save puts the stored values under them
         url: mask_url_secrets(&source.url),
         url_masked: mask_url_secrets(&source.url) != source.url,
         enabled: source.enabled,
@@ -410,9 +406,9 @@ fn values_for_select(source: &Source) -> Vec<String> {
 }
 
 // The URL and the header values carry the credentials of the upstream
-// feed. The admin screens show them, so the secrets are masked there and
-// restored from the stored row when the form comes back — the mask is a
-// display form, never the value that is stored.
+// feed. The admin screens show them masked and restore them from the
+// stored row when the form comes back: the mask is a display form,
+// never the value that is stored.
 
 /// The password of a URL's userinfo, if it has one.
 fn url_password(url: &str) -> Option<&str> {
@@ -433,7 +429,7 @@ fn mask_url_userinfo(url: &str) -> String {
     };
     let userinfo = &url[start..end];
     let Some(colon) = userinfo.find(':') else {
-        // A userinfo without a password carries no secret.
+        // A userinfo without a password carries no secret
         return url.to_string();
     };
     let masked = mask_secret(&userinfo[colon + 1..]);
@@ -587,11 +583,7 @@ async fn build_source_from_form(
 ) -> Result<(Source, Option<Source>), FormError> {
     let mut errors: Vec<(String, String)> = Vec::new();
 
-    // The stored row is read once, up front: the form hands back the
-    // secrets it masked (the password of the URL, the header values),
-    // and the updated row carries the creation stamp of the row it
-    // replaces. A row that cannot be read is a broken database or a
-    // vanished source, never a form error.
+    // The stored row is read once, up front (see [`read_stored_source`])
     let existing = read_stored_source(state, existing_id).await?;
 
     let name = form_field(form, "name");
@@ -612,7 +604,7 @@ async fn build_source_from_form(
     // The source's own access token guards `/src` (the profile token does
     // not extend there). Same contract as the profile form: the stored
     // token is a hash, so the field shows a placeholder, an unchanged
-    // placeholder keeps the stored token, and an empty field clears it.
+    // placeholder keeps the stored token, and an empty field clears it
     let access_token = parse_access_token(
         lang,
         &form_field(form, "access_token"),
@@ -620,11 +612,11 @@ async fn build_source_from_form(
         &mut errors,
     );
     // The preferred family is parsed before the URL so the save-time SSRF
-    // check can vet the host under the source's own constraint.
+    // check can vet the host under the source's own constraint
     let ip_family = parse_ip_family(lang, &form_field(form, "ip_family"), &mut errors);
     // The URL: the edit form shows the secrets of the URL masked, so the
-    // stored values go back where the form still carries those masks.
-    // The restored URL is the one that is vetted and stored.
+    // stored values go back where the form still carries those masks
+    // The restored URL is the one that is vetted and stored
     let url = validate_source_url(
         state,
         lang,
@@ -648,7 +640,7 @@ async fn build_source_from_form(
     );
     // Pipeline: in builder mode the JSON is generated from the widget
     // fields server-side (a stale `pipeline` textarea, if any, is ignored);
-    // in raw mode the textarea is the input, as before.
+    // in raw mode the textarea is the input
     let pipeline = pipeline_from_form(form, lang, &mut errors);
 
     if !errors.is_empty() {
@@ -666,7 +658,7 @@ async fn build_source_from_form(
             url,
             // HTML checkbox semantics: an unchecked checkbox submits nothing,
             // a checked one submits its value (`1` in the source form), so
-            // the flag is read from the value, not from the field's presence.
+            // the flag is read from the value, not from the field's presence
             enabled: is_checkbox_on(form, "enabled"),
             encoding,
             input_format,
@@ -680,7 +672,7 @@ async fn build_source_from_form(
             updated_at: now,
             // The fetcher owns these three columns: the admin write path
             // does not carry them (`sources::update_settings` leaves the
-            // stored values alone), so the assembled row leaves them empty.
+            // stored values alone), so the assembled row leaves them empty
             last_fetched_at: None,
             last_error: None,
             error_class: None,
@@ -701,7 +693,7 @@ async fn read_stored_source(
     match existing_id {
         Some(id) => match sources::get(&state.pool, id).await {
             Ok(Some(stored)) => Ok(Some(stored)),
-            // The row is gone: the save has nothing to update.
+            // The row is gone: the save has nothing to update
             Ok(None) => Err(FormError::Server(fumox_core::Error::NotFound(format!(
                 "source {id}"
             )))),
@@ -797,7 +789,7 @@ async fn validate_source_url(
     // The stored row was vetted when it was saved: an edit that leaves
     // the URL and its preferred family alone skips the vet, so saving a
     // renamed source does not depend on the feed host's DNS answering
-    // this time too.
+    // this time too
     } else if !url_and_family_unchanged(existing, &url, ip_family)
         && let Err(issue) = fetcher::vet_url_with_policy(
             &url,
@@ -945,7 +937,7 @@ fn parse_headers(
         }
         let value = value.trim().to_string();
         // Two lines for one header are a mistake, not a silent overwrite:
-        // the second value would replace the first without a trace.
+        // the second value would replace the first without a trace
         if headers_map.insert(key.clone(), value).is_some() {
             errors.push((
                 "headers".into(),
@@ -957,7 +949,7 @@ fn parse_headers(
     // rendered from them. A mask is valid only under the key it was
     // rendered for: under any other key it is reported, so the operator
     // enters the value again instead of a mask reaching the upstream
-    // fetch as a credential.
+    // fetch as a credential
     if let Some(stored_headers) = existing.and_then(|s| s.headers.as_ref())
         && let Some(key) = restore_masked_headers(&mut headers_map, stored_headers)
     {
@@ -1046,7 +1038,7 @@ fn restore_masked_headers(
         return None;
     }
     // The masks of the stored values: a submitted value that equals one
-    // of them is a mask, whichever key it was rendered for.
+    // of them is a mask, whichever key it was rendered for
     let masks: std::collections::BTreeSet<String> =
         stored.values().map(|value| mask_secret(value)).collect();
     let mut offender: Option<String> = None;
@@ -1096,13 +1088,13 @@ fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
         url_masked: url_carries_mask(&url),
         url,
         // Same read as the save (`is_checkbox_on`): the replayed form
-        // shows the checkbox exactly the way the row would be saved.
+        // shows the checkbox exactly the way the row would be saved
         enabled: is_checkbox_on(form, "enabled"),
         encoding: form_field(form, "encoding"),
         input_format: form_field(form, "input_format"),
         ip_family: form_field(form, "ip_family"),
         // Every value in order, an empty one included: the multi-select
-        // replays exactly what was posted.
+        // replays exactly what was posted
         protocols: form
             .iter()
             .filter(|(k, _)| k == "protocols")
@@ -1136,7 +1128,7 @@ pub async fn source_create(
                 pipeline_error,
             );
             // The posted form is parsed once; the values and the protocol
-            // selection come from the same parse.
+            // selection come from the same parse
             let values = form_values_from(&form);
             return render_source_form(
                 &state,
@@ -1189,14 +1181,14 @@ pub async fn source_update(
                 pipeline_error,
             );
             // The posted form is parsed once; the values and the protocol
-            // selection come from the same parse.
+            // selection come from the same parse
             let values = form_values_from(&form);
             // Both notes follow the stored row, computed the same way as
             // the GET render: they are about the values the form shows
             // masked, not about what was posted. The assembled row does
             // not exist here (validation failed), so the row is read
             // once for both; a row that cannot be read keeps the notes
-            // on, the previous render's assumption.
+            // on, the previous render's assumption
             let (headers_masked_note, token_masked_note) =
                 match sources::get(&state.pool, &id).await {
                     Ok(Some(stored)) => (
@@ -1231,7 +1223,7 @@ pub async fn source_update(
     // Saved → effective immediately. The freshness stamp lives on the
     // source row (`sources::update_settings` resets it when a
     // fetch-relevant field changed); only the rendered outputs need
-    // dropping here.
+    // dropping here
     state
         .caches
         .invalidate_processed_for_source(&source.id)
@@ -1252,8 +1244,6 @@ pub async fn source_update(
         Redirect::to(&format!("/admin/sources/{}", source.id)).into_response()
     }
 }
-
-// Card
 
 #[derive(Template)]
 #[template(path = "sources/detail.html")]
@@ -1333,14 +1323,14 @@ pub async fn source_detail(
 
     // The cursor of the requested page: the same journal token the global
     // screen pages by. A token of another sort is not a position in this
-    // one, so the log falls back to its first page.
+    // one, so the log falls back to its first page
     let page = params
         .get("cur")
         .and_then(|token| decode_fetch_cursor(token))
         .map(|(cursor, direction)| fetch_log::FetchLogPage { cursor, direction });
 
     // The rows over-fetch by one: the extra row says whether a further
-    // page exists without a second count.
+    // page exists without a second count
     let mut log: Vec<fetch_log::FetchLogRow> = match fetch_log::list_for_source(
         &state.pool,
         &id,
@@ -1355,7 +1345,7 @@ pub async fn source_detail(
 
     // The navigation of the log, assembled exactly like the global
     // journal screen's: the over-fetched row dropped on a backwards page,
-    // then the neighbours of the page.
+    // then the neighbours of the page
     let backward = page
         .as_ref()
         .is_some_and(|page| page.direction == fetch_log::FetchLogDirection::Backward);
@@ -1419,7 +1409,7 @@ fn render_source_detail(
         source.slug.clone().unwrap_or_else(|| source.id.clone())
     );
     // Absolute serve link: the host the admin panel was opened on with the
-    // public port from [server].bind.
+    // public port from [server].bind
     let base = match state.serve_base(peer, headers) {
         Ok(b) => b,
         Err(err) => {
@@ -1467,7 +1457,7 @@ fn render_source_detail(
             active: "sources",
             csrf: state.csrf_for(headers),
             // The secrets of the URL are secrets: the card shows their
-            // masks, the full URL stays in the database.
+            // masks, the full URL stays in the database
             url_display: mask_url_secrets(&source.url),
             url_masked: mask_url_secrets(&source.url) != source.url,
             source: SourceCard::from_source(&source),
@@ -1506,7 +1496,7 @@ pub async fn source_log(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     // The fragment belongs to a card: a source that is gone gets the
-    // same not-found the detail page returns, not an empty log.
+    // same not-found the detail page returns, not an empty log
     match sources::get(&state.pool, &id).await {
         Ok(Some(_)) => {}
         Ok(None) => return not_found(lang, "err.source_not_found"),
@@ -1524,8 +1514,6 @@ pub async fn source_log(
         StatusCode::OK,
     )
 }
-
-// Actions
 
 /// The enabled badge of the source card, as a standalone fragment: the
 /// detail page includes the same file, and the toggle action re-renders it
@@ -1604,7 +1592,7 @@ pub async fn source_toggle(
     };
     let enabled = !source.enabled;
     // The toggle writes the flag and nothing else: the settings columns
-    // keep the values they have.
+    // keep the values they have
     match sources::set_enabled(&state.pool, &id, enabled).await {
         Ok(true) => {}
         Ok(false) => return not_found(lang, "err.source_not_found"),
@@ -1613,7 +1601,7 @@ pub async fn source_toggle(
     source.enabled = enabled;
     source.updated_at = now_ts();
     // The enabled flip reset the row's freshness stamp (a fetch-relevant
-    // change, see `sources::set_enabled`); the rendered outputs go here.
+    // change, see `sources::set_enabled`); the rendered outputs go here
     state.caches.invalidate_processed_for_source(&id).await;
     let message = if source.enabled {
         lang.t("src.enabled_toast")
@@ -1626,10 +1614,10 @@ pub async fn source_toggle(
         &format!("/admin/sources/{id}"),
         // The wrapper id must survive the swap (the form's hx-target points
         // at it), and the toggle button must flip with the state, it lives
-        // outside the badge, so it travels along as an out-of-band swap.
+        // outside the badge, so it travels along as an out-of-band swap
         // Both elements are rendered from the same fragment templates the
         // detail page includes, so the swap cannot drop the aria attributes
-        // or drift from the initial markup.
+        // or drift from the initial markup
         toggle_swap_fragment(&lang, &source, &state.csrf_for(&headers)),
         message,
     )
@@ -1650,9 +1638,9 @@ pub async fn source_refresh(
     }
     match state.refresh_tx.try_send(id.clone()) {
         Ok(()) => {}
-        // The bounded queue is full: the loop is behind on its dispatches.
+        // The bounded queue is full: the loop is behind on its dispatches
         // The click is dropped here instead of piling up behind it; the
-        // operator gets the "busy" toast, the log names the dropped one.
+        // operator gets the "busy" toast, the log names the dropped one
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             tracing::warn!(
                 source = %id,
@@ -1666,7 +1654,7 @@ pub async fn source_refresh(
             );
         }
         // The scheduler is gone (shutdown or a wedged loop): the operator
-        // gets the "unavailable" toast, the log names the failed enqueue.
+        // gets the "unavailable" toast, the log names the failed enqueue
         Err(err) => {
             tracing::warn!(
                 source = %id,
@@ -1685,7 +1673,7 @@ pub async fn source_refresh(
     if is_htmx(&headers) {
         // The initial state is the fragment the polled status renders,
         // so the two cannot drift apart: the swap and the first render
-        // carry the same markup and the same polling contract.
+        // carry the same markup and the same polling contract
         render_html(
             lang.clone(),
             "sources/_status.html",
@@ -1698,7 +1686,7 @@ pub async fn source_refresh(
                 error_message: None,
                 ok: true,
                 // The task is queued, not running yet: the elapsed time
-                // starts when the scheduler picks the source up.
+                // starts when the scheduler picks the source up
                 elapsed_seconds: None,
                 budget_hint: refresh_budget_hint(&lang),
             },
@@ -1707,7 +1695,7 @@ pub async fn source_refresh(
     } else {
         // Plain-browser path: the queued refresh is announced with a
         // flash toast, like every other action's fallback — a bare
-        // redirect would land silently.
+        // redirect would land silently
         flash_redirect(
             &format!("/admin/sources/{id}"),
             lang.t("common.refreshing"),
@@ -1777,7 +1765,7 @@ pub async fn source_refresh_status(
     let busy = state.scheduler.is_in_flight(&id).await;
     // How long the running refresh has been going. The clock starts when
     // the scheduler picks the source up, so a request that waits for a
-    // concurrency permit is counted too.
+    // concurrency permit is counted too
     let elapsed_seconds = state
         .scheduler
         .in_flight_since(&id)
@@ -1788,7 +1776,7 @@ pub async fn source_refresh_status(
     } else {
         let source = match sources::get(&state.pool, &id).await {
             Ok(Some(source)) => source,
-            // The source is gone: the poll has nothing left to report.
+            // The source is gone: the poll has nothing left to report
             Ok(None) => return not_found(lang, "err.source_not_found"),
             Err(err) => return server_error(&state, &headers, "sources.refresh_status", &err),
         };
@@ -1796,7 +1784,7 @@ pub async fn source_refresh_status(
             (false, source.last_fetched_at, None, true)
         } else if source.error_class.is_none() {
             // Never fetched: there is no outcome yet, and "unknown
-            // error" would describe a fetch that never happened.
+            // error" would describe a fetch that never happened
             (true, None, None, false)
         } else {
             (
@@ -1844,16 +1832,16 @@ pub async fn source_delete(
     // keeps its state. The sweep runs while the links still name this
     // source, so it picks exactly the proxies it fed and leaves the
     // ones another source still feeds alone: deleting one source must
-    // not walk the whole table.
+    // not walk the whole table
     //
     // With `drop_gate = false` the admin click is intentionally
     // conservative: a `ready` row is tunnel-verified and an `unknown`
     // row has not yet had its first verdict, neither should be retired
     // just because its source went away. The probe is the only authority
     // on the lifecycle of a verified proxy, and the priority queue is
-    // the only authority on a not-yet-checked one.
+    // the only authority on a not-yet-checked one
     // With `drop_gate = true` the strict policy applies and every
-    // orphan retires.
+    // orphan retires
     let protected = fumox_core::ingest::IngestPolicy::from_drop_gate(state.ingest().drop_gate)
         .protected_statuses();
     let sweep = proxies::mark_source_orphans_removed(&state.pool, &id, protected).await;
@@ -1862,7 +1850,7 @@ pub async fn source_delete(
         Ok(false) => return not_found(lang, "err.source_not_found"),
         Err(err) => return server_error(&state, &headers, "sources.delete", &err),
     }
-    // The row is gone; the rendered outputs that still name it go here.
+    // The row is gone; the rendered outputs that still name it go here
     state.caches.invalidate_processed_for_source(&id).await;
     tracing::info!(source = %id, "source deleted");
     deleted_source_response(lang, is_htmx(&headers), &id, sweep)
@@ -1889,7 +1877,7 @@ fn deleted_source_response(
             }
             if sweep.protected > 0 {
                 // The rows the sweep left alone on purpose: they have no
-                // source link any more, so no probe lane can reach them.
+                // source link any more, so no probe lane can reach them
                 tracing::info!(
                     source = %source_id,
                     protected = sweep.protected,
@@ -1906,7 +1894,7 @@ fn deleted_source_response(
         Err(err) => {
             // The source is gone, but the proxies it fed are not
             // flagged: the operator has to hear it, the toast is the
-            // only place they will see it.
+            // only place they will see it
             tracing::error!(
                 source = %source_id,
                 error = %err,
@@ -1921,8 +1909,6 @@ fn deleted_source_response(
         }
     }
 }
-
-// Dry-run fetch
 
 /// Dry-run result fragment: what a real fetch would see, without writing
 /// anything to the database.
@@ -1970,7 +1956,7 @@ pub async fn source_dry_run(
     let outcome = crate::ingest::dry_run_source(&state.fetcher, &state.geo, &source).await;
     // One event per outcome, without the URL or the headers: the log
     // tail names the source and the verdict, the secrets stay in the
-    // database.
+    // database
     log_dry_run_outcome(&id, &outcome);
     let fragment = dry_run_fragment(lang, outcome);
     if is_htmx(&headers) {
@@ -1985,7 +1971,7 @@ pub async fn source_dry_run(
         // the source card, so a plain POST would land on a chrome-less
         // page. Redirect back to the card with the outcome as a flash
         // message instead, the same plain-browser fallback as
-        // `source_refresh`.
+        // `source_refresh`
         flash_redirect(
             &format!("/admin/sources/{id}"),
             &fragment.message,
@@ -2117,8 +2103,6 @@ mod tests {
             .collect()
     }
 
-    /// The mask the edit form renders is replaced by the stored secret
-    /// under its own key.
     #[test]
     fn unchanged_mask_is_restored_from_the_stored_secret() {
         let stored = headers(&[("X-Token", "supersecretvalue")]);
@@ -2127,10 +2111,6 @@ mod tests {
         assert_eq!(submitted["X-Token"], "supersecretvalue");
     }
 
-    /// A mask is valid only under the key it was rendered for: under
-    /// any other key it is reported, so the operator enters the value
-    /// again instead of a mask reaching the upstream fetch as a
-    /// credential.
     #[test]
     fn a_mask_under_a_renamed_key_is_reported() {
         let stored = headers(&[("X-Token", "supersecretvalue")]);
@@ -2147,8 +2127,7 @@ mod tests {
     }
 
     /// A real value that happens to contain the bullet the mask is drawn
-    /// with is a value, not a mask: the old `contains('•')` test threw it
-    /// away and stored the stored secret instead.
+    /// with is a value, not a mask.
     #[test]
     fn typed_value_with_a_bullet_is_kept() {
         let stored = headers(&[("X-Token", "supersecretvalue")]);
@@ -2171,7 +2150,6 @@ mod tests {
         );
     }
 
-    /// A new source has nothing stored to restore from.
     #[test]
     fn restore_is_a_noop_without_stored_headers() {
         let mut submitted = headers(&[("X-Token", "tok•en")]);
@@ -2217,40 +2195,31 @@ mod tests {
         );
     }
 
-    /// The URL of the card and of the edit form shows the password of the
-    /// userinfo masked: the secret stays in the database and in the
-    /// fetcher.
     #[test]
     fn the_url_password_is_masked() {
         assert_eq!(
             mask_url_userinfo("https://user:secret123@example.com/sub"),
             "https://user:sec…••••@example.com/sub"
         );
-        // A userinfo without a password carries no secret.
         assert_eq!(
             mask_url_userinfo("https://user@example.com/sub"),
             "https://user@example.com/sub"
         );
-        // A URL without a userinfo is untouched.
         assert_eq!(
             mask_url_userinfo("https://example.com/sub"),
             "https://example.com/sub"
         );
     }
 
-    /// The mask the form hands back is restored under the stored
-    /// password; a password the operator typed is kept as typed.
     #[test]
     fn the_stored_password_comes_back_under_the_mask() {
         let stored = "https://user:secret123@example.com/sub";
         let masked = mask_url_userinfo(stored);
         assert_eq!(restore_url_password(&masked, stored), stored);
-        // A fresh password replaces the mask.
         assert_eq!(
             restore_url_password("https://user:fresh456@example.com/sub", stored),
             "https://user:fresh456@example.com/sub"
         );
-        // A URL without a password stays as typed.
         assert_eq!(
             restore_url_password("https://example.com/sub", stored),
             "https://example.com/sub"
@@ -2258,8 +2227,8 @@ mod tests {
     }
 
     /// The subscription token travels in the query of the feed URL, so
-    /// the query value is redacted in the panel the same way it is in
-    /// the log. The harmless pairs survive: they are the diagnostics.
+    /// it is redacted in the panel the same way as in the log; the
+    /// harmless pairs survive, they are the diagnostics.
     #[test]
     fn the_secret_query_values_are_redacted() {
         assert_eq!(
@@ -2267,22 +2236,20 @@ mod tests {
             "https://example.com/sub?token=[redacted]&page=2"
         );
         // The name is kept, the value is not: the operator must see
-        // which parameter carries the credential.
+        // which parameter carries the credential
         assert_eq!(
             mask_url_secrets("https://example.com/sub?api_key=x&ok=1"),
             "https://example.com/sub?api_key=[redacted]&ok=1"
         );
-        // A URL without a query is untouched.
         assert_eq!(
             mask_url_secrets("https://example.com/sub"),
             "https://example.com/sub"
         );
     }
 
-    /// The masked URL is what the edit form shows, and the form hands it
-    /// back on submit: the stored secret must come back under the mask,
-    /// or saving the form would silently drop the token and the feed
-    /// would stop working.
+    /// The stored secret must come back under the mask the form hands
+    /// back on submit, or a save would silently drop the token and the
+    /// feed would stop working.
     #[test]
     fn the_stored_secrets_come_back_under_the_masks() {
         let stored = "https://user:secret123@example.com/sub?token=ABC&page=2";
@@ -2291,12 +2258,10 @@ mod tests {
         assert!(!masked.contains("ABC"), "{masked}");
         assert_eq!(restore_url_secrets(&masked, stored), stored);
 
-        // A typed token replaces the mask.
         assert_eq!(
             restore_url_secrets("https://example.com/sub?token=NEW&page=2", stored),
             "https://example.com/sub?token=NEW&page=2"
         );
-        // A pair the operator added keeps the value that was typed.
         assert_eq!(
             restore_url_secrets("https://example.com/sub?token=[redacted]&new=1", stored),
             "https://example.com/sub?token=ABC&new=1"
@@ -2328,8 +2293,8 @@ mod tests {
     }
 
     /// L-185: a running refresh shows how long it has been going and
-    /// what it may cost. The operator must be able to tell a slow
-    /// source from a stuck panel.
+    /// what it may cost, so the operator can tell a slow source from a
+    /// stuck panel.
     #[test]
     fn the_running_refresh_shows_the_elapsed_time_and_the_budget() {
         let lang = test_lang();
@@ -2347,21 +2312,17 @@ mod tests {
         let html = fragment.render().unwrap();
         let elapsed = lang.t_named("src.refresh_elapsed", &[("seconds", "42".to_string())]);
         assert!(html.contains(&elapsed), "{html}");
-        // The budget is quoted next to the spinner: the ceiling of one
-        // fetch and the number of requests it may make.
         assert!(html.contains(&refresh_budget_hint(&lang)), "{html}");
         // The polled element stays the one that carries the polling
         // contract, and it swaps its content into the page's permanent
         // `#refresh-status` live region instead of re-rendering the
-        // region itself (a recreated live region is never announced).
+        // region itself (a recreated live region is never announced)
         assert!(!html.contains(r#"id="refresh-status""#), "{html}");
         assert!(html.contains(r#"data-busy="1""#), "{html}");
         assert!(html.contains(r##"hx-target="#refresh-status""##), "{html}");
         assert!(html.contains(r#"hx-swap="innerHTML""#), "{html}");
     }
 
-    /// A finished refresh has no elapsed time: the moment it ended is
-    /// what the fragment shows then.
     #[test]
     fn a_finished_refresh_shows_no_elapsed_time() {
         let lang = test_lang();
@@ -2381,9 +2342,6 @@ mod tests {
         assert!(!html.contains("data-busy"), "{html}");
     }
 
-    /// A source that has never been fetched has no outcome to show: the
-    /// fragment renders the neutral pending badge, neither the error
-    /// badge nor the busy marker of a fetch in flight.
     #[test]
     fn a_never_fetched_source_renders_the_pending_state() {
         let lang = test_lang();
@@ -2429,10 +2387,9 @@ mod tests {
         assert!(!values.enabled, "an absent checkbox is unchecked");
     }
 
-    /// The `enabled` checkbox follows HTML semantics: a checked box
-    /// submits the field with its value, and the truthy synonyms read
-    /// as checked; everything else, an explicit `false` included, is
-    /// unchecked — presence alone must not flip the flag on.
+    /// HTML checkbox semantics: a checked box submits the field with its
+    /// value, the truthy synonyms read as checked, and presence alone
+    /// must not flip the flag on.
     #[test]
     fn the_enabled_checkbox_is_read_from_its_value() {
         for checked in ["1", "on", "true"] {
@@ -2451,9 +2408,6 @@ mod tests {
         }
     }
 
-    /// The list filter reads the select's `on`/`off` plus their boolean
-    /// synonyms; anything else filters nothing, like the empty "all"
-    /// option.
     #[test]
     fn the_enabled_filter_reads_the_boolean_synonyms() {
         assert_eq!(enabled_filter_value("on"), Some(true));
@@ -2466,7 +2420,6 @@ mod tests {
         assert_eq!(enabled_filter_value("nonsense"), None);
     }
 
-    /// A source row as the toggle action holds it after the flip.
     fn sample_source(enabled: bool) -> Source {
         Source {
             slug: Some("s1".into()),
@@ -2532,8 +2485,6 @@ mod tests {
         assert!(swap.contains(lang.t("common.on")), "{swap}");
     }
 
-    /// The disabled flip: the badge class and the button label follow the
-    /// stored state.
     #[test]
     fn toggle_swap_fragment_flips_with_the_disabled_state() {
         let lang = test_lang();

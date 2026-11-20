@@ -7,7 +7,7 @@
 //! admin card). Unavailability is reported, never fatal: the daemon skips
 //! T2 with backoff and keeps running T1.
 //!
-//! The client draws one line and keeps it: a *verdict about the proxy*
+//! One line is kept throughout: a *verdict about the proxy*
 //! (`ProxyFailed`) may be charged to the proxy's fail budget, a *fault of
 //! the engine* (`ServiceUnavailable`) may not. The controller can rewrite
 //! the proxy kernel's configuration, so it is also vetted at startup: it
@@ -36,7 +36,6 @@ pub struct MeowClient {
     /// at startup and again before every tunnel batch, see
     /// [`MeowClient::verify_address`].
     host: String,
-    /// Whether the host is a name rather than an IP literal.
     host_is_name: bool,
 }
 
@@ -54,29 +53,23 @@ pub struct MeowMemory {
 pub enum DelayOutcome {
     /// Tunnel established; latency in milliseconds.
     Ok(u64),
-    /// meow-rs answered, but the proxy failed the tunnel test. This is the
-    /// outcome meow reports for a dead or unusably slow proxy (its 503 and
-    /// 504), and it never contributes to the engine-down abort.
-    ///
-    /// The only outcome that may be charged to the proxy's fail budget.
+    /// meow-rs answered, but the proxy failed the tunnel test (its 503 and
+    /// 504 for a dead or unusably slow proxy). The only outcome that may
+    /// charge the proxy's fail budget, and never a contributor to the
+    /// engine-down abort.
     ProxyFailed(String),
-    /// meow-rs itself did not judge the proxy: it was unreachable, it
-    /// answered with a status that is not a probe verdict, or it sent a
-    /// body the probe cannot read. The batch is aborted without touching
-    /// any proxy status.
-    ///
-    /// A request the engine *refused* (an unknown proxy name, a wrong
-    /// token) lands here too: the engine did not run a tunnel test, so
-    /// there is no verdict to charge anybody with.
+    /// meow-rs did not judge the proxy: unreachable, a status that is not
+    /// a probe verdict, or a body the probe cannot read. A request the
+    /// engine *refused* (an unknown proxy name, a wrong token) lands here
+    /// too: no tunnel test ran, so there is no verdict to charge anybody
+    /// with.
     ServiceUnavailable(String),
 }
 
 /// How far the controller can be reached from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControllerScope {
-    /// Loopback: nothing but this host reaches the controller.
     Loopback,
-    /// A private network: the local network reaches the controller.
     Private,
 }
 
@@ -84,14 +77,13 @@ enum ControllerScope {
 ///
 /// The controller carries the bearer token on every request and can
 /// rewrite the proxy kernel's configuration, so it must stay where
-/// nobody else reaches it: a public address would hand the token to the
-/// internet. A private-network controller is allowed, but it needs the
-/// token (see [`MeowClient::new`]).
+/// nobody else reaches it. A private-network controller is allowed, but
+/// it needs the token (see [`MeowClient::new`]).
 fn vet_api_addr(addr: &str) -> Result<(String, u16, ControllerScope), String> {
     let trimmed = addr.trim();
     // The client prepends its own scheme when it dials the controller, so
     // a value that carries one would produce a broken authority like
-    // `http://http://127.0.0.1:9090`; the config field is `host:port`.
+    // `http://http://127.0.0.1:9090`; the config field is `host:port`
     if trimmed.contains("://") {
         return Err(format!(
             "meow.api_addr {addr:?} must be host:port without a scheme"
@@ -129,7 +121,7 @@ fn vet_api_addr(addr: &str) -> Result<(String, u16, ControllerScope), String> {
         return Ok((host.to_string(), port, ControllerScope::Loopback));
     }
     // A name: it is resolved and vetted at startup (see
-    // `verify_address`), and until then it counts as network-reachable.
+    // `verify_address`), and until then it counts as network-reachable
     Ok((host.to_string(), port, ControllerScope::Private))
 }
 
@@ -145,8 +137,7 @@ fn format_host_port(host: &str, port: u16) -> String {
 
 /// The verdict about a controller name's resolution: none of the
 /// addresses may be public, the bearer token would be reachable there.
-/// Private and loopback resolutions are allowed — the token rule of
-/// [`MeowClient::new`] covers a controller somebody else reaches.
+/// Private and loopback resolutions are allowed.
 fn vet_controller_resolution(host: &str, addrs: &[IpAddr]) -> Result<(), String> {
     for ip in addrs {
         if fumox_core::ssrf::is_public(*ip) {
@@ -165,11 +156,9 @@ fn vet_controller_resolution(host: &str, addrs: &[IpAddr]) -> Result<(), String>
 /// meow-rs answers a failed tunnel with 503 (transport failure) or 504
 /// (missed deadline). A 400 is ambiguous: it may be a tunnel failure in
 /// another spelling or a request the engine refused, so it counts as a
-/// verdict only when the message names a fault of the *proxy*.
-///
-/// Every other status (404, 405, 408, 401, 403, 429, the rest) is a
-/// request or configuration error: the engine did not judge the proxy,
-/// and charging the proxy for it would retire healthy entries.
+/// verdict only when the message names a fault of the *proxy*. Every
+/// other status is a request or configuration error: the engine did not
+/// judge the proxy, and charging it would retire healthy entries.
 fn is_tunnel_verdict(status: u16, message: &str) -> bool {
     match status {
         503 | 504 => true,
@@ -184,10 +173,9 @@ fn is_tunnel_verdict(status: u16, message: &str) -> bool {
                 "unreachable",
                 "connection",
                 "delay test",
-                // The proxy's own credentials: the request was well
-                // formed and the engine rejected *the node*. The
-                // controller's own token is a different thing and
-                // answers 401/403, which never reaches this arm.
+                // The proxy's own credentials: the request was well formed
+                // and the engine rejected *the node*. The controller's own
+                // token answers 401/403, which never reaches this arm
                 "credential",
             ]
             .iter()
@@ -199,8 +187,8 @@ fn is_tunnel_verdict(status: u16, message: &str) -> bool {
 
 /// Upper bound of a controller body the probe buffers: every endpoint
 /// answers a small JSON document (or a short error detail), so a bigger
-/// body is a malfunction — or an impersonator — and is rejected instead
-/// of being read into memory.
+/// body is a malfunction or an impersonator, rejected instead of being
+/// read into memory.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// Read a controller body under [`MAX_BODY_BYTES`]: the content length is
@@ -241,7 +229,7 @@ impl MeowClient {
     /// asks, and it can rewrite the proxy kernel's configuration.
     pub fn new(config: &MeowConfig) -> Result<Self, String> {
         // reqwest is compiled without a crypto provider and panics when a
-        // client is built before one is installed.
+        // client is built before one is installed
         fumox_core::tls::install_crypto_provider();
         let (host, port, scope) = vet_api_addr(&config.api_addr)?;
         let api_token = config.api_token.trim().to_string();
@@ -253,8 +241,8 @@ impl MeowClient {
             ));
         }
         // The config deserializer already refuses an empty `meow.test_url`,
-        // but the struct can also be built by hand; the split into first and
-        // rest below is what makes a non-empty list visible to the types.
+        // but the struct can also be built by hand; the first/rest split is
+        // what makes a non-empty list visible to the types
         let (test_url_first, test_url_rest) = match config.test_url.as_slice() {
             [first, rest @ ..] => (first.clone(), rest.to_vec()),
             [] => {
@@ -267,26 +255,25 @@ impl MeowClient {
         };
         let timeout = Duration::from_secs(config.timeout_secs.max(1));
         // One client, built exactly once: a builder failure is a startup
-        // error to report, not something to paper over with a silently
-        // rebuilt fallback.
+        // error to report, not something to paper over with a rebuilt
+        // fallback
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
-            // The controller is a loopback or private-network service,
-            // vetted at startup, so ambient `HTTP(S)_PROXY` variables must
-            // not reroute this traffic: the proxy would intercept requests
-            // meant for the kernel and receive its bearer token.
+            // The controller is vetted at startup, so ambient
+            // `HTTP(S)_PROXY` variables must not reroute this traffic: the
+            // proxy would intercept requests meant for the kernel and
+            // receive its bearer token
             .no_proxy()
             // A redirect would carry the bearer token to whoever the
-            // controller points at: the controller answers, it does not
-            // redirect.
+            // controller points at
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("cannot build the meow-rs HTTP client: {e}"))?;
         Ok(Self {
-            // Client-level timeout as a floor: every call below also sets a
-            // per-request timeout (which takes precedence), but a future one
-            // that forgets to would otherwise hang forever.
+            // Client-level timeout as a floor: every call below also sets
+            // a per-request timeout (which takes precedence), but a future
+            // one that forgets to would otherwise hang forever
             http,
             base_url: format!("http://{}", format_host_port(&host, port)),
             test_url_first,
@@ -331,10 +318,9 @@ impl MeowClient {
     /// The `Authorization` header of every controller request.
     ///
     /// The controller can rewrite the proxy kernel's configuration, so a
-    /// deployment that publishes it needs it to answer only to the
-    /// probe. An empty token means the controller is unauthenticated:
-    /// the header is left off entirely rather than sent empty, which
-    /// some controllers answer differently from a missing one.
+    /// deployment that publishes it needs it to answer only to the probe.
+    /// An empty token leaves the header off entirely rather than sent
+    /// empty, which some controllers answer differently from a missing one.
     fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.api_token.is_empty() {
             return request;
@@ -347,7 +333,7 @@ impl MeowClient {
     /// (one URL may be blocked or degraded in a given region).
     fn pick_test_url<'a>(&'a self, rng: &mut impl rand::Rng) -> &'a str {
         // A uniform index over `first + rest`: the first URL is always
-        // there (see the field docs), so the draw never comes up empty.
+        // there, so the draw never comes up empty
         let idx = rng.random_range(..=self.test_url_rest.len());
         match self.test_url_rest.get(idx) {
             Some(url) => url,
@@ -373,10 +359,9 @@ impl MeowClient {
     /// `GET /version`, the version string of the controller.
     ///
     /// Strict on purpose: a body that is not JSON is a malfunction the
-    /// operator has to see, not a version. The liveness question ("does
-    /// the engine answer at all?") has its own method, [`Self::alive`],
-    /// which the runtime uses; this one only serves the strict check of
-    /// the tests.
+    /// operator has to see, not a version. Liveness has its own method,
+    /// [`Self::alive`], which the runtime uses; this one only serves the
+    /// tests.
     #[cfg(test)]
     pub async fn ping(&self) -> Result<String, String> {
         let response = self
@@ -393,7 +378,7 @@ impl MeowClient {
             .await
             .map_err(|e| format!("bad /version payload: {e}"))?;
         // The version field is optional: a controller that answers with
-        // another JSON shape is alive, it just does not name itself.
+        // another JSON shape is alive, it just does not name itself
         Ok(body
             .get("version")
             .and_then(|v| v.as_str())
@@ -402,12 +387,9 @@ impl MeowClient {
     }
 
     /// Whether the controller answers at all, judged by the status code
-    /// alone.
-    ///
-    /// The answer to "is the engine down?" must not depend on the shape of
-    /// its payload: a controller that changed the format of `/version`
-    /// would otherwise look dead, and the batch would be aborted (and
-    /// every proxy of it stamped unverified) over a response format.
+    /// alone: a controller that changed the format of `/version` must not
+    /// look dead, or the batch would be aborted (and every proxy of it
+    /// stamped unverified) over a response format.
     pub async fn alive(&self) -> Result<(), String> {
         let response = self
             .auth(self.http.get(format!("{}/version", self.base_url)))
@@ -429,10 +411,10 @@ impl MeowClient {
     /// placeholder never shows as "0 bytes"; a frame without the field is
     /// an error, not a zero reading.
     pub async fn memory(&self) -> Result<MeowMemory, String> {
-        // The feed never ends, so the request cannot finish on time: its
-        // timeout is a backstop well above the per-frame deadline, and
-        // the deadline has to win. Otherwise a stalled feed looks like a
-        // transport error instead of a stall.
+        // The feed never ends, so the request cannot finish on time: the
+        // request timeout is a backstop above the per-frame deadline, and
+        // the deadline has to win, or a stalled feed looks like a
+        // transport error instead of a stall
         let frame_deadline = self.timeout.min(Duration::from_secs(5));
         let mut response = self
             .auth(self.http.get(format!("{}/memory", self.base_url)))
@@ -444,13 +426,12 @@ impl MeowClient {
             return Err(format!("meow-rs /memory returned {}", response.status()));
         }
 
-        // The feed never ends, so read frames until one is a real sample.
         let mut buf = Vec::new();
         let started = std::time::Instant::now();
         loop {
-            // A wall-clock bound of the whole read: a feed that answers
-            // on time but never leaves the zero placeholder would
-            // otherwise hold the request frame after frame forever.
+            // A wall-clock bound of the whole read: a feed that never
+            // leaves the zero placeholder would otherwise hold the request
+            // frame after frame forever
             if started.elapsed() >= frame_deadline {
                 return Err("meow-rs /memory feed stalled before a sample".into());
             }
@@ -461,7 +442,7 @@ impl MeowClient {
                 .ok_or_else(|| "meow-rs /memory feed closed early".to_string())?;
             buf.extend_from_slice(&chunk);
             // A frame is a small JSON document; a buffer that grows past
-            // the cap is not the feed it claims to be.
+            // the cap is not the feed it claims to be
             if buf.len() > MAX_BODY_BYTES {
                 return Err("meow-rs /memory frame exceeds the read cap".into());
             }
@@ -475,7 +456,7 @@ impl MeowClient {
                 };
                 if inuse == 0 {
                     // The zero placeholder, or a kernel that has not
-                    // accounted anything yet: keep reading.
+                    // accounted anything yet
                     continue;
                 }
                 return Ok(MeowMemory {
@@ -500,8 +481,8 @@ impl MeowClient {
             return Ok(());
         }
         let status = response.status();
-        // The body is an error detail, not a document to trust: it is
-        // read under the same cap as every other controller answer.
+        // The body is an error detail, read under the same cap as every
+        // other controller answer
         let body = read_body_capped(response, "PUT /configs")
             .await
             .unwrap_or_else(|error| error);
@@ -515,10 +496,8 @@ impl MeowClient {
     ///
     /// The outcome says who the failure belongs to. `ProxyFailed` is a
     /// verdict about the proxy (meow ran the tunnel test and it died) and
-    /// is the only outcome that may be charged to the proxy's fail
-    /// budget. `ServiceUnavailable` is a fault of the engine or of the
-    /// request itself: the batch is aborted without touching any proxy
-    /// status.
+    /// the only outcome that may charge the fail budget;
+    /// `ServiceUnavailable` is a fault of the engine or of the request.
     ///
     /// Success is strict: 2xx **with** a numeric `delay` field; a 2xx
     /// without one is an engine malfunction, not a pass.
@@ -536,9 +515,8 @@ impl MeowClient {
             Err(e) => return DelayOutcome::ServiceUnavailable(format!("transport error: {e}")),
         };
 
-        // The body is read after the status and under the shared cap: the
-        // endpoint answers a small JSON verdict, so a bigger body is an
-        // engine malfunction, not something to buffer.
+        // The body is read after the status and under the shared cap: a
+        // bigger body is an engine malfunction, not something to buffer
         let status = response.status();
         let text = match read_body_capped(response, "delay").await {
             Ok(text) => text,
@@ -547,10 +525,8 @@ impl MeowClient {
         let body: serde_json::Value = match serde_json::from_str(text.trim()) {
             Ok(body) => body,
             // A body that is not JSON still carries a verdict when the
-            // status is one (a 503/504 tunnel failure, or a 400 that
-            // names a fault of the proxy): the raw text becomes the
-            // message and the proxy is charged. Any other status stays
-            // an engine fault.
+            // status is one (503/504, or a 400 naming a proxy fault): the
+            // raw text becomes the message and the proxy is charged
             Err(_) => {
                 let message = text.trim();
                 if is_tunnel_verdict(status.as_u16(), message) {
@@ -570,8 +546,7 @@ impl MeowClient {
         // The delay endpoint reports the tunnel outcome and nothing else:
         // 503 a transport failure, 504 a missed deadline, both a verdict
         // about this proxy. Every other status is the engine refusing the
-        // request (an unknown proxy, a wrong token, a rate limit), which
-        // says nothing about the proxy.
+        // request (unknown proxy, wrong token, rate limit)
         let message = body
             .get("message")
             .and_then(|v| v.as_str())
@@ -579,7 +554,7 @@ impl MeowClient {
             .to_string();
         if is_tunnel_verdict(status.as_u16(), &message) {
             // The status stays in the text: 503, 504 and a tunnel 400
-            // have to stay distinguishable in `probe_results.error`.
+            // have to stay distinguishable in `probe_results.error`
             DelayOutcome::ProxyFailed(format!("{status}: {message}"))
         } else {
             DelayOutcome::ServiceUnavailable(format!("{status}: {message}"))
@@ -662,7 +637,7 @@ mod tests {
                     }
                 }),
             )
-            // Mirrors the real /memory feed, zero placeholder first.
+            // Mirrors the real /memory feed, zero placeholder first
             .route(
                 "/memory",
                 get(|| async {
@@ -684,7 +659,7 @@ mod tests {
                         let capture = capture.clone();
                         async move {
                             // Both parameters are part of the contract
-                            // with the engine, not only the test URL.
+                            // with the engine, not only the test URL
                             for (key, value) in query {
                                 capture.lock().unwrap().insert(key, value);
                             }
@@ -711,7 +686,7 @@ mod tests {
         let config = MeowConfig {
             api_addr: addr.clone(),
             // The delay request must carry this timeout in milliseconds
-            // (see `ping_reload_and_delay_outcomes`).
+            // (see `ping_reload_and_delay_outcomes`)
             timeout_secs: 5,
             ..Default::default()
         };
@@ -752,7 +727,7 @@ mod tests {
         }
 
         // The delay request carries the configured timeout in
-        // milliseconds: the engine applies it to its own tunnel test.
+        // milliseconds: the engine applies it to its own tunnel test
         let params = seen.lock().unwrap().clone();
         let expected_ms = (config.timeout_secs * 1000).to_string();
         assert_eq!(
@@ -774,10 +749,9 @@ mod tests {
             .map(str::to_string)
     }
 
-    /// The controller can reconfigure the proxy kernel, so a deployment
-    /// that publishes it needs it to answer only to the probe. Every
-    /// request therefore carries the configured bearer token, and a
-    /// client without a token sends no header at all.
+    /// The controller can reconfigure the proxy kernel, so every request
+    /// carries the configured bearer token, and a client without a token
+    /// sends no header at all.
     #[tokio::test]
     async fn the_bearer_token_is_sent_on_every_request() {
         let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
@@ -849,7 +823,7 @@ mod tests {
 
         // Without a token the header is absent, not empty: a controller
         // that treats "no header" and "empty header" differently has to
-        // see the former.
+        // see the former
         let plain = MeowClient::new(&MeowConfig {
             api_token: String::new(),
             ..config.clone()
@@ -867,10 +841,10 @@ mod tests {
     #[tokio::test]
     async fn unreachable_api_reports_service_unavailable() {
         let config = MeowConfig {
-            // Nothing listens here.
+            // Nothing listens here
             api_addr: "127.0.0.1:1".into(),
             // Keep the timeouts short: the test only exercises the
-            // transport-failure path.
+            // transport-failure path
             timeout_secs: 2,
             ..Default::default()
         };
@@ -915,7 +889,7 @@ mod tests {
             ..Default::default()
         };
         let client = MeowClient::new(&config).unwrap();
-        // Seeded: the assertion is deterministic for this fixed sequence.
+        // Seeded: the assertion is deterministic for this fixed sequence
         let mut rng = {
             use rand::SeedableRng;
             rand::rngs::StdRng::seed_from_u64(7)
@@ -924,7 +898,7 @@ mod tests {
         assert_eq!(picked, HashSet::from(["a", "b", "c"]));
     }
 
-    /// A flaky proxy fails the first request and succeeds the second ,
+    /// A flaky proxy fails the first request and succeeds the second,
     /// `check_delay_with_retry` absorbs the transient blip and returns
     /// `Ok`. Without the retry the caller would see `ServiceUnavailable`
     /// and abort the rest of the batch on the first failure.
@@ -967,7 +941,7 @@ mod tests {
             ..Default::default()
         };
         let client = MeowClient::new(&config).unwrap();
-        // Two attempts, 50ms between, first fails, second succeeds.
+        // Two attempts, 50ms between, first fails, second succeeds
         match client
             .check_delay_with_retry(
                 "fumox-flaky",
@@ -1031,8 +1005,9 @@ mod tests {
     }
 
     /// meow-rs answers /memory with a live feed whose first frame is a
-    /// hardcoded zero placeholder. Reporting that as "0 bytes" would show a
-    /// dead-looking kernel on the admin card, so the first frame is dropped.
+    /// hardcoded zero placeholder. Reporting that as "0 bytes" would show
+    /// a dead-looking kernel on the admin card, so the first frame is
+    /// dropped.
     #[tokio::test]
     async fn memory_skips_the_zero_placeholder_frame() {
         let (_addr, config, _) = mock_api(Arc::default()).await;
@@ -1044,7 +1019,7 @@ mod tests {
 
         // `os_limit_bytes` is passed through verbatim: meow-rs resolves it
         // from the cgroup, and a container without one reports 0, which the
-        // panel renders as "no percentage" rather than dividing by it.
+        // panel renders as "no percentage" rather than dividing by it
     }
 
     /// meow-rs reports a failed tunnel as 503 or 504. Both are the one
@@ -1097,7 +1072,7 @@ mod tests {
                 DelayOutcome::ProxyFailed(msg) => {
                     // The status code stays in the text: 503 and 504
                     // have to remain distinguishable in
-                    // `probe_results.error`.
+                    // `probe_results.error`
                     assert!(
                         msg.starts_with(label),
                         "{label} must lead the message, got {msg}"
@@ -1119,9 +1094,7 @@ mod tests {
 
     /// A tunnel verdict spelled in plain text (a 503 whose body is not
     /// JSON) is still a verdict about the proxy: the raw text becomes the
-    /// message and the proxy is charged. Reading the body before the
-    /// status used to file it as an engine outage (`ServiceUnavailable`)
-    /// and abort the whole batch over one dead tunnel.
+    /// message and the proxy is charged.
     #[tokio::test]
     async fn a_non_json_tunnel_verdict_still_charges_the_proxy() {
         for (status, label) in [
@@ -1214,7 +1187,7 @@ mod tests {
     async fn a_network_controller_without_a_token_is_refused() {
         let error = client_error(&meow_config("10.0.0.5:9090", ""));
         assert!(error.contains("meow.api_token"), "{error}");
-        // The same address with a token is fine.
+        // The same address with a token is fine
         assert!(MeowClient::new(&meow_config("10.0.0.5:9090", "s3cr3t")).is_ok());
     }
 
@@ -1230,11 +1203,9 @@ mod tests {
         }
     }
 
-    /// The verdict about a controller name's resolution: a public address
-    /// is refused with the host and the address named (the vet runs again
-    /// before every tunnel batch, so a name that drifts into public space
-    /// mid-run stops the batches instead of leaking the token), while
-    /// loopback and private resolutions stay allowed.
+    /// A public resolution of the controller name is refused with the host
+    /// and the address named; loopback and private resolutions stay
+    /// allowed.
     #[test]
     fn a_public_resolution_of_the_controller_name_is_refused() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
@@ -1290,7 +1261,7 @@ mod tests {
     async fn an_api_addr_with_a_scheme_is_refused() {
         let error = client_error(&meow_config("http://127.0.0.1:9090", "s3cr3t"));
         assert!(error.contains("host:port without a scheme"), "{error}");
-        // The same address without the scheme is accepted.
+        // The same address without the scheme is accepted
         assert!(MeowClient::new(&meow_config("127.0.0.1:9090", "s3cr3t")).is_ok());
     }
 
@@ -1506,7 +1477,7 @@ mod tests {
                 let _ = socket.shutdown().await;
                 return;
             }
-            // The feed never ends: hold the connection open.
+            // The feed never ends: hold the connection open
             let _ = tokio::time::timeout(std::time::Duration::from_secs(30), socket.read(&mut buf))
                 .await;
         });

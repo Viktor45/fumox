@@ -46,14 +46,14 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     };
     // The structured blocks are parsed once for the whole entry and handed
     // to the writers below: every one of them used to re-parse the same
-    // feed-controlled YAML text.
+    // feed-controlled YAML text
     let blocks = Blocks::of(entry);
 
     put("name", Value::String(name.to_string()));
     put("server", Value::String(entry.host.clone()));
     put("port", num(i64::from(entry.port)));
 
-    // One writer per scheme arm keeps the dispatcher readable.
+    // One writer per scheme arm keeps the dispatcher readable
     match entry.scheme {
         Scheme::Vless => put_vless(entry, &blocks, &mut put),
         Scheme::Vmess => put_vmess(entry, &blocks, &mut put),
@@ -69,7 +69,7 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     if super::is_insecure(entry) {
         put("skip-cert-verify", Value::Bool(true));
     }
-    // Clash-input entries keep their `udp` toggle; URI feeds don't carry one.
+    // Clash-input entries keep their `udp` toggle; URI feeds don't carry one
     if super::param_truthy(entry, "udp") {
         put("udp", Value::Bool(true));
     }
@@ -84,7 +84,7 @@ fn put_vless(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Val
     put("uuid", Value::String(entry.credential.clone()));
     copy_param(entry, "flow", "flow", put);
     // One shared decision on whether the proxy is wrapped; the
-    // sing-box writer asks the same question.
+    // sing-box writer asks the same question
     if crate::params::wants_tls(entry, blocks) {
         put("tls", Value::Bool(true));
         copy_param(entry, "sni", "servername", put);
@@ -103,14 +103,14 @@ fn put_vmess(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Val
     put("type", Value::String("vmess".into()));
     put("uuid", Value::String(entry.credential.clone()));
     // One shared reader, one type (u64, a negative value is 0) for
-    // both encoders.
+    // both encoders
     put("alterId", Value::Number(super::alter_id(entry).into()));
     let cipher = super::param_value(entry, "scy")
         .or_else(|| super::param_value(entry, "cipher"))
         .unwrap_or_else(|| "auto".into());
     put("cipher", Value::String(cipher));
     // vmess JSON carries TLS in `tls: "tls"`; Clash input uses the
-    // boolean `tls: true`; some feeds spell it `security=tls`.
+    // boolean `tls: true`; some feeds spell it `security=tls`
     if crate::params::wants_tls(entry, blocks) {
         put("tls", Value::Bool(true));
         copy_param(entry, "sni", "servername", put);
@@ -142,7 +142,7 @@ fn put_ss(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
     put("type", Value::String("ss".into()));
     // The shared splitter owns the missing/empty-method fallback
     // (see `parsers::clash` `SS_SPEC` for the parse-time
-    // canonicalization).
+    // canonicalization)
     let (cipher, password) = super::split_ss_credential(&entry.credential);
     put("cipher", Value::String(cipher.to_string()));
     put("password", Value::String(password.to_string()));
@@ -173,7 +173,7 @@ fn put_socks5(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
     put("type", Value::String("socks5".into()));
     // Credential is stored as "user:pass"; both parts are optional,
     // and a colon-less credential is all username (the shared
-    // splitter owns the decision).
+    // splitter owns the decision)
     let (user, password) = super::split_user_password(&entry.credential);
     if !user.is_empty() {
         put("username", Value::String(user.to_string()));
@@ -191,36 +191,36 @@ fn put_socks5(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
 fn put_snell(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
     put("type", Value::String("snell".into()));
     // meow-rs names the secret `psk`; the URI keeps it as the
-    // userinfo, so the credential maps straight across.
+    // userinfo, so the credential maps straight across
     put("psk", Value::String(entry.credential.clone()));
     // Omitted entirely when the feed does not say: meow's own
     // default is v4, and writing an explicit default here would
-    // pin every entry to a value the operator never chose.
+    // pin every entry to a value the operator never chose
     if let Some(version) = super::param_value(entry, "version") {
         put("version", Value::String(version.to_string()));
     }
     // Only emitted when asked, so a false cannot become "true"
     // through a string round-trip. `udp` comes from the shared
-    // tail below, which also covers the Clash-input case.
+    // tail below, which also covers the Clash-input case
     if super::param_truthy(entry, "reuse") {
         put("reuse", Value::Bool(true));
     }
     // Both keys pass through verbatim, including the combinations
     // meow rejects (obfs-opts on v6, mode on older). It drops those
     // items rather than failing the config, so the T2 check 404s and
-    // charges the proxy, which is the honest verdict.
+    // charges the proxy, which is the honest verdict
     if let Some(mode) = super::param_value(entry, "mode") {
         put("mode", Value::String(mode.to_string()));
     }
     // A Clash feed keeps the nested `obfs-opts` block, a URI feed the
-    // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts.
+    // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts
     let obfs = super::param_value(entry, "obfs").or_else(|| super::map_str(&blocks.obfs, "mode"));
     let obfs_host =
         super::param_value(entry, "obfs-host").or_else(|| super::map_str(&blocks.obfs, "host"));
     if obfs.is_some() || obfs_host.is_some() {
         let mut opts = Mapping::new();
         // meow treats an absent obfs as off, and so do we: only a
-        // host without a mode would be ambiguous.
+        // host without a mode would be ambiguous
         opts.insert(
             Value::String("mode".into()),
             Value::String(obfs.clone().unwrap_or_else(|| "off".to_string())),
@@ -237,9 +237,9 @@ fn put_anytls(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
     put("type", Value::String("anytls".into()));
     put("password", Value::String(entry.credential.clone()));
     // meow's anytls parser reads `sni` only; it has no
-    // client-fingerprint knob, so `fp` is deliberately not mapped.
+    // client-fingerprint knob, so `fp` is deliberately not mapped
     copy_param(entry, "sni", "sni", put);
-    // skip-cert-verify and udp come from the shared tail below.
+    // skip-cert-verify and udp come from the shared tail below
 }
 
 /// `reality-opts: {public-key, short-id}` from URI `pbk`/`sid` params or a
@@ -293,7 +293,7 @@ fn put_transport(
     match network.as_str() {
         "" | "tcp" => {
             // Plain-HTTP header obfuscation: `type=tcp&headerType=http` in
-            // URIs, `net: tcp, type: http` in vmess JSON.
+            // URIs, `net: tcp, type: http` in vmess JSON
             if param_value_is(entry, "headerType", "http")
                 || (entry.scheme == Scheme::Vmess && param_value_is(entry, "type", "http"))
             {
@@ -323,7 +323,7 @@ fn put_transport(
             }
         }
         // Unknown network spelling (xhttp, kcp, …): pass it through so a
-        // capable mihomo can still use it.
+        // capable mihomo can still use it
         other => put("network", Value::String(other.into())),
     }
 }
@@ -396,7 +396,7 @@ fn put_h2_opts(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, V
     let path = super::param_value(entry, "path").or_else(|| super::map_str(&blocks.h2, "path"));
     // The one "value as a list" helper: the URI `host` splits on commas, the
     // block's `host` keeps its sequence items or splits a scalar the same
-    // way (`params::list` / `params::map_list`).
+    // way (`params::list` / `params::map_list`)
     let hosts = super::param_list(entry, "host").or_else(|| super::map_list(&blocks.h2, "host"));
     if path.is_none() && hosts.is_none() {
         return;
@@ -523,7 +523,7 @@ fn put_ss_plugin(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
             put_plugin_opts(opts, put);
         }
         // Unknown plugin: pass name and raw options through so a capable
-        // mihomo (restls, …) can still consume them.
+        // mihomo (restls, …) can still consume them
         _ => {
             put("plugin", Value::String(name));
             let mut opts = Mapping::new();
@@ -602,11 +602,11 @@ mod tests {
         assert_eq!(v.field("port").and_then(Value::as_u64), Some(443));
         assert_eq!(v.str_field("uuid"), Some("uuid-1"));
         assert_eq!(v.str_field("flow"), Some("xtls-rprx-vision"));
-        // TLS goes through the `tls` toggle + `servername`.
+        // TLS goes through the `tls` toggle + `servername`
         assert_eq!(v.field("tls").and_then(Value::as_bool), Some(true));
         assert_eq!(v.str_field("servername"), Some("sni.example.com"));
         assert_eq!(v.str_field("client-fingerprint"), Some("chrome"));
-        // REALITY keys live under reality-opts, gRPC name under grpc-opts.
+        // REALITY keys live under reality-opts, gRPC name under grpc-opts
         let reality = v.field("reality-opts").unwrap().as_mapping().unwrap();
         assert_eq!(
             reality
@@ -624,7 +624,7 @@ mod tests {
             ws.get(Value::from("path")).and_then(Value::as_str),
             Some("/ws")
         );
-        // No insecure toggle on the entry, no skip-cert-verify.
+        // No insecure toggle on the entry, no skip-cert-verify
         assert!(v.field("skip-cert-verify").is_none());
     }
 
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(v.str_field("client-fingerprint"), Some("chrome"));
         assert_eq!(v.str_field("network"), Some("ws"));
         let ws = v.field("ws-opts").unwrap().as_mapping().unwrap();
-        // `host` param becomes the ws Host header; path is decoded.
+        // `host` param becomes the ws Host header; path is decoded
         assert_eq!(
             ws.get(Value::from("path")).and_then(Value::as_str),
             Some("/ws?ed=2560")
@@ -717,7 +717,7 @@ mod tests {
                 .as_str(),
             Some("/hp")
         );
-        // `type=http` alone is Xray's HTTP/2 spelling → h2.
+        // `type=http` alone is Xray's HTTP/2 spelling → h2
         let line2 = "vless://uuid-1@h.example.com:443?security=tls&type=http&path=%2Fh2&host=a.example.com,b.example.com#Name";
         let e2 = parse(line2);
         let v2 = entry_to_clash(&e2).unwrap();
@@ -738,7 +738,7 @@ mod tests {
         let line = format!("vmess://{}", b64(json.as_bytes()));
         let e = parse(&line);
         let v = entry_to_clash(&e).unwrap();
-        // vmess TLS is spelled `tls: "tls"` in the JSON, not `security=tls`.
+        // vmess TLS is spelled `tls: "tls"` in the JSON, not `security=tls`
         assert_eq!(v.field("tls").and_then(Value::as_bool), Some(true));
         assert_eq!(v.str_field("servername"), Some("s.example.com"));
         assert_eq!(v.str_field("network"), Some("ws"));
@@ -1018,11 +1018,6 @@ mod tests {
         );
     }
 
-    // Round-trip tests: a Clash item parsed by `crate::parsers::clash`
-    // must render back through the writers below to something meow-rs
-    // accepts, otherwise a Clash subscription loses the proxy on every
-    // export. They live next to the writers they exercise.
-
     /// The two schemes must survive a Clash round-trip: a feed entry
     /// parsed to an entry must render back to something meow-rs accepts,
     /// otherwise a Clash subscription would lose them on every export.
@@ -1045,7 +1040,7 @@ mod tests {
         assert_eq!(snell.get("version").and_then(|v| v.as_str()), Some("6"));
         assert_eq!(snell.get("mode").and_then(|v| v.as_str()), Some("unshaped"));
         assert_eq!(snell.get("reuse").and_then(|v| v.as_bool()), Some(true));
-        // meow-rs reads obfs as a block; the writer must not flatten it.
+        // meow-rs reads obfs as a block; the writer must not flatten it
         assert_eq!(
             snell
                 .get("obfs-opts")
@@ -1128,7 +1123,7 @@ mod tests {
         assert!(entry_to_clash(&entry(Scheme::Mieru, "c", &[])).is_none());
         assert!(entry_to_clash(&entry(Scheme::Naive, "c", &[])).is_none());
         // snell/anytls have mapping arms and are meow-tunnelable; a
-        // regression here silently strips them from Clash subscriptions.
+        // regression here silently strips them from Clash subscriptions
         assert!(entry_to_clash(&entry(Scheme::Snell, "c", &[])).is_some());
         assert!(entry_to_clash(&entry(Scheme::AnyTls, "c", &[])).is_some());
     }
@@ -1175,7 +1170,7 @@ mod tests {
             Some(true)
         );
 
-        // The end-to-end dispatch must not filter them out either.
+        // The end-to-end dispatch must not filter them out either
         let yaml = encode_clash(&[entry(Scheme::Snell, "psk-2", &[])]);
         let doc: Value = serde_norway::from_str(&yaml).expect("clash YAML");
         let proxies = doc["proxies"].as_sequence().expect("proxies");
@@ -1203,7 +1198,7 @@ mod tests {
             proxies[1].get("name").and_then(Value::as_str),
             Some("dup (2)")
         );
-        // No tuic anywhere: the scheme has no mihomo counterpart.
+        // No tuic anywhere: the scheme has no mihomo counterpart
         assert!(
             proxies
                 .iter()

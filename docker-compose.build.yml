@@ -1,19 +1,13 @@
-# Local build overlay for docker-compose.yml.
-#
+# Local build overlay for docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-#
-# The base file pins the published images by digest; a digest cannot be a
-# build tag ("build tag cannot contain a digest"), so the build path lives
-# in this overlay: it replaces the pinned references with local tags and
-# adds the build sections. The two files are meant to be used together,
-# never on their own: the overlay alone has no services of its own.
-#
-# The meow wrapper pins the upstream release: MEOW_VERSION names a
-# concrete tag and the two sums are the ones the upstream release
-# publishes for its musl archives. Bumping the version means bumping the
-# sums in the same edit (the build refuses a download whose hash does not
-# match), so a new upstream release is picked up through review, not by
-# accident.
+# The base file pins the published images by digest and a build tag cannot
+# carry a digest, so this overlay swaps in local tags and adds the build
+# sections. Used together with the base file, never alone: it has no
+# services of its own
+# The meow wrapper pins the upstream release: MEOW_VERSION and the two
+# musl-archive sums the upstream release publishes are bumped together in
+# the same edit, the build refuses a download whose hash does not match,
+# so a new upstream release is picked up through review, not by accident
 
 services:
   server:
@@ -24,13 +18,13 @@ services:
       # `mounts` builds through persistent BuildKit cache mounts: rebuilds
       # after a source change recompile only the workspace crates (~1 min
       # instead of ~7.5). Set FUMOX_BUILD_CACHE=layers in .env on builders
-      # without cache-mount support (e.g. podman-compose), that path uses
-      # the classic cargo-chef image layers. See the Dockerfile header.
+      # without cache-mount support (e.g. podman-compose), see the
+      # Dockerfile header
       args:
         BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
 
-  # The probe runs the same binary as the server, so it uses the same
-  # local image; no second build section is needed.
+  # Same binary as the server, so the same local image, no second build
+  # section needed
   probe:
     image: localhost/fumox:local
 

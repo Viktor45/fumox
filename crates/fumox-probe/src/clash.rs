@@ -15,17 +15,15 @@ pub fn proxy_name(proxy_id: i64) -> String {
 }
 
 /// One record of a T2 batch, the input of [`generate`]: the entry as the
-/// calling layer already parsed it from storage, the id the results map
-/// back to, and the vetted address the proxy dials when IP pinning is on
-/// (`None` keeps the entry's own host). The storage-row → entry conversion
-/// belongs to the calling layer, so this module only formats.
+/// calling layer parsed it from storage (this module only formats), the
+/// id the results map back to, and the vetted address the proxy dials
+/// when IP pinning is on (`None` keeps the entry's own host).
 pub struct BatchRow {
     pub id: i64,
     pub entry: ProxyEntry,
     pub vetted: Option<std::net::IpAddr>,
 }
 
-/// Shorthand for integer YAML scalars.
 fn num(value: i64) -> Value {
     Value::Number(value.into())
 }
@@ -33,7 +31,7 @@ fn num(value: i64) -> Value {
 /// The required credential field a scheme's entry must carry for the
 /// engine config, as a short problem description; `None` when the entry is
 /// complete. meow-rs (mihomo) refuses a config whose proxy carries no
-/// credential, and one such record used to void the whole batch at
+/// credential, and one such record voids the whole batch at
 /// `PUT /configs`, so the caller rejects the record itself before the
 /// config is generated. `socks5` may run without a credential (an
 /// anonymous proxy is valid); only a one-sided `user:pass` is malformed.
@@ -81,40 +79,34 @@ pub fn generate(rows: &[BatchRow], ipv6: bool) -> serde_norway::Result<(String, 
     root.insert(Value::String("socks-port".into()), num(0));
     root.insert(Value::String("allow-lan".into()), Value::Bool(false));
     root.insert(Value::String("mode".into()), Value::String("rule".into()));
-    // warning, not silent: a fully quiet kernel hides what a T2 batch died
-    // of (config rejects, listen failures) in the container log; the
-    // per-request chatter below warning stays off.
+    // warning, not silent: a fully quiet kernel hides what a T2 batch
+    // died of (config rejects, listen failures); per-request chatter
+    // below warning stays off
     root.insert(
         Value::String("log-level".into()),
         Value::String("warning".into()),
     );
     // Emitted explicitly, never left to the engine default: meow-rs 0.22.0
     // made `ipv6` effective end-to-end, so an omitted key is a real
-    // behavioural choice (IPv4-only) that `[meow].ipv6` should own.
+    // behavioural choice (IPv4-only) that `[meow].ipv6` should own
     root.insert(Value::String("ipv6".into()), Value::Bool(ipv6));
     root.insert(Value::String("proxies".into()), Value::Sequence(proxies));
     Ok((serde_norway::to_string(&Value::Mapping(root))?, included))
 }
 
 /// Map one batch record onto a Clash proxy definition; returns `None` for
-/// entries the core mapping cannot express (they are skipped, never
-/// fatal, log+skip policy).
-///
-/// The core mapping is the single source of truth for what meow-rs can
-/// tunnel: a scheme it does not know has no mihomo counterpart, and the
-/// mapping says so by returning `None`. The probe keeps no second list.
+/// entries the core mapping cannot express (skipped, never fatal). The
+/// core mapping is the single source of truth for what meow-rs can
+/// tunnel: the probe keeps no second list.
 ///
 /// When the record carries a vetted address, the entry is cloned with
-/// `host` replaced by that address before being serialized. This closes
-/// the vet/dial TOCTOU the same way T1 closes it: the proxy dials the
-/// vetted address, not whatever the OS resolver returns next. mihomo accepts
-/// an IP literal in `server`, and an IP is no certificate server name, so
+/// `host` replaced by that address before being serialized, closing the
+/// vet/dial TOCTOU the same way T1 closes it. mihomo accepts an IP
+/// literal in `server`, and an IP is no certificate server name, so
 /// pinning also carries the proxy's own hostname into the scheme's
-/// server-name param (see [`carry_server_name`]): the entry's `sni` /
-/// `servername` when it has one, its pre-pin host when it does not, which is
-/// what keeps certificate verification (its insecure toggle is dropped
-/// here, see [`generate`]) pointed at the right name while the hostname
-/// itself never enters the dial.
+/// server-name param (see [`carry_server_name`]): the entry's
+/// `sni`/`servername` when it has one, its pre-pin host when it does not
+/// (its insecure toggle is dropped here, see [`generate`]).
 fn proxy_to_value(row: &BatchRow) -> Option<Value> {
     let mut entry = row.entry.clone();
     if let Some(ip) = row.vetted {
@@ -122,10 +114,9 @@ fn proxy_to_value(row: &BatchRow) -> Option<Value> {
         carry_server_name(&mut entry, &pre_pin_host);
         entry.host = ip.to_string();
     }
-    // The insecure parameters (`is_insecure`'s aliases) come from the feed,
-    // not from the operator: dropping them keeps the shared mapping from
-    // rendering `skip-cert-verify` into the T2 config, so the tunnel check
-    // never verifies nothing just because the entry asked to.
+    // The insecure parameters come from the feed, not from the operator:
+    // dropping them keeps the shared mapping from rendering
+    // `skip-cert-verify` into the T2 config
     entry.params.retain(|p| !is_insecure_param(p));
     entry_to_clash_named(&entry, &proxy_name(row.id))
 }
@@ -133,29 +124,26 @@ fn proxy_to_value(row: &BatchRow) -> Option<Value> {
 /// The parameter the shared mapping reads the TLS server name from, as
 /// (destination key, source keys in the order they must be consulted), per
 /// scheme (`formats::clash`). `None` for the schemes the mapping never
-/// negotiates TLS with: ss has no TLS there, and mihomo reads no server name
-/// for a socks5 proxy.
+/// negotiates TLS with.
 ///
 /// For vless/vmess both spellings are copied into the same destination key
 /// and the later insert is the one that survives, so the mapping renders
 /// `servername` over `sni`; that is the order listed here, which keeps a
 /// pinned row on the name the unpinned row of the same entry renders.
 ///
-/// For trojan/hysteria2 the mapping reads `sni` alone. `servername` is
-/// listed second as a fallback the mapping itself would drop, since it
-/// emits no name at all for such a row, reading it is deliberate, see
-/// [`carry_server_name`].
+/// For trojan/hysteria2 the mapping reads `sni` alone; `servername` is
+/// listed second as a fallback the mapping itself would drop, reading it
+/// is deliberate, see [`carry_server_name`].
 fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'static str])> {
     match scheme {
         Scheme::Vless | Scheme::Vmess => Some(("servername", &["servername", "sni"])),
         // AnyTLS is TLS to its server and meow reads `sni` alone, so it
-        // pins exactly like trojan.
+        // pins exactly like trojan
         Scheme::Trojan | Scheme::Hysteria2 | Scheme::AnyTls => {
             Some(("sni", &["sni", "servername"]))
         }
         // Snell carries no top-level server name: its obfs name lives in
-        // `obfs-opts.host`, which the Clash mapping emits untouched, and
-        // with no obfs there is nothing to pin at all.
+        // `obfs-opts.host`, which the Clash mapping emits untouched
         Scheme::Ss
         | Scheme::Socks5
         | Scheme::Naive
@@ -175,8 +163,7 @@ fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'stat
 /// plain-TCP vless/vmess would flip it to a TLS node (`tls: true`) and
 /// the T2 check would tunnel-test a plaintext proxy as TLS. The decision
 /// is [`fumox_core::params::wants_tls`], the same one `t1::check_kind`
-/// consults; trojan/hysteria2/anytls negotiate TLS unconditionally, and
-/// the schemes [`server_name_sources`] maps to `None` get no param.
+/// consults.
 fn carry_server_name(entry: &mut ProxyEntry, pre_pin_host: &str) {
     let Some((key, sources)) = server_name_sources(entry.scheme) else {
         return;
@@ -221,9 +208,8 @@ mod tests {
         }
     }
 
-    /// A pinned batch record: the entry dials the vetted address instead of
-    /// its host, the way the calling layer pins a row whose host it has
-    /// resolved once per cycle.
+    /// A pinned batch record: the entry dials the vetted address instead
+    /// of its host.
     fn pinned(id: i64, entry: ProxyEntry) -> BatchRow {
         BatchRow {
             id,
@@ -306,7 +292,7 @@ mod tests {
         assert_eq!(vless["servername"].as_str(), Some("s.example.com"));
         assert_eq!(vless["reality-opts"]["public-key"].as_str(), Some("key"));
         // No `insecure` parameter on the entry: verification stays on, since
-        // T2 sends the credential through the tunnel.
+        // T2 sends the credential through the tunnel
         assert!(vless.get("skip-cert-verify").is_none());
 
         let ss = &proxies[1];
@@ -336,15 +322,14 @@ mod tests {
         assert_eq!(vmess["cipher"].as_str(), Some("aes-128-gcm"));
         assert_eq!(vmess["tls"].as_bool(), Some(true));
 
-        // Listener ports are disabled in the generated config.
         assert_eq!(parsed["port"].as_u64(), Some(0));
         assert_eq!(parsed["socks-port"].as_u64(), Some(0));
     }
 
     #[test]
     fn unsupported_schemes_are_skipped() {
-        // The probe keeps no list of its own: the core mapping decides,
-        // and a scheme it cannot express yields no proxy definition.
+        // The core mapping decides: a scheme it cannot express yields no
+        // proxy definition
         assert!(fumox_core::formats::clash::is_supported(Scheme::Vless));
         assert!(fumox_core::formats::clash::is_supported(Scheme::Hysteria2));
         assert!(!fumox_core::formats::clash::is_supported(Scheme::Tuic));
@@ -382,7 +367,7 @@ mod tests {
             required_field_problem(&entry(Scheme::Hysteria2, "", &[])),
             Some("missing password")
         );
-        // ss carries `cipher:password`; either half missing is malformed.
+        // ss carries `cipher:password`; either half missing is malformed
         assert_eq!(
             required_field_problem(&entry(Scheme::Ss, "aes-256-gcm:pw", &[])),
             None
@@ -395,7 +380,7 @@ mod tests {
             required_field_problem(&entry(Scheme::Ss, "noseparator", &[])),
             Some("missing cipher or password")
         );
-        // An anonymous socks5 is a valid node; a one-sided pair is not.
+        // An anonymous socks5 is a valid node; a one-sided pair is not
         assert_eq!(
             required_field_problem(&entry(Scheme::Socks5, "", &[])),
             None
@@ -408,9 +393,7 @@ mod tests {
 
     /// AnyTLS and Snell have mapping arms, so both reach the engine config
     /// and `included`; a pinned AnyTLS entry renders the `sni` meow's
-    /// anytls parser reads beside the pinned IP: the name the certificate
-    /// is verified against travels along while the dial goes to the
-    /// vetted address.
+    /// anytls parser reads beside the pinned IP.
     #[test]
     fn anytls_and_snell_are_included_and_a_pinned_anytls_keeps_its_server_name() {
         assert!(fumox_core::formats::clash::is_supported(Scheme::AnyTls));
@@ -446,8 +429,8 @@ mod tests {
     /// The insecure parameters (`insecure`, `allowInsecure`,
     /// `allow_insecure`, `skip-cert-verify`) ride in from an untrusted
     /// feed: T2 must not tunnel-test with verification off just because
-    /// the entry asked to, so the generator drops them and the config
-    /// carries no `skip-cert-verify` key at all.
+    /// the entry asked to, so the config carries no `skip-cert-verify` key
+    /// at all.
     #[test]
     fn skip_cert_verify_is_not_carried_from_the_entry_params() {
         let rows = vec![
@@ -482,9 +465,8 @@ mod tests {
         }
     }
 
-    /// Single-row batch + pin map mapping the row's host to a vetted IP:
-    /// the emitted `server` must be the pinned IP literal, and any
-    /// `sni`/`servername` on the entry must remain the original hostname
+    /// A pinned batch renders the vetted IP as `server`; any
+    /// `sni`/`servername` on the entry remains the original hostname
     /// (mihomo's TLS handshake reads SNI from those params, not from
     /// `server`).
     #[test]
@@ -506,9 +488,7 @@ mod tests {
         assert_eq!(proxy["servername"].as_str(), Some("real.example.com"));
     }
 
-    /// No vetted address → `server` keeps the original hostname verbatim,
-    /// matching today's behavior for any operator who hasn't enabled T2
-    /// IP pinning via the vetted-address path.
+    /// No vetted address: `server` keeps the original hostname verbatim.
     #[test]
     fn generates_yaml_with_empty_pin_keeps_original_host() {
         let rows = vec![record(
@@ -521,11 +501,9 @@ mod tests {
         assert_eq!(proxy["server"].as_str(), Some("h.example.com"));
     }
 
-    /// Two rows sharing a hostname → both YAML entries use the same vetted
-    /// address: the calling layer resolves one address per host per cycle,
-    /// and the probe batch is already id-deduplicated upstream, so two
-    /// rows sharing a hostname is by definition the same operator intent
-    /// for the same vetted IP.
+    /// Two rows sharing a hostname both use the same vetted address: the
+    /// batch is id-deduplicated upstream, so two rows on one host are by
+    /// definition the same operator intent for the same vetted IP.
     #[test]
     fn two_rows_same_host_use_the_same_pin() {
         let rows = vec![
@@ -540,12 +518,11 @@ mod tests {
         assert_eq!(proxies[1]["server"].as_str(), Some("203.0.113.10"));
     }
 
-    /// A pinned TLS entry with no `sni`/`servername` of its own, the shape
-    /// of a plain `trojan://pass@real.example.com:443` feed line, used to
-    /// be emitted as `server: <vetted ip>` and nothing else, so mihomo had
-    /// no name to verify the certificate against while verification itself
-    /// stayed on (T2 never forces `skip-cert-verify`). The pre-pin hostname
-    /// has to travel along as the server name, per scheme key.
+    /// A pinned TLS entry with no `sni`/`servername` of its own (a plain
+    /// `trojan://pass@real.example.com:443` feed line) must carry the
+    /// pre-pin hostname along as the server name, per scheme key:
+    /// verification stays on (T2 never forces `skip-cert-verify`), so
+    /// mihomo needs a name to verify the certificate against.
     #[test]
     fn pinning_keeps_a_tls_server_name_for_a_bare_entry() {
         let rows = vec![
@@ -578,16 +555,14 @@ mod tests {
 
     /// Pinning supplies a server name the entry is missing; it must never
     /// re-rank or shadow the one the entry already renders. The unpinned
-    /// render is the reference: the shared mapping copies `sni` and then
-    /// `servername` into the same `servername` key, the later insert wins,
-    /// and an empty value is not copied at all. Both renderings of the same
-    /// row have to agree on the name, or the pin silently changes which
-    /// certificate gets verified.
+    /// render is the reference: both renderings of the same row have to
+    /// agree on the name, or the pin silently changes which certificate
+    /// gets verified.
     #[test]
     fn pinning_never_re_ranks_the_entry_server_name() {
         // (scheme, params, the key `formats::clash` renders the name under)
         let cases: Vec<ServerNameCase> = vec![
-            // Both spellings: `servername` is the one the mapping keeps.
+            // Both spellings: `servername` is the one the mapping keeps
             (
                 Scheme::Vless,
                 vec![
@@ -598,7 +573,7 @@ mod tests {
                 "servername",
             ),
             // An empty `sni` is not copied by the mapping, so `servername`
-            // is the rendered name.
+            // is the rendered name
             (
                 Scheme::Vless,
                 vec![
@@ -608,7 +583,7 @@ mod tests {
                 ],
                 "servername",
             ),
-            // Only one spelling: it is the rendered name, whatever its key.
+            // Only one spelling: it is the rendered name, whatever its key
             (
                 Scheme::Vless,
                 vec![("security", "tls"), ("sni", "sni.example.com")],
@@ -664,7 +639,6 @@ mod tests {
     /// at all (the mapping reads `sni` for those two schemes and nothing
     /// else), and the pin turns that spelling into the `sni` mihomo reads,
     /// so the certificate is verified against a name instead of the IP.
-    /// This is the exception [`carry_server_name`] documents.
     #[test]
     fn pinning_supplies_a_sni_the_mapping_would_drop() {
         let plain = vec![
@@ -732,10 +706,9 @@ mod tests {
 
     /// A pinned entry that does not negotiate TLS must not grow a server
     /// name: a carried `servername` is an SNI to the shared predicate, so
-    /// the pin would flip a plain-TCP vless/vmess to a TLS node and the
-    /// T2 check would tunnel-test a plaintext proxy as TLS. The decision
-    /// is `params::wants_tls`, the same one `t1::check_kind` asks; an
-    /// entry that really negotiates TLS keeps its `servername`.
+    /// the pin would flip a plain-TCP vless/vmess to a TLS node. The
+    /// decision is `params::wants_tls`, the same one `t1::check_kind`
+    /// asks; an entry that really negotiates TLS keeps its `servername`.
     #[test]
     fn pinning_a_plain_tcp_entry_does_not_invent_a_server_name() {
         let rows = vec![

@@ -1,10 +1,7 @@
 //! Admin presentation helpers: the template methods that shape a value
-//! for the screen, as opposed to the ones that translate a key.
-//!
-//! The split keeps [`crate::admin::i18n`] about the catalog alone. The
-//! i18n layer resolves a key into a phrase; this module renders a
-//! timestamp, a proxy name or a status badge. The two meet only in the
-//! template structs, which get both sets of methods.
+//! for the screen (a timestamp, a proxy name, a status badge), as opposed
+//! to the ones that translate a key in [`crate::admin::i18n`]. The two
+//! meet only in the template structs, which get both sets of methods.
 
 /// The stored status value and the catalog key that renders it.
 ///
@@ -53,8 +50,8 @@ pub(crate) fn known_status_key(status: &str) -> Option<&'static str> {
         .map(|(_, key)| *key)
 }
 
-/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (the no-JS
-/// fallback). This text is the no-JS fallback inside [`fmt_ts_element`].
+/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS`, the no-JS
+/// fallback text inside [`fmt_ts_element`].
 pub(crate) fn fmt_ts(ts: i64) -> String {
     const FMT: &[time::format_description::FormatItem<'static>] =
         time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
@@ -114,11 +111,8 @@ pub(crate) fn fmt_day_plain(ts: i64) -> String {
 }
 
 /// Add the presentation helpers to a template struct that carries a
-/// `lang: Lang` field.
-///
-/// The helpers are separate from the i18n ones on purpose: they shape a
-/// value for the screen rather than translate a key, and the i18n layer
-/// stays free of the admin handlers.
+/// `lang: Lang` field (separate from the i18n helpers so that layer stays
+/// about the catalog alone).
 macro_rules! impl_presentation {
     ($ty:ty) => {
         impl $ty {
@@ -212,7 +206,7 @@ mod tests {
     fn day_element_omits_the_time_part() {
         // A midnight-UTC ingest bucket must label its column with the date
         // alone: the `day` class keeps the admin JS from writing a time
-        // back in, and a 64 px column has no room for one.
+        // back in, and a 64 px column has no room for one
         let html = fmt_day_element(1_700_000_000);
         assert_eq!(
             html,
@@ -223,7 +217,7 @@ mod tests {
 
     #[test]
     fn fmt_ts_element_carries_utc_datetime_and_fallback_text() {
-        // 1_700_000_000 == 2023-11-14 22:13:20 UTC.
+        // 1_700_000_000 == 2023-11-14 22:13:20 UTC
         let html = fmt_ts_element(1_700_000_000);
         assert_eq!(
             html,
@@ -236,7 +230,7 @@ mod tests {
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
         );
 
-        // Out-of-range timestamps fall back to the raw number in both forms.
+        // Out-of-range timestamps fall back to the raw number in both forms
         assert_eq!(
             fmt_ts_element(i64::MAX),
             format!("<time class=\"ts\" datetime=\"{0}\">{0}</time>", i64::MAX)

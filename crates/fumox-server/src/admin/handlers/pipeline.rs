@@ -1,10 +1,10 @@
-//! Pipeline builder endpoints: server-side generation and
-//! validation for the admin form widget. All of them are POSTs inside the
-//! protected admin router, so session auth and the CSRF middleware apply
-//! exactly like to every other admin action; the builder fields ride in the
-//! urlencoded body (`ped_*` names, see [`crate::admin::pipeline_editor`]).
-//! Rendering itself (widget, preview, rows) lives in the editor module ,
-//! these handlers are HTTP glue only.
+//! Pipeline builder endpoints: server-side generation and validation for
+//! the admin form widget. All of them are POSTs inside the protected
+//! admin router, so session auth and the CSRF middleware apply like to
+//! every other admin action; the builder fields ride in the urlencoded
+//! body (`ped_*` names, see [`crate::admin::pipeline_editor`]). Rendering
+//! itself (widget, preview, rows) lives in the editor module; these
+//! handlers are HTTP glue only.
 
 use super::{FormMap, not_found};
 use crate::admin::html_response;
@@ -38,7 +38,7 @@ pub async fn pipeline_preview(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     // `preview_body` has already handled its own rendering failure (logged,
-    // empty region), so the body arrives pre-rendered.
+    // empty region), so the body arrives pre-rendered
     let body = preview_body(&lang, &BuilderState::from_form(&form));
     html_response(lang, "pipeline/_preview.html", StatusCode::OK, Ok(body))
 }
@@ -61,7 +61,7 @@ pub async fn pipeline_rows(
     // An absent section is the rename container (the *Add rule* button
     // posts without one). An unknown name is a broken request, not the
     // rename rows: the caller asked for a container the widget does not
-    // render.
+    // render
     let section = if section.is_empty() {
         "rename"
     } else {
@@ -78,9 +78,7 @@ pub async fn pipeline_rows(
 ///
 /// Absent means "add a line" (the *Add rule* button), an index means
 /// "drop that line", and a value that does not parse is a broken
-/// request: it changes nothing at all. The two used to collapse into
-/// one, so a malformed `remove` appended a fresh line instead of
-/// leaving the rows as they were.
+/// request: it changes nothing at all.
 #[derive(Debug, PartialEq, Eq)]
 enum Remove {
     Absent,
@@ -106,7 +104,7 @@ fn apply_rows_request(built: &mut BuilderState, params: &FormMap) {
     // browser already has the row count it wants, the round-trip only
     // has to repaint the row layout (regex ↔ ASN switch). Without this
     // flag every change would append a fresh empty row, exactly like the
-    // explicit *Add rule* button does.
+    // explicit *Add rule* button does
     let append = !params.contains_key("render");
     match (
         params.get("section").map(String::as_str),
@@ -114,7 +112,7 @@ fn apply_rows_request(built: &mut BuilderState, params: &FormMap) {
         append,
     ) {
         // A `remove` that does not parse is a broken request: the rows
-        // stay as they are, no line is appended.
+        // stay as they are, no line is appended
         (_, Remove::Broken, _) => {}
         (Some("drop"), Remove::Index(index), _) => {
             if index < built.drop.len() {
@@ -168,7 +166,7 @@ pub async fn pipeline_preset(
     // A preset name the widget does not know is refused with an explicit
     // error instead of silently rendering the empty state: the operator
     // asked for a ready-made configuration and must not lose the built
-    // one to a typo in a link.
+    // one to a typo in a link
     let built = match preset(params.get("name").map(String::as_str).unwrap_or("blank")) {
         Some(built) => built,
         None => return not_found(lang, "err.preset_not_found"),
@@ -198,9 +196,6 @@ mod tests {
         }
     }
 
-    /// A `remove` that does not parse is a broken request: the rows stay
-    /// as they are. It used to read as "no remove at all", which
-    /// appended a fresh line to the section.
     #[test]
     fn a_broken_remove_changes_nothing() {
         for broken in ["abc", "", "1.5", "-1"] {
@@ -211,8 +206,6 @@ mod tests {
         }
     }
 
-    /// A `remove` that does not parse in the drop section changes
-    /// nothing either.
     #[test]
     fn a_broken_remove_in_the_drop_section_changes_nothing() {
         let mut built = state_with_rows(1, 3);
@@ -224,8 +217,6 @@ mod tests {
         assert_eq!(built.drop.len(), 3);
     }
 
-    /// An absent `remove` is the *Add rule* button: a fresh empty line
-    /// is appended to the section.
     #[test]
     fn an_absent_remove_appends_a_line() {
         let mut built = state_with_rows(1, 0);
@@ -237,8 +228,6 @@ mod tests {
         assert_eq!(built.drop.len(), 2);
     }
 
-    /// A `remove` with an index drops that line and leaves the others
-    /// alone.
     #[test]
     fn a_remove_with_an_index_drops_the_line() {
         let mut built = state_with_rows(3, 0);
@@ -250,8 +239,6 @@ mod tests {
         assert_eq!(built.drop.len(), 2);
     }
 
-    /// An index past the end of the section changes nothing: there is no
-    /// such line to drop.
     #[test]
     fn a_remove_past_the_end_changes_nothing() {
         let mut built = state_with_rows(2, 0);

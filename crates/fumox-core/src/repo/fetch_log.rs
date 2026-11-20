@@ -1,5 +1,3 @@
-//! `fetch_log` journal: one row per source fetch attempt.
-
 use super::BindWhereFilter;
 use crate::db::DbPool;
 use crate::models::ErrorClass;
@@ -26,11 +24,9 @@ pub struct FetchLogRow {
     pub attempts: Option<i64>,
 }
 
-/// One fetch attempt to be journaled.
-///
-/// Deliberately without metric fields: a measurement belongs to the call
-/// that made the attempt, so it travels through [`FetchTiming`] and
-/// callers without one pass [`FetchTiming::default()`].
+/// One fetch attempt to be journaled, deliberately without metric
+/// fields: a measurement belongs to the call that made the attempt, so
+/// it travels through [`FetchTiming`].
 #[derive(Debug, Clone)]
 pub struct FetchLogEntry<'a> {
     pub source_id: &'a str,
@@ -43,11 +39,9 @@ pub struct FetchLogEntry<'a> {
     pub error_class: Option<ErrorClass>,
 }
 
-/// The optional per-attempt metrics of one journal row.
-///
-/// Deliberately all-defaulted: a caller spells out only the fields it
-/// has (`FetchTiming { duration_ms: Some(ms), ..Default::default() }`),
-/// and [`insert`] stays the one public writer of the table.
+/// The optional per-attempt metrics of one journal row, deliberately
+/// all-defaulted: a caller spells out only the fields it has, and
+/// [`insert`] stays the one public writer of the table.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FetchTiming {
     /// Measured wall-clock duration of the fetch attempt in milliseconds
@@ -110,7 +104,7 @@ pub async fn recent_for_source(
 /// Global journal across all sources, newest first (admin screen).
 pub async fn recent_global(pool: &DbPool, limit: i64) -> crate::Result<Vec<FetchLogRow>> {
     // sqlx 0.9 SqlSafeStr: {order_newest_first} is a compile-time constant
-    // of this module; all data flows through .bind().
+    // of this module; all data flows through .bind()
     let sql = sqlx::AssertSqlSafe(format!(
         "SELECT * FROM fetch_log {}",
         order_newest_first(None)
@@ -119,12 +113,9 @@ pub async fn recent_global(pool: &DbPool, limit: i64) -> crate::Result<Vec<Fetch
     Ok(rows)
 }
 
-// Admin fetch-journal screen
-//
-// The dynamic list screen: filter clauses are whitelisted fragments
+// Admin fetch-journal screen: filter clauses are whitelisted fragments
 // assembled through the shared [`super::WhereFilter`], every value flows
-// through a bind. The count and the page query share one
-// [`FetchLogFilter::where_filter`], so their clause sets cannot drift.
+// through a bind.
 
 /// One row of the global fetch journal screen, joined with the source
 /// display name (`source_name` is NULL when the source row is gone).
@@ -174,10 +165,9 @@ pub struct FetchLogFilter {
 impl FetchLogFilter {
     /// The WHERE fragment and bound values shared by [`count_filtered`]
     /// and [`list_page`]: the one place the journal's dynamic clause set
-    /// is defined.
-    ///
-    /// Clauses must qualify columns with the `f` alias — `list_page`
-    /// joins `sources`, and an unqualified column becomes ambiguous.
+    /// is defined. Clauses must qualify columns with the `f` alias —
+    /// `list_page` joins `sources`, and an unqualified column becomes
+    /// ambiguous.
     fn where_filter(&self) -> super::WhereFilter {
         let mut wf = super::WhereFilter::new();
         match self.ok {
@@ -257,13 +247,11 @@ pub async fn count_filtered(pool: &DbPool, filter: &FetchLogFilter) -> crate::Re
 }
 
 /// One page of the global journal for `filter`, newest first, joined with
-/// the source display name.
-///
-/// Keyset paging: the page seeks to the `(fetched_at, id)` of the row it
-/// continues from ([`FetchLogPage`]) instead of skipping an SQL `OFFSET`,
-/// so a deep page costs a seek, not a walk over every row before it.
-/// `None` is the first page. Rows arrive in display order either way;
-/// callers over-fetch by one to learn whether a further page exists.
+/// the source display name. Keyset paging ([`FetchLogPage`]): the page
+/// seeks to the `(fetched_at, id)` of the row it continues from instead
+/// of skipping an SQL `OFFSET`. `None` is the first page; rows arrive in
+/// display order either way, callers over-fetch by one to learn whether
+/// a further page exists.
 pub async fn list_page(
     pool: &DbPool,
     filter: &FetchLogFilter,
@@ -277,9 +265,6 @@ pub async fn list_page(
     } else {
         order_newest_first(Some("f"))
     };
-    // The keyset predicate rides on the filter's WHERE; with no filter
-    // clauses it is the WHERE itself — an `AND` with nothing before it
-    // would land in the LEFT JOIN's ON and stop filtering the journal.
     let filter_sql = wf.sql();
     let keyset = keyset_predicate(page, backwards, "f.");
     let clause = if keyset.is_empty() {
@@ -290,7 +275,7 @@ pub async fn list_page(
         format!("{filter_sql} AND {keyset}")
     };
     // sqlx 0.9 SqlSafeStr: the clauses are compile-time constants of this
-    // module; every data value flows through a bind.
+    // module; every data value flows through a bind
     let sql = format!(
         "SELECT {LIST_COLUMNS}
          FROM fetch_log f LEFT JOIN sources s ON s.id = f.source_id
@@ -315,10 +300,8 @@ pub async fn list_page(
 }
 
 /// One page of one source's journal, newest first (source-card log).
-///
-/// Keyset paging like [`list_page`]: the page seeks to the
-/// `(fetched_at, id)` of the row it continues from instead of skipping an
-/// SQL `OFFSET`. `None` is the first page; rows arrive in display order.
+/// Keyset paging like [`list_page`]; `None` is the first page, rows
+/// arrive in display order.
 pub async fn list_for_source(
     pool: &DbPool,
     source_id: &str,
@@ -332,7 +315,7 @@ pub async fn list_for_source(
         order_newest_first(None)
     };
     // The read always carries `WHERE source_id = ?`, the predicate rides
-    // on it.
+    // on it
     let keyset = keyset_predicate(page, backwards, "");
     let keyset_sql = if keyset.is_empty() {
         String::new()
@@ -340,7 +323,7 @@ pub async fn list_for_source(
         format!("AND {keyset}")
     };
     // sqlx 0.9 SqlSafeStr: {keyset_sql} and {order} are compile-time
-    // constants of this module; all data flows through .bind().
+    // constants of this module; all data flows through .bind()
     let sql = sqlx::AssertSqlSafe(format!(
         "SELECT * FROM fetch_log WHERE source_id = ?
          {}
@@ -363,17 +346,13 @@ pub async fn list_for_source(
     Ok(rows)
 }
 
-/// How many journal rows one purge batch deletes.
 const PURGE_BATCH_SIZE: i64 = 10_000;
 
-/// Delete journal entries older than the cutoff (retention).
-///
-/// The delete runs in bounded batches, one statement each: a single
-/// `DELETE` over the whole expired population holds the write lock until
-/// the last row is gone and grows the WAL with one giant commit, which on
-/// a long-lived database is exactly the case the retention exists for.
-/// Each statement is its own transaction, so the lock is released between
-/// the batches.
+/// Delete journal entries older than the cutoff (retention), in bounded
+/// batches, one statement each: a single `DELETE` over the whole expired
+/// population holds the write lock until the last row is gone and grows
+/// the WAL with one giant commit, which on a long-lived database is
+/// exactly the case the retention exists for.
 pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     super::purge_batched(
         pool,
@@ -464,7 +443,7 @@ mod tests {
 
         let rows = recent_for_source(&pool, "srcA0000000", 10).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].fetched_at, 2000); // newest first
+        assert_eq!(rows[0].fetched_at, 2000);
         assert_eq!(rows[0].error_class.as_deref(), Some("network"));
         assert_eq!(rows[1].proxies_found, Some(42));
 
@@ -504,7 +483,7 @@ mod tests {
         .unwrap();
 
         // Same fetched_at, so insertion order (id DESC) decides: the newest
-        // row is the timed one.
+        // row is the timed one
         let rows = recent_for_source(&pool, "srcA0000000", 10).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].duration_ms, Some(1234));
@@ -521,8 +500,7 @@ mod tests {
     }
 
     /// `recent_for_source` caps its answer at `limit` and returns the
-    /// newest rows: a source card that asks for two sees the two latest
-    /// attempts, not the two first ones.
+    /// newest rows, not the oldest.
     #[tokio::test]
     async fn recent_for_source_respects_the_limit() {
         let (_dir, pool) = temp_pool().await;
@@ -564,7 +542,7 @@ mod tests {
         for (id, name) in [("srcA0000000", "Alpha"), ("srcB0000000", "Beta")] {
             seed_source(&pool, id, name).await;
         }
-        // (fetched_at, source, ok, error_class): four attempts.
+        // (fetched_at, source, ok, error_class): four attempts
         let rows = [
             (1000, "srcA0000000", 1, None),
             (1001, "srcA0000000", 0, Some("network")),
@@ -585,7 +563,6 @@ mod tests {
             .unwrap();
         }
 
-        // Unfiltered: count and page agree, newest first, names resolved.
         let filter = FetchLogFilter::default();
         assert_eq!(count_filtered(&pool, &filter).await.unwrap(), 4);
         let page = list_page(&pool, &filter, 10, None).await.unwrap();
@@ -595,7 +572,6 @@ mod tests {
         );
         assert_eq!(page[0].source_name.as_deref(), Some("Beta"));
 
-        // Result filter.
         let filter = FetchLogFilter {
             ok: Some(false),
             ..Default::default()
@@ -609,7 +585,6 @@ mod tests {
         };
         assert_eq!(count_filtered(&pool, &filter).await.unwrap(), 3);
 
-        // Error class and source filters, combined.
         let filter = FetchLogFilter {
             error_class: "network".into(),
             ..Default::default()
@@ -627,8 +602,8 @@ mod tests {
         };
         assert_eq!(count_filtered(&pool, &filter).await.unwrap(), 1);
 
-        // Pagination windows: the first page, then the page the cursor of
-        // its last row leads to — the keyset seek replaces the offset walk.
+        // Pagination windows: the first page, then the page its cursor
+        // leads to
         let first = list_page(&pool, &FetchLogFilter::default(), 2, None)
             .await
             .unwrap();
@@ -656,8 +631,6 @@ mod tests {
             vec![1001, 1000]
         );
 
-        // A backwards page re-reads the rows on the newer side of the
-        // cursor, still newest first.
         let back = list_page(
             &pool,
             &FetchLogFilter::default(),
@@ -677,7 +650,6 @@ mod tests {
             vec![1003, 1002]
         );
 
-        // Source-card pagination.
         let page = list_for_source(&pool, "srcA0000000", 2, None)
             .await
             .unwrap();
@@ -751,7 +723,6 @@ mod tests {
                 direction: FetchLogDirection::Forward,
             });
         }
-        // Newest first is write order reversed; the walk saw every row.
         assert_eq!(
             seen,
             vec![Some(5), Some(4), Some(3), Some(2), Some(1), Some(0)]

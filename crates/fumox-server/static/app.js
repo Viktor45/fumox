@@ -1,19 +1,16 @@
-// Admin panel behaviour.
-//
-// Loaded with `defer` from /admin/static/app.js, so the document is
-// parsed when this runs. The content-security policy allows scripts from
-// this origin only: there is no inline script and no inline event
-// handler in the templates, every handler is delegated from here.
-//
+// Admin panel behaviour. Loaded with `defer` from /admin/static/app.js.
+// The content-security policy allows scripts from this origin only: no
+// inline script and no inline event handler in the templates, every
+// handler is delegated from here.
 // The toast handler decodes its message with `decodeURIComponent`: the
 // server percent-encodes every message it sends (the `HX-Trigger` header
-// and the pending toast alike), because a header is Latin-1 on the wire
-// and raw UTF-8 would arrive as mojibake.
+// and the pending toast alike), a header is Latin-1 on the wire and raw
+// UTF-8 would arrive as mojibake
 
 (function () {
   'use strict';
 
-  // Toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}.
+  // Toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}
   document.body.addEventListener('toast', function (e) {
     var wrap = document.getElementById('toast-wrap');
     if (!wrap) return;
@@ -22,16 +19,15 @@
     var isError = detail.level === 'error';
     div.className = 'toast' + (isError ? ' error' : '');
     // role=status/alert makes the toast announced by screen readers;
-    // errors stay longer.
+    // errors stay longer
     div.setAttribute('role', isError ? 'alert' : 'status');
     var message = detail.message || '';
     try { message = decodeURIComponent(message); } catch (_) {}
-    // A missing message falls back to the localized "action failed"
-    // string the wrap carries, never to a debug String(detail) (which
-    // would print "[object Object]").
+    // A missing message falls back to the localized "action failed" string
+    // the wrap carries, never to a debug String(detail) ("[object Object]")
     div.textContent = message || wrap.getAttribute('data-fallback') || '';
     // Dismissal is a real button: reachable from the keyboard, with the
-    // pointer cursor on a control instead of the whole toast.
+    // pointer cursor on a control instead of the whole toast
     var close = document.createElement('button');
     close.type = 'button';
     close.className = 'toast-close';
@@ -45,8 +41,7 @@
 
   // Toast of a plain-browser action: the server parks the message in the
   // session and hands it over here, once. It does not travel through the
-  // URL, so a copied link cannot replay it and a crafted link cannot
-  // fake one.
+  // URL, so a copied link cannot replay it and a crafted link cannot fake one
   (function () {
     if (!window.fetch) return;
     fetch('/admin/flash', { credentials: 'same-origin' })
@@ -63,10 +58,10 @@
       .catch(function () { /* a missing toast is not worth an error */ });
   })();
 
-  // SSE: push updates from the server. Each event is
-  // re-broadcast on <body> as a namespaced DOM event so HTMX fragments
-  // can react with hx-trigger="fumox:*". Polling fragments remain the
-  // no-JS fallback, SSE is a pure enhancement.
+  // SSE: push updates from the server, each event re-broadcast on <body>
+  // as a namespaced DOM event so HTMX fragments can react with
+  // hx-trigger="fumox:*". Polling fragments remain the no-JS fallback,
+  // SSE is a pure enhancement
   (function () {
     if (!window.EventSource) return;
     var statusEl = document.getElementById('sse-status');
@@ -81,7 +76,7 @@
     var es = new EventSource('/admin/events');
     es.addEventListener('open', function () { setStatus('live'); });
     es.addEventListener('error', function () {
-      // EventSource reconnects on its own; show the gap meanwhile.
+      // EventSource reconnects on its own; show the gap meanwhile
       setStatus(es.readyState === EventSource.OPEN ? 'live' : 'stale');
     });
     ['fetch.started', 'fetch.done', 'fetch.failed']
@@ -93,7 +88,7 @@
         });
       });
     // When any fetch finishes, refresh the in-flight status fragment and
-    // the source fetch-log if either is present on the page.
+    // the source fetch-log if either is present on the page
     function refreshAfterFetch() {
       if (!window.htmx) return;
       ['refresh-status', 'log-live'].forEach(function (id) {
@@ -106,9 +101,9 @@
   })();
 
   // Toggle swaps replace the button the user just activated (the form
-  // travels out-of-band with the badge), so keyboard focus falls to
-  // <body> after every click. Put it back on the re-created button, but
-  // only when focus was not moved elsewhere in the meantime.
+  // travels out-of-band with the badge), so keyboard focus falls to <body>
+  // after every click; put it back on the re-created button, but only when
+  // focus was not moved elsewhere in the meantime
   (function () {
     function restoreToggleFocus(event) {
       var target = event.detail && event.detail.target;
@@ -124,12 +119,12 @@
     document.body.addEventListener('htmx:oobAfterSwap', restoreToggleFocus);
   })();
 
-  // Local time: the server emits every
-  // timestamp as <time class="ts" datetime="RFC3339 UTC">UTC text</time>.
-  // The browser rewrites the text into the user's timezone, formatted in
-  // the panel language (<html lang>), without JS the UTC text stays.
-  // Re-run after every HTMX swap: fragments carry <time> elements too.
-  // Idempotent: the text is always rebuilt from the datetime attribute.
+  // Local time: the server emits every timestamp as
+  // <time class="ts" datetime="RFC3339 UTC">UTC text</time>; the browser
+  // rewrites the text into the user's timezone, formatted in the panel
+  // language (<html lang>), without JS the UTC text stays. Re-run after
+  // every HTMX swap (fragments carry <time> too); idempotent, the text is
+  // always rebuilt from the datetime attribute
   (function () {
     function localize(root) {
       if (!root.querySelectorAll) return;
@@ -142,7 +137,7 @@
         });
         // `time.ts.day` marks a calendar-day bucket (the ingest chart's
         // columns): the time of day is always 00:00 and only crowds out
-        // the date in a 64px column, so those keep the date alone.
+        // the date in a 64px column, so those keep the date alone
         dayOnly = new Intl.DateTimeFormat(lang, {
           year: 'numeric', month: '2-digit', day: '2-digit'
         });
@@ -160,7 +155,7 @@
         var fmt = isDay ? dayOnly : full;
         var local = fmt.format(stamp);
         el.textContent = local;
-        // Language-neutral tooltip: the original UTC instant and the zone used.
+        // Language-neutral tooltip: the original UTC instant and the zone used
         el.title = attr + ' → ' + local + zone;
       });
     }
@@ -171,17 +166,15 @@
   })();
 
   // Pipeline widget: show/hide the inner fields of a tri-state section
-  // (geo / sort / limit) based on which radio is checked. The inner
-  // fields are always in the DOM so the browser can hold typed values
-  // across toggles; the `hidden` attribute is the only visibility knob.
-  // Runs on initial load (initial state) and on every HTMX settle (the
-  // widget re-renders on preset / mode / preview refresh).
-  //
-  // The token names below are the contract between the rendered widget
-  // and this script: the template emits `data-ped-section="<name>"`,
-  // the radio group `ped_<name>` and the inner block
-  // `data-ped-inner="<name>"` for every section. A test suite keeps the
-  // two sides in sync (template_contracts.rs); change them together.
+  // (geo / sort / limit) based on which radio is checked. The inner fields
+  // are always in the DOM so the browser can hold typed values across
+  // toggles; the `hidden` attribute is the only visibility knob. Runs on
+  // initial load and on every HTMX settle (the widget re-renders on
+  // preset / mode / preview refresh).
+  // The token names below are the contract between the rendered widget and
+  // this script: the template emits `data-ped-section="<name>"`, the radio
+  // group `ped_<name>`, the inner block `data-ped-inner="<name>"`;
+  // template_contracts.rs keeps the two sides in sync, change them together
   var PED_SECTION_ATTR = 'data-ped-section';
   var PED_INNER_ATTR = 'data-ped-inner';
   var PED_INPUT_PREFIX = 'ped_';
@@ -192,13 +185,13 @@
       var checked = section.querySelector('input[name="' + PED_INPUT_PREFIX + name + '"]:checked');
       var inner = section.querySelector('[' + PED_INNER_ATTR + '="' + name + '"]');
       if (!inner) return;
-      // Hide when the section is `skip`; show otherwise. `defaults`
-      // and `set` keep the inner fields visible so the user can edit.
-      // A hidden block is disabled along with the hiding: its fields
-      // are dropped on save (the section is skipped), so submitting
-      // them would promise what the server silently ignores. Disabled
-      // controls are left out of the submission by both the plain form
-      // and htmx, and they keep their typed values for the toggle-back.
+      // Hide when the section is `skip`; show otherwise (`defaults` and
+      // `set` keep the inner fields editable). A hidden block is disabled
+      // along with the hiding: its fields are dropped on save, so
+      // submitting them would promise what the server silently ignores
+      // (disabled controls are left out of the submission by both plain
+      // forms and htmx, and they keep their typed values for the
+      // toggle-back)
       var inputs = inner.querySelectorAll('input, select, textarea');
       if (checked && checked.value === 'skip') {
         inner.setAttribute('hidden', '');
@@ -213,7 +206,6 @@
       for (var i = 0; i < sections.length; i++) syncSection(sections[i]);
     }
     syncAll(document);
-    // User clicks on a tri-state radio.
     document.body.addEventListener('change', function (event) {
       var target = event.target;
       if (!(target instanceof HTMLInputElement)) return;
@@ -222,9 +214,6 @@
       var section = target.closest('[' + PED_SECTION_ATTR + ']');
       if (section) syncSection(section);
     });
-    // The widget is re-rendered by HTMX on preset / mode / preview
-    // refresh, re-run after every settle so the initial state matches
-    // the rendered radios.
     document.body.addEventListener('htmx:afterSettle', function () {
       syncAll(document);
     });
@@ -232,7 +221,7 @@
 
   // Settings tabs: the panes swap on the radio's :checked, but
   // `aria-selected` is server-rendered and would keep naming the tab the
-  // page loaded with. Mirror the radio onto the labels.
+  // page loaded with; mirror the radio onto the labels
   (function () {
     function syncTabs() {
       document.querySelectorAll('input.tab-input').forEach(function (input) {
@@ -249,7 +238,7 @@
   // Rule counters: the lists are capped in height, so the number is the
   // only way to see how many rules a section holds, and htmx changes the
   // rows without a page render. Blank lines do not count, the rename
-  // editor always keeps one and it emits no rule.
+  // editor always keeps one and it emits no rule
   (function () {
     function filledRows(container) {
       if (!container) return 0;
@@ -279,13 +268,13 @@
   })();
 
   // Pipeline rule rows: the container is re-rendered wholesale after a
-  // target change or a row removal, and only the target select carries
-  // a stable id for htmx to hand the focus back to. Track where the
-  // focus sat (row number and the control's position inside the row)
-  // and put it back after the settle; when the row the user was on was
-  // removed, land on the neighbouring remove button. A hidden live
-  // region next to the rows says that the list changed: the rows
-  // themselves stay silent, a re-rendered table would read itself out.
+  // target change or a row removal, and only the target select carries a
+  // stable id for htmx to hand the focus back to. Track where the focus
+  // sat (row number and the control's position inside the row) and put it
+  // back after the settle; when the row was removed, land on the
+  // neighbouring remove button. A hidden live region next to the rows says
+  // that the list changed: the rows themselves stay silent, a re-rendered
+  // table would read itself out
   (function () {
     var ROW_CONTAINER_SEL = '#ped-rows, #ped-drop-rows';
     var snapshot = null;
@@ -295,8 +284,7 @@
     }
 
     // Where the focus sits, kept current on every focus move inside the
-    // rows: the restore must not depend on which control fired the
-    // request.
+    // rows: the restore must not depend on which control fired the request
     document.body.addEventListener('focusin', function (event) {
       var active = event.target;
       if (!active || !active.closest) return;
@@ -312,10 +300,10 @@
       };
     });
 
-    // The remove button drops its own row: remember the row so the
-    // focus can land on the neighbour's button after the swap. The
-    // click runs before the request; the button's hx-post carries the
-    // rows endpoint's `remove=` form — a contract with _rows.html.
+    // The remove button drops its own row: remember the row so the focus
+    // can land on the neighbour's button after the swap. The click runs
+    // before the request; the button's hx-post carries the rows endpoint's
+    // `remove=` form, a contract with _rows.html
     document.body.addEventListener('click', function (event) {
       var target = event.target;
       if (!(target instanceof HTMLButtonElement)) return;
@@ -342,9 +330,8 @@
       var live = document.querySelector('[data-ped-live="' + remembered.container + '"]');
       if (live) live.textContent = live.getAttribute('data-list-changed') || '';
 
-      // The keyboard user's focus fell to <body> with the row it sat
-      // in; put it back, but only when focus was not moved elsewhere in
-      // the meantime.
+      // The keyboard user's focus fell to <body> with the row it sat in;
+      // put it back, but only when focus was not moved elsewhere meanwhile
       if (document.activeElement !== document.body) return;
       var rows = target.querySelectorAll('.ped-row');
       if (!rows.length) return;
@@ -359,16 +346,14 @@
     });
   })();
 
-  // Dialogs: a trigger carries `data-dialog-open="<dialog id>"`, a
-  // cancel button carries `data-dialog-close`. The no-JS fallback in
-  // base.html renders the dialog as a plain panel and hides the trigger,
-  // so the form inside stays reachable without scripting.
-  //
-  // The focus goes to the heading of the dialog, not to the first
-  // control: in the destructive dialogs the first control is the button
-  // that applies them, and a keyboard user must not be able to press it
-  // by accident. The focus returns to the trigger when the dialog
-  // closes.
+  // Dialogs: a trigger carries `data-dialog-open="<dialog id>"`, a cancel
+  // button `data-dialog-close`. The no-JS fallback in base.html renders the
+  // dialog as a plain panel and hides the trigger, so the form inside stays
+  // reachable without scripting.
+  // The focus goes to the heading of the dialog, not to the first control:
+  // in the destructive dialogs the first control is the button that applies
+  // them, and a keyboard user must not be able to press it by accident. The
+  // focus returns to the trigger when the dialog closes
   document.body.addEventListener('click', function (event) {
     var target = event.target;
     if (!target || !target.closest) return;
@@ -390,11 +375,10 @@
     }
   });
 
-  // A request the server refused: the plain-text body of the response
-  // (a localized "not found" or "internal error") is printed into the
-  // slot the page keeps next to the control that failed. The
-  // content-security policy forbids inline handlers, so the listener is
-  // delegated from here.
+  // A request the server refused: the plain-text body of the response (a
+  // localized "not found" or "internal error") is printed into the slot
+  // next to the control that failed. The content-security policy forbids
+  // inline handlers, so the listener is delegated from here
   (function () {
     function slotFor(elt) {
       var holder = elt && elt.closest ? elt.closest('[data-error-target]') : null;
@@ -413,10 +397,10 @@
       var message = xhr && xhr.responseText ? xhr.responseText.trim() : '';
       slot.textContent = message || slot.getAttribute('data-error-fallback') || '';
     });
-    // A request that never got an answer (the network dropped, the
-    // server is gone): htmx fires sendError and no responseError, so
-    // without this the slot would keep claiming the action succeeded.
-    // There is no body to print, the slot's fallback text stands in.
+    // A request that never got an answer (network dropped, server gone):
+    // htmx fires sendError and no responseError, so without this the slot
+    // would keep claiming the action succeeded; there is no body to print,
+    // the slot's fallback text stands in
     document.body.addEventListener('htmx:sendError', function (event) {
       var slot = slotFor(event.detail && event.detail.elt);
       if (!slot) return;
@@ -445,7 +429,7 @@
       var newest = list.reduce(function (a, b) { return a > b ? a : b; });
       var seen = container.getAttribute('data-newest');
       if (seen === null) {
-        // The first render is the baseline, nothing is new yet.
+        // The first render is the baseline, nothing is new yet
         container.setAttribute('data-newest', String(newest));
         return;
       }
@@ -465,14 +449,14 @@
 
   // The theme and language switchers return to the current page: their
   // hidden `next` inputs carry the current path, filled here once per
-  // document load (the script is deferred, so this runs before any
-  // interaction). Without JavaScript the inputs stay empty and the
-  // server falls back to the dashboard.
+  // document load (deferred script, before any interaction). Without
+  // JavaScript the inputs stay empty and the server falls back to the
+  // dashboard
   document.querySelectorAll('input[data-next-input]').forEach(function (input) {
     input.value = location.pathname + location.search;
   });
 
-  // A select that submits its own form (the dashboard's row count).
+  // A select that submits its own form (the dashboard's row count)
   document.body.addEventListener('change', function (event) {
     var target = event.target;
     if (!(target instanceof HTMLSelectElement)) return;
@@ -481,7 +465,7 @@
   });
 
   // A form that asks before it acts: the confirmation text is the
-  // `data-confirm` attribute of the form.
+  // `data-confirm` attribute of the form
   document.body.addEventListener('submit', function (event) {
     var form = event.target;
     if (!form || !form.getAttribute) return;
@@ -490,11 +474,11 @@
     if (!window.confirm(message)) event.preventDefault();
   });
 
-  // A form the server refused: the first invalid control takes the
-  // focus, so the operator lands on the field that has to be fixed
-  // instead of on the top of a long form. The control can sit in a pane
-  // that the CSS-only tabs keep hidden, and a hidden control cannot take
-  // the focus, so its pane is opened first.
+  // A form the server refused: the first invalid control takes the focus,
+  // so the operator lands on the field that has to be fixed instead of on
+  // the top of a long form. The control can sit in a pane that the
+  // CSS-only tabs keep hidden, and a hidden control cannot take the focus,
+  // so its pane is opened first
   (function () {
     function openPaneOf(element) {
       var pane = element.closest('.tab-pane');
@@ -506,7 +490,7 @@
         if (label.getAttribute('aria-controls') !== pane.id) continue;
         if (radios[i].checked) return;
         radios[i].checked = true;
-        // The strip's `aria-selected` is mirrored from the radio.
+        // The strip's `aria-selected` is mirrored from the radio
         radios[i].dispatchEvent(new Event('change', { bubbles: true }));
         return;
       }
@@ -514,15 +498,14 @@
     var invalid = document.querySelector('[aria-invalid="true"]');
     if (!invalid) return;
     openPaneOf(invalid);
-    // Reading a layout property flushes the style, so the pane is
-    // already visible when the focus is moved into it.
+    // Reading a layout property flushes the style, so the pane is already
+    // visible when the focus is moved into it
     void invalid.offsetHeight;
     invalid.focus();
   })();
 
-  // The import screen: load a chosen JSON file into the payload
-  // textarea. The textarea also accepts a manual paste, so the flow
-  // works without scripting.
+  // The import screen: load a chosen JSON file into the payload textarea;
+  // it also accepts a manual paste, so the flow works without scripting
   (function () {
     var input = document.getElementById('io-file');
     if (!input || !window.FileReader) return;

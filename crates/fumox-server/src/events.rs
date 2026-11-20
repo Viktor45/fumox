@@ -7,18 +7,9 @@
 //! own polling cadence as well, so a dropped event delays an update but
 //! never loses state.
 //!
-//! The names ([`FETCH_QUEUED`], [`FETCH_STARTED`], [`FETCH_DONE`],
-//! [`FETCH_FAILED`]) and the `data` fields each carries:
-//!
-//! - `fetch.queued`: `source_id` — the refresh has to wait for a
-//!   concurrency permit (a free permit skips straight to `fetch.started`).
-//! - `fetch.started`: `source_id` — the request can actually go out (a
-//!   concurrency permit is in hand).
-//! - `fetch.done`: `source_id`, `ok: true`, `proxies_found`, `dropped`,
-//!   `duration_ms`.
-//! - `fetch.failed`: `source_id`, `ok: false`, `error_class`, `message`,
-//!   `http_status` (set when the server answered one), `duration_ms` (a
-//!   panic before the fetch started reports none of the measured ones).
+//! The event names ([`FETCH_QUEUED`], [`FETCH_STARTED`], [`FETCH_DONE`],
+//! [`FETCH_FAILED`]) and the `data` fields each carries are documented on
+//! the constants.
 
 use tokio::sync::broadcast;
 
@@ -63,7 +54,7 @@ impl EventBus {
     pub fn new() -> Self {
         // Small buffer: SSE consumers tolerate dropped events (they are
         // notifications, the fragments they trigger refresh on their own
-        // cadence: the polls and page loads are the source of truth).
+        // cadence: the polls and page loads are the source of truth)
         let (tx, _) = broadcast::channel(64);
         Self { tx }
     }
@@ -88,7 +79,7 @@ mod tests {
         let mut rx = bus.subscribe();
         bus.publish(FETCH_DONE, serde_json::json!({"source_id": "s1"}));
         let event = rx.recv().await.unwrap();
-        // The literal, not the constant: the value itself stays pinned.
+        // The literal, not the constant: the value itself stays pinned
         assert_eq!(event.name, "fetch.done");
         assert_eq!(event.data["source_id"], "s1");
     }

@@ -1,5 +1,5 @@
 # Fumox + meow-rs, one-command deployment: three containers (server, probe,
-# meow) wired through shared volumes and env overrides.
+# meow) wired through shared volumes and env overrides
 #
 # Quick start:
 #   cp .env.example .env        # then set FUMOX_ADMIN__TOKEN and
@@ -9,169 +9,139 @@
 #                               # ...or build server + meow locally from source
 #   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
 #
-# Services:
-#   server  fumox-server : public /sub + /src on :8080, admin panel on :8081
-#   probe   fumox-probe  : health-check daemon (T1 TCP/TLS + T2 tunnel checks)
-#   meow    meow-rs      : mihomo-compatible kernel the probe drives for T2
+# Images are pinned by digest (`image:` lines): one immutable manifest, so a
+# deployment cannot change under a running stack. docker-compose.build.yml
+# is the overlay replacing them with local builds; the two never mix, a
+# build tag cannot carry a digest
 #
-# The images are pinned by digest (see the `image:` lines): a digest names
-# one immutable manifest, so a deployment cannot change under a running
-# stack. `docker-compose.build.yml` is the overlay that replaces them with
-# local builds; the two never mix, because a build tag cannot carry a
-# digest.
-#
-# How the probe ↔ meow wiring works:
-#   - probe reaches the meow-rs REST API at meow:9090 (FUMOX_MEOW__API_ADDR);
+# Probe ↔ meow wiring:
+#   - probe reaches the meow-rs REST API at meow:9090 (FUMOX_MEOW__API_ADDR)
 #   - probe renders the T2 batch to /shared/meow/meow.yaml and calls PUT
 #     /configs with that exact path, so BOTH containers mount the meow
-#     volume at the same location (FUMOX_MEOW__CONFIG_PATH=/shared/meow/meow.yaml);
-#   - meow's external-controller (9090) is only reachable from the probe over
-#     the dedicated `meow` network; it is deliberately not published to the
-#     host and it answers only to a caller that presents the controller
-#     secret (FUMOX_MEOW__API_TOKEN).
+#     volume at the same location (FUMOX_MEOW__CONFIG_PATH=/shared/meow/meow.yaml)
+#   - the controller (9090) is reachable only from the probe over the
+#     dedicated `meow` network, deliberately not published to the host,
+#     and answers only to a caller presenting the controller secret
+#     (FUMOX_MEOW__API_TOKEN)
 #
-# Config file location: the services point the loader at the mounted
-# ./config volume explicitly (FUMOX_CONFIG=/app/config/app.toml, the default
-# the image would use anyway). Set FUMOX_CONFIG in .env to a different file
-# name inside that volume (e.g. /app/config/prod.toml), remember the
-# mounted file must exist, a missing one is a startup error.
+# Config: the services point the loader at the mounted ./config volume
+# (FUMOX_CONFIG=/app/config/app.toml, the default the image would use
+# anyway); set FUMOX_CONFIG in .env for another file name inside that
+# volume, the mounted file must exist, a missing one is a startup error
 #
 # Volumes:
 #   fumox-data   SQLite database, shared by server and probe -> /app/data
-#   fumox-geo    GeoLite2 .mmdb files, written by the server   -> /shared/geo
-#   fumox-meow   generated Clash config exchange                -> /shared/meow
-#   ./config     app.toml                                      -> /app/config
-#                (probe always :ro; the server :rw so the admin
-#                *Edit settings* page can save, or :ro with
+#   fumox-geo    GeoLite2 .mmdb files, written by the server -> /shared/geo
+#   fumox-meow   generated Clash config exchange             -> /shared/meow
+#   ./config     app.toml -> /app/config (probe always :ro; the server :rw
+#                so the admin *Edit settings* page can save, or :ro with
 #                FUMOX_CONFIG_ACCESS=ro)
 #
-# Each container runs as a non-root user with no capabilities and a
+# Every container runs as a non-root user with no capabilities and a
 # read-only root filesystem; every path a binary writes to is a volume, a
 # bind mount or a tmpfs (/tmp for the SQLite scratch files, /run/meow for
-# the rendered kernel config).
+# the rendered kernel config)
 #
-# GeoLite2 .mmdb files do NOT go into ./config: the server sets
-# FUMOX_GEO__DB_DIR=/shared/geo (the geo volume), and the environment
-# outranks config/app.toml, so ./config is never scanned for databases. The
-# server downloads them into /shared/geo at startup, which is why the manual
-# step below is optional and needs no action on a stock `docker compose up`.
-# To supply your own MaxMind files, copy them into that volume:
+# GeoLite2 .mmdb files do NOT go into ./config: FUMOX_GEO__DB_DIR=/shared/geo
+# (the geo volume) outranks config/app.toml, so ./config is never scanned
+# for databases. The server downloads them into /shared/geo at startup; to
+# supply your own MaxMind files:
 #   docker compose cp GeoLite2-City.mmdb server:/shared/geo/
-# or drop the FUMOX_GEO__DB_DIR override and set [geo].db_dir instead.
+# or drop the FUMOX_GEO__DB_DIR override and set [geo].db_dir instead
 
 services:
   server:
     image: ${FUMOX_IMAGE:-ghcr.io/viktor45/fumox@sha256:6490bda1a14b3ce12b5192121cfb92ffca220761a732661f4bd2a79d8373f466}
     command: ["fumox-server"]
-    # Least privilege: the image already runs as this user (uid/gid 999),
-    # the explicit line keeps the guarantee visible in the deployment and
-    # survives an image change.
+    # The image already runs as uid/gid 999; the explicit line keeps the
+    # guarantee visible in the deployment and survives an image change
     user: "999:999"
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      # SQLite needs a scratch directory; nothing else on the image is
-      # writable.
+      # SQLite scratch directory; nothing else on the image is writable
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
-      # The panel is off without a token. "change-me" is not a token: the
-      # server refuses to start with it on a non-loopback bind.
+      # The panel is off without a token; "change-me" is not a token, the
+      # server refuses to start with it on a non-loopback bind
       FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env (a random value, not "change-me")}
-      # Add `; Secure` to the admin session cookie. Set true when the panel is
-      # reached through an HTTPS front (reverse proxy with TLS); leave false
-      # for plain-HTTP localhost access (browsers drop Secure cookies on
-      # http://). config/app.toml ships this off; the compose default here is
-      # true (ready for an HTTPS front), so a plain-HTTP stand must pin
-      # FUMOX_ADMIN__SECURE_COOKIES=false in .env. `${VAR-true}` without the
-      # colon: a default applies only when the variable is unset, an empty
-      # .env value passes through as-is instead of being masked by `true`.
+      # compose defaults true (ready for an HTTPS front), so a plain-HTTP
+      # stand must pin FUMOX_ADMIN__SECURE_COOKIES=false in .env (browsers
+      # drop Secure cookies on http://). `${VAR-true}` without the colon:
+      # the default applies only when the variable is unset, an empty .env
+      # value passes through as-is instead of being masked by `true`
       FUMOX_ADMIN__SECURE_COOKIES: ${FUMOX_ADMIN__SECURE_COOKIES-true}
+      # Outranks [geo].db_dir in config/app.toml: the databases live in the
+      # geo volume, not in ./config (see the Volumes header)
       FUMOX_GEO__DB_DIR: /shared/geo
-      # SSRF guard: set true in .env only for trusted local test setups
-      # (source URLs may then point at private/loopback addresses).
+      # SSRF guard: true in .env only for trusted local test setups (source
+      # URLs may then point at private/loopback addresses)
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
-      # GeoLite2 databases live in the geo volume, not in ./config:
-      # the env layer outranks config/app.toml, so [geo].db_dir = "config"
-      # from the file is ignored by this stack. See the Volumes header.
     volumes:
-      # Writable: the admin *Edit settings* page writes /app/config/app.toml
-      # in place via the toml_edit-backed editor (see USERGUIDE §7). Set
-      # FUMOX_CONFIG_ACCESS=ro in .env to turn config edits off, the editor
-      # then renders disabled with the `set.edit_unwritable` banner. That is
-      # what scripts/smoke-up.sh does: only the named volumes are
+      # :rw because the admin *Edit settings* page writes app.toml in place
+      # via the toml_edit-backed editor (FUMOX_CONFIG_ACCESS=ro turns edits
+      # off). scripts/smoke-up.sh mounts :ro: only the named volumes are
       # project-scoped, the bind mount is the same host ./config for every
       # compose project, so a writable mount would let the smoke stand's
-      # admin panel overwrite the main stack's app.toml.
+      # admin panel overwrite the main stack's app.toml
       - ./config:/app/config:${FUMOX_CONFIG_ACCESS:-rw},z
       - fumox-data:/app/data
       - fumox-geo:/shared/geo
     ports:
-      # Host ports are parameterized so a second, isolated stand (the smoke
-      # scripts in scripts/) can run alongside the main one:
-      # FUMOX_PUBLIC_PORT / FUMOX_ADMIN_BIND / FUMOX_ADMIN_PORT, defaults keep 8080/8081.
+      # Parameterized so a second, isolated stand (the smoke scripts in
+      # scripts/) can run alongside the main one
       - "${FUMOX_PUBLIC_PORT:-8080}:8080"            # public subscription endpoints
       - "${FUMOX_ADMIN_BIND:-127.0.0.1}:${FUMOX_ADMIN_PORT:-8081}:8081"   # admin panel: loopback-only by
-      # default; put a reverse proxy / SSH tunnel in
-      # front to expose it
-    # Readiness gate for the probe below. The server runs its migrations
-    # before the listeners bind, so a 200 here means the schema is current
-    # and the probe cannot race the server into a second CREATE INDEX on a
-    # large `proxies` table. The runtime image ships no curl or wget, so
-    # the probe is the binary itself.
+      # default; put a reverse proxy / SSH tunnel in front to expose it
+    # Readiness gate for probe.depends_on: migrations run before the
+    # listeners bind, a 200 means the schema is current, so the probe cannot
+    # race the server into a second CREATE INDEX on a large `proxies` table.
+    # The image ships no curl or wget, the probe is the binary itself
     healthcheck:
       test: ["CMD", "fumox-server", "--health-check"]
       interval: 5s
       timeout: 4s
       retries: 12
       start_period: 10s
-      #
-      # HTTPS front (optional): docker/nginx/ holds a ready example,
-      # an nginx container terminating TLS for /sub (→ server:8080) and
-      # /admin (→ server:8081), with ACME challenges on port 80. Add:
-      #
+      # HTTPS front (optional): docker/nginx/ holds a ready example, nginx
+      # terminating TLS for /sub (→ server:8080) and /admin (→ server:8081),
+      # with ACME challenges on port 80. Add:
       #   frontend:
       #     build: { context: docker/nginx }
       #     ports: ["443:443", "80:80"]
       #     volumes:
       #       - ./docker/nginx/certs:/certs:ro     # fullchain.pem + privkey.pem
-      #
-      # …and set FUMOX_ADMIN__SECURE_COOKIES=true (the panel is HTTPS-only
-      # behind the front). The server ports above can then be unpublished
-      # entirely, nginx reaches both listeners over the compose network.
-      #
+      # and set FUMOX_ADMIN__SECURE_COOKIES=true. The server ports above can
+      # then be unpublished entirely, nginx reaches both listeners over the
+      # compose network
       # The front needs three keys per listener, in ./config/app.toml (the
-      # file this stack mounts; the admin *Edit settings* page writes it
-      # too). The proxy's CIDR is the compose network it sits on:
-      #
+      # file this stack mounts; the proxy's CIDR is the compose network it
+      # sits on):
       #   [server]                         [admin]
       #   trust_proxy_ips  = ["172.20.0.0/16"]   (the proxy's subnet)
-      #   trust_proxy_header = "xff"             (the family nginx writes:
-      #                                              X-Forwarded-For /
-      #                                              -Proto / -Host)
+      #   trust_proxy_header = "xff"             (the X-Forwarded-* family)
       #   allowed_hosts    = ["fumox.example.com"]
-      #
-      # Without them every request shares the proxy's IP, so the per-IP
-      # rate limit becomes one budget for the whole fleet; the rendered
-      # links stay on http behind the TLS front; and the Host header is
-      # trusted as-is, which is what the allowlist is there to stop. The
-      # startup log names a trust_proxy_ips without a trust_proxy_header.
-      #
-      # The public hostname has to be on BOTH lists: the panel gates the
-      # request on [admin].allowed_hosts and builds the export link from
-      # the host you opened the panel on, while the public listener gates
-      # the link on [server].allowed_hosts.
+      # Without them every request shares the proxy's IP (one rate-limit
+      # budget for the whole fleet), the rendered links stay http behind the
+      # TLS front, and the Host header is trusted as-is, which is what the
+      # allowlist stops. The startup log names a trust_proxy_ips without a
+      # trust_proxy_header
+      # The public hostname must be on BOTH lists: the panel gates the
+      # request on [admin].allowed_hosts and builds the export link from the
+      # host you opened the panel on, while the public listener gates the
+      # link on [server].allowed_hosts
     restart: unless-stopped
     # Rotating json-file logs: the public listener answers client pulls all
-    # day, unbounded logs would eat the host disk.
+    # day, unbounded logs would eat the host disk
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
-    # The same quotas the quadlet units pin (MemoryMax/CPUQuota/TasksMax)
-    # and the kube manifest sets (resources).
+    # Same quotas the quadlet units pin (MemoryMax/CPUQuota/TasksMax) and
+    # the kube manifest sets (resources)
     mem_limit: 512m
     cpus: "1.0"
     pids_limit: 256
@@ -188,14 +158,13 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     depends_on:
-      # service_healthy, not a bare list entry: `depends_on` without a
-      # condition only waits for the container to start, which said nothing
-      # about whether the server had finished migrating the shared volume.
+      # service_healthy, not a bare list entry: it must also wait for the
+      # server to finish migrating the shared volume
       server:
         condition: service_healthy
-      # service_healthy, not service_started: the probe starts driving the
-      # controller as soon as its first T2 batch is due, so the kernel's
-      # REST API must already be listening (see the meow healthcheck below).
+      # service_healthy, not service_started: the probe drives the
+      # controller as soon as its first T2 batch is due, the REST API must
+      # already be listening
       meow:
         condition: service_healthy
     environment:
@@ -203,22 +172,20 @@ services:
       FUMOX_MEOW__API_ADDR: meow:9090
       FUMOX_MEOW__CONFIG_PATH: /shared/meow/meow.yaml
       # The controller secret: the probe presents it as
-      # `Authorization: Bearer <token>`, and the kernel refuses everything
-      # else. The probe never sees the admin token.
+      # `Authorization: Bearer <token>`, the kernel refuses everything else.
+      # The probe never sees the admin token
       FUMOX_MEOW__API_TOKEN: ${FUMOX_MEOW__API_TOKEN:?set FUMOX_MEOW__API_TOKEN in .env (openssl rand -hex 32)}
-      # Override in .env if the default test URL is blocked in your region.
-      # HTTPS only: a plain-HTTP answer would not prove that a tunnel is
-      # up, it would only prove that something answered.
+      # Override in .env when the default test URL is blocked in your
+      # region. HTTPS only: a plain-HTTP answer would not prove a tunnel
+      # is up, only that something answered
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-https://www.gstatic.com/generate_204}
-      # SSRF guard for dial targets, mirroring the server's
-      # ALLOW_PRIVATE_URLS handling: feeds are untrusted, so the probe must
-      # not dial loopback/RFC1918/link-local/CGNAT addresses they carry.
-      # Set true in .env only for isolated test infrastructure.
+      # SSRF guard mirroring ALLOW_PRIVATE_URLS: feeds are untrusted, the
+      # probe must not dial loopback/RFC1918/link-local/CGNAT targets they
+      # carry. True only for isolated test infrastructure
       FUMOX_PROBE__ALLOW_PRIVATE_TARGETS: ${FUMOX_PROBE__ALLOW_PRIVATE_TARGETS:-false}
     volumes:
-      # Probe only reads app.toml at startup, never writes. Read-only mount
-      # means a buggy probe can never mangle the config the server is also
-      # editing.
+      # :ro: the probe only reads app.toml, so a buggy probe can never
+      # mangle the config the server is also editing
       - ./config:/app/config:ro,z
       - fumox-data:/app/data
       - fumox-meow:/shared/meow
@@ -228,19 +195,19 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    # Same quotas as fumox-probe.container (MemoryMax/CPUQuota/TasksMax).
+    # Same quotas as fumox-probe.container (MemoryMax/CPUQuota/TasksMax)
     mem_limit: 256m
     cpus: "0.5"
     pids_limit: 128
     networks:
-      # The default network carries the outbound traffic; the `meow` network
-      # is the only path to the kernel's controller.
+      # The default network carries the outbound traffic, the `meow`
+      # network is the only path to the kernel's controller
       - default
       - meow
 
   meow:
-    # The wrapper image is pinned by digest like the fumox one. The
-    # GHCR image is published manually via .github/workflows/docker-meow.yml.
+    # Pinned by digest like the fumox image; the GHCR image is published
+    # manually via .github/workflows/docker-meow.yml
     image: ${FUMOX_MEOW_IMAGE:-ghcr.io/viktor45/fumox-meow@sha256:49e91fa751672db22916982ed4cb97423d7aaaa667cf4984e973f613f2406e7b}
     user: "998:999"
     read_only: true
@@ -248,24 +215,22 @@ services:
     security_opt: ["no-new-privileges:true"]
     tmpfs:
       # The rendered kernel config (it carries the controller secret) and
-      # the kernel's own data directory live on RAM only.
+      # the kernel's own data directory live on RAM only
       - /run/meow:rw,noexec,nosuid,nodev,mode=1777,size=16m
     environment:
-      # The controller secret. The kernel refuses to start without one: an
-      # unauthenticated controller can rewrite the proxy configuration.
+      # The kernel refuses to start without one: an unauthenticated
+      # controller can rewrite the proxy configuration
       FUMOX_MEOW__API_TOKEN: ${FUMOX_MEOW__API_TOKEN:?set FUMOX_MEOW__API_TOKEN in .env (openssl rand -hex 32)}
-      # The probe reaches the controller over the compose network, so the
-      # controller listens on the container's address. In the pod layouts
-      # (quadlet/kube) the probe shares the network namespace and the
-      # address is 127.0.0.1 instead.
+      # Compose: the probe reaches the controller over the network. In the
+      # pod layouts (quadlet/kube) the probe shares the network namespace,
+      # the address is 127.0.0.1 instead
       FUMOX_MEOW_API_BIND: 0.0.0.0:9090
     volumes:
       - fumox-meow:/shared/meow
-    # Readiness gate for the probe (condition: service_healthy above): the
-    # kernel's REST API must be listening before the probe drives it. The
+    # Readiness gate for the probe (condition: service_healthy above); the
     # image ships no curl or wget, so the check is a plain TCP connect via
     # busybox nc (the controller secret is checked per-request by the
-    # kernel itself, not by the probe).
+    # kernel itself)
     healthcheck:
       test: ["CMD", "sh", "-c", "nc -w 2 127.0.0.1 9090 </dev/null >/dev/null 2>&1"]
       interval: 5s
@@ -278,13 +243,13 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    # Same quotas as fumox-meow.container (MemoryMax/CPUQuota/TasksMax).
+    # Same quotas as fumox-meow.container (MemoryMax/CPUQuota/TasksMax)
     mem_limit: 256m
     cpus: "0.75"
     pids_limit: 128
     networks:
       # The kernel dials the proxies under test, so it needs the outbound
-      # path the default network provides; the controller stays unpublished.
+      # path the default network provides; the controller stays unpublished
       - default
       - meow
 
@@ -294,6 +259,6 @@ volumes:
   fumox-meow:
 
 networks:
-  # The `meow` network carries the probe ↔ kernel traffic only. The server
-  # is not on it, so it cannot reach the controller at all.
+  # Probe ↔ kernel traffic only; the server is not on it, so it cannot
+  # reach the controller at all
   meow:

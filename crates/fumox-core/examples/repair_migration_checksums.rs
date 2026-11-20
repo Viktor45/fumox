@@ -1,38 +1,24 @@
 //! One-shot repair for `sqlx::migrate!()` checksum mismatches.
 //!
 //! Migration files are immutable once applied: sqlx stores the SHA-384 of
-//! every migration's content in the `_sqlx_migrations` table, and any
-//! post-apply edit to the file fails the next `migrate()` call with
-//! "migration N was previously applied but has been modified". The
-//! correct long-term answer is to never edit applied migrations, new
-//! changes belong in a new migration file.
+//! every migration's content in `_sqlx_migrations`, and any post-apply
+//! edit fails the next `migrate()` with "migration N was previously
+//! applied but has been modified". The long-term answer is to never edit
+//! applied migrations; this utility exists for one narrow case, a
+//! comment-only edit that changed no DDL. Running it re-stamps every
+//! `_sqlx_migrations.checksum` with the SHA-384 of the current file
+//! content, after which `sqlx::migrate!().run(pool)` succeeds without
+//! touching the schema.
 //!
-//! This utility exists for one narrow case: a comment-only edit that
-//! changed no DDL (so the schema is byte-identical to what was
-//! applied). Running it re-stamps every `_sqlx_migrations.checksum`
-//! with the SHA-384 of the current file content. After it finishes,
-//! `sqlx::migrate!().run(pool)` succeeds again without touching the
-//! schema.
+//! It cannot fix a DDL edit: sqlx never re-runs an applied migration and
+//! the SHA-384 covers the whole file, so the re-stamp hides the
+//! difference instead of applying it. A DDL change to an already-applied
+//! file needs a new migration file.
 //!
-//! What it cannot do is fix a DDL edit: sqlx never re-runs an applied
-//! migration, and the SHA-384 covers the whole file, so the re-stamp
-//! hides the difference instead of applying it. A DDL change to an
-//! already-applied file needs a new migration file.
-//!
-//! The database must be fully in sync with this build's embedded set
-//! in both directions, a migration this build does not know about
-//! means the database was migrated by a newer Fumox, and the tool
-//! refuses rather than leaving `migrate()` to fail with
-//! `VersionMissing`.
-//!
-//! Usage:
-//!
-//! ```text
-//! cargo run --bin repair_migration_checksums -- /path/to/db.sqlite
-//! ```
-//!
-//! The path defaults to the `DatabaseConfig::default()` location
-//! (`fumox.db` in the working directory) when no argument is given.
+//! Usage: `cargo run --bin repair_migration_checksums --
+//! /path/to/db.sqlite`; the path defaults to the
+//! `DatabaseConfig::default()` location (`fumox.db` in the working
+//! directory).
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -51,16 +37,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(format!("database file not found: {}", path.display()).into());
     }
 
-    // The macro embeds the migrations at compile time and computes their
-    // SHA-384 from the on-disk content of the same files
-    // `sqlx::migrate!().run()` uses. Whatever the runtime embedder would
-    // compare against is exactly what we have here.
+    // The macro computes the SHA-384 from the on-disk content of the same
+    // files `sqlx::migrate!().run()` compares against
     let migrator: Migrator = sqlx::migrate!("./migrations");
 
     // The pool comes from `db::connect_pool`, the same builder the server
-    // and the probe open their pools with: WAL, the configured busy
-    // timeout, the 0600 pre-create — a repair must not open the file with
-    // a weaker setup than the services do.
+    // and the probe open their pools with (WAL, busy timeout, 0600
+    // pre-create): a repair must not open the file with a weaker setup
     let pool = db::connect_pool(&DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -68,15 +51,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     .await?;
 
     // Pre-flight: the database must already mirror this build's embedded
-    // migration set — see `verify_repairable_state` for what is checked
-    // and why each mismatch is a state this utility cannot fix.
+    // migration set (see `verify_repairable_state`)
     verify_repairable_state(&pool, &migrator).await?;
 
-    // The UPDATE itself lives in `db::repair_migration_checksums` so the
-    // guards (applied and successful rows only, checksums compared against
-    // this build's embedded set) cannot drift from the copy
-    // `db::migrate()` uses: a row that already matches is left alone and
-    // not reported as a repair.
+    // The UPDATE lives in `db::repair_migration_checksums` so its guards
+    // (applied and successful rows only, checksums compared against this
+    // build's embedded set) cannot drift from the copy `db::migrate()`
+    // uses
     let re_stamped = fumox_core::db::repair_migration_checksums(&pool).await?;
     let re_stamped_set: std::collections::HashSet<i64> = re_stamped.iter().copied().collect();
     for migration in migrator.iter() {
@@ -90,12 +71,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
-    // The re-stamp is a write, so it may still sit in the write-ahead log
-    // when this process exits. The checkpoint that pushes it into the
-    // database file is what makes the repair visible to a reader that opens
-    // the file without its own `-wal`. A checkpoint that fails leaves the
-    // repair in the log, and a copy of the database file alone would not
-    // carry it, so the failure is reported instead of swallowed.
+    // The re-stamp is a write and may still sit in the write-ahead log
+    // when this process exits; the checkpoint pushes it into the database
+    // file so a reader that opens the file without its own `-wal` sees
+    // the repair. A failed checkpoint is reported, not swallowed
     let checkpoint = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .fetch_one(&pool)
         .await;
@@ -178,11 +157,10 @@ async fn verify_repairable_state(
         )
         .into());
     }
-    // The mirror check. A database carrying a version this build does not
-    // embed was migrated by a newer Fumox; re-stamping the versions we do
-    // know about would leave sqlx refusing to start with
-    // `VersionMissing(<that version>)` anyway, so the tool must say so up
-    // front instead of promising a `migrate()` that cannot succeed.
+    // A database carrying a version this build does not embed was
+    // migrated by a newer Fumox; re-stamping would leave sqlx refusing to
+    // start with `VersionMissing(<that version>)` anyway, so say so up
+    // front instead of promising a `migrate()` that cannot succeed
     let only_in_applied: Vec<i64> = applied_versions
         .iter()
         .copied()

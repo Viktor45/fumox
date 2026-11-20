@@ -5,13 +5,11 @@
 //! owns `probe_results`, which the server never writes. The windows, the
 //! clamp and the order of the purges live here, so a server-only
 //! deployment and a deployment with a daemon cannot drift apart on what
-//! "older than the window" means.
-//!
-//! The daemon purges its own `probe_results` table around this sweep; the
-//! server does not, because it has nothing in that table to purge. The
-//! mirror image is [`purge_stale_removed_proxies`], the TTL purge of the
-//! `removed` proxies: the server alone runs it, because the daemon's
-//! authorizer forbids proxy deletion.
+//! "older than the window" means. The daemon purges its own
+//! `probe_results` around this sweep, the server does not (nothing to
+//! purge); the mirror image is [`purge_stale_removed_proxies`], which the
+//! server alone runs, because the daemon's authorizer forbids proxy
+//! deletion.
 
 use crate::db::DbPool;
 use crate::repo::{fetch_log, probe, proxies};
@@ -28,7 +26,6 @@ pub struct RetentionWindows {
 /// What one sweep removed.
 #[derive(Debug, Clone, Default)]
 pub struct RetentionOutcome {
-    /// Rows dropped from `fetch_log`.
     pub fetch_log: u64,
     /// Rows dropped from `probe_requests`: the settled ones and the stale
     /// ones together.
@@ -40,9 +37,8 @@ pub struct RetentionOutcome {
 }
 
 /// Cutoff timestamp for a window of `days`: the rows older than it go.
-///
 /// A zero window would wipe the whole table on every pass, so the window
-/// is clamped to one day. The subtraction saturates: an absurd window
+/// is clamped to one day; the subtraction saturates, so an absurd window
 /// from a hand-edited config cuts everything off rather than wrapping
 /// around into the future.
 pub fn cutoff(now: i64, days: u64) -> i64 {
@@ -54,8 +50,7 @@ pub fn cutoff(now: i64, days: u64) -> i64 {
 
 /// The `fetch_log` pass of the sweep: the journal rows older than
 /// `before` go, the count lands in `outcome.fetch_log`, and the first
-/// failure is stamped into `outcome.error` — the callers read it as a
-/// failed rotation, not a quiet one.
+/// failure is stamped into `outcome.error`.
 async fn rotate_fetch_log(pool: &DbPool, outcome: &mut RetentionOutcome, before: i64) {
     match fetch_log::purge_before(pool, before).await {
         Ok(0) => {}
@@ -108,9 +103,7 @@ async fn rotate_stale_probe_requests(pool: &DbPool, outcome: &mut RetentionOutco
     }
 }
 
-/// Purge the journal rows both binaries write and report what went.
-///
-/// The order is the one the daemon's retention loop has always used: the
+/// Purge the journal rows both binaries write and report what went: the
 /// journal first, then the queue rows whose proxy already left the
 /// `unknown` state, then the queue rows that are simply too old. A row
 /// that is both settled and old is counted once, in the settled pass.
@@ -134,21 +127,17 @@ pub async fn sweep_shared_journals(
 /// The TTL half of «purge removed»: physically delete the proxies that
 /// have sat in the `removed` status for more than `days` days
 /// (`[retention].removed_proxies_days`), through the same bounded
-/// batches as the admin button (`proxies::purge_removed_before`).
+/// batches as the admin button ([`proxies::purge_removed_before`]).
 ///
 /// The server runs this next to [`sweep_shared_journals`], and the
 /// server alone: a proxy delete is content deletion, and the probe
 /// daemon's connections run behind an authorizer that denies
 /// `DELETE FROM proxies` (`sqlite_guard`), so the daemon's retention
-/// loop must not call this — its only reward would be an `ok: false`
-/// stamp on every tick. A daemon-only deployment simply has no
-/// automatic purge; the admin button still does.
+/// loop must not call this; a daemon-only deployment has no automatic
+/// purge, the admin button still does.
 ///
-/// A zero window disables the purge outright. The journal windows
-/// inside [`sweep_shared_journals`] clamp a zero to one day, because a
-/// zero window there would wipe the whole table; here zero means the
-/// operator never opted in, and deleting every `removed` proxy would be
-/// the surprise, not the intent — `removed` stays reversible until the
+/// A zero window disables the purge outright, unlike the journal windows
+/// (which clamp a zero to one day): `removed` stays reversible until the
 /// admin presses the button.
 pub async fn purge_stale_removed_proxies(pool: &DbPool, days: u64, now: i64) -> crate::Result<u64> {
     if days == 0 {
@@ -299,7 +288,7 @@ mod tests {
             .unwrap();
 
         // The opt-out: a zero window deletes nothing, an off purge must
-        // not read as a zero-days one.
+        // not read as a zero-days one
         let deleted = purge_stale_removed_proxies(&pool, 0, now).await.unwrap();
         assert_eq!(deleted, 0);
         let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
@@ -308,8 +297,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 3);
 
-        // The window: the row past it goes, the fresh one and the live
-        // one stay.
         let deleted = purge_stale_removed_proxies(&pool, 7, now).await.unwrap();
         assert_eq!(deleted, 1);
         let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")

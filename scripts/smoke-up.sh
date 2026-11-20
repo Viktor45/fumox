@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Bring up the disposable smoke stand: the full docker-compose stack (server +
-# probe + meow) under an isolated compose project, on shifted host ports, with
-# its own generated admin token and fresh volumes. The main stack (ports
-# 8080/8081, project "fumox") is never touched. The stand runs the local
-# build: the compose file pins the published images by digest and the
-# overlay (docker-compose.build.yml) swaps them for the locally built
-# ones, so the smoke build doubles as the main-stack rebuild. The shared
-# host ./config mount is the one thing a compose project cannot scope, so
-# the server gets it read-only here (FUMOX_CONFIG_ACCESS=ro), the smoke
-# stand's admin panel can read app.toml but never writes it.
+# Bring up the disposable smoke stand: the full stack (server + probe + meow)
+# under an isolated compose project, on shifted host ports, with its own
+# generated admin token and fresh volumes. The main stack (ports 8080/8081,
+# project "fumox") is never touched. The stand runs the local build: the
+# compose file pins the published images by digest and the overlay
+# (docker-compose.build.yml) swaps them for the locally built ones. The
+# shared host ./config mount is the one thing a compose project cannot scope,
+# so the server gets it read-only (FUMOX_CONFIG_ACCESS=ro) and its admin
+# panel can read app.toml but never writes it.
 #
 # Usage:
 #   scripts/smoke-up.sh [--no-build] [--show-token]
@@ -29,8 +28,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# The arguments are parsed before any environment probing, so --help and a
-# bad flag answer without docker, curl or a free port being needed.
+# Parsed before any environment probing, so --help and a bad flag answer
+# without docker, curl or a free port
 BUILD_FLAGS=(--build)
 SHOW_TOKEN=0
 for arg in "$@"; do
@@ -38,10 +37,8 @@ for arg in "$@"; do
         --no-build) BUILD_FLAGS=() ;;
         --show-token) SHOW_TOKEN=1 ;;
         -h | --help)
-            # The header block: from the second line to the line before the
-            # first executable one, comment markers stripped. awk rather
-            # than sed because BSD sed has no address range with a nested
-            # delete-and-print, and macOS is where this runs.
+            # Prints the header, comment markers stripped. awk rather than
+            # sed: BSD sed lacks the nested delete-and-print address range
             awk 'NR == 1 { next } /^set -euo/ { exit }
                  { sub(/^# ?/, ""); print }' "$0"
             exit 0
@@ -58,8 +55,8 @@ SMOKE_PUBLIC_PORT="${SMOKE_PUBLIC_PORT:-18080}"
 SMOKE_BIND="${SMOKE_BIND:-127.0.0.1}"
 SMOKE_ADMIN_PORT="${SMOKE_ADMIN_PORT:-18081}"
 
-# Allow-list: the stand owns real volumes, and the project name decides
-# which ones. Only the smoke stand's own naming scheme is accepted.
+# The project name decides which real volumes the stand owns, so only the
+# smoke stand's own naming scheme is accepted
 case "$SMOKE_PROJECT" in
     fumox-smoke | fumox-smoke-*) ;;
     *)
@@ -69,7 +66,6 @@ case "$SMOKE_PROJECT" in
         ;;
 esac
 
-# compose command
 if docker compose version >/dev/null 2>&1; then
     COMPOSE=(docker compose)
 elif podman compose version >/dev/null 2>&1; then
@@ -81,15 +77,11 @@ else
     exit 1
 fi
 
-# The compose file pins the published images by digest and has no build
-# section; the overlay swaps them for the locally built ones. The stand
-# always runs the local build, that is the point of it.
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.build.yml)
 
-# container CLI
-# The binary that owns the containers is not `${COMPOSE[0]}`: for
-# podman-compose that is a compose front-end with no `inspect` at all. The
-# engine is the binary that has one.
+# The binary that owns the containers is not ${COMPOSE[0]}: for podman-compose
+# that is a compose front-end with no `inspect` at all, so the engine is the
+# binary that has one
 case "${COMPOSE[0]}" in
     docker) CONTAINER_CLI=(docker) ;;
     podman) CONTAINER_CLI=(podman) ;;
@@ -103,16 +95,13 @@ case "${COMPOSE[0]}" in
     *) CONTAINER_CLI=() ;;
 esac
 
-# pre-flight
-# The checks below are curl one-liners: a missing curl would otherwise
-# surface as a failed wait_for a minute into the bring-up, which reads like
-# a stand that did not come up rather than like a missing tool.
+# Checked up front: a missing curl would otherwise surface as a failed
+# wait_for a minute into the bring-up, which reads like a stand that did not
+# come up rather than like a missing tool
 command -v curl >/dev/null 2>&1 || { echo "error: curl is required by the smoke checks" >&2; exit 1; }
 
-# Check whether a TCP port on this host already has a listener. lsof is on
-# macOS and most Linux installs; parse /proc/net/tcp{,6} on bare Linux where
-# it's missing. Returns 0 if the port is busy, 1 if it's free (port_busy name
-# kept for grep-friendly exit codes).
+# Whether a host TCP port already has a listener: lsof on macOS and most
+# Linux, /proc/net/tcp{,6} where lsof is missing. Returns 0 if busy, 1 if free
 port_busy() {
     local port="$1" hex found=0
     hex=$(printf '%04X' "$port")
@@ -122,17 +111,15 @@ port_busy() {
         fi
         return 1
     fi
-    # Linux fallback: /proc/net/tcp{,6} lines have local_address in
-    # "<hex_ip>:<hex_port>"; state 0A == LISTEN. Matches both v4 and v6.
-    # BOTH files are walked: a v6-only listener is in tcp6 alone, and
-    # returning after the first one would miss it.
+    # local_address is "<hex_ip>:<hex_port>", state 0A == LISTEN. Both files
+    # are walked: a v6-only listener is in tcp6 alone
     for f in /proc/net/tcp /proc/net/tcp6; do
         [ -r "$f" ] || continue
         if awk -v hex=":$hex" '$4 == "0A" && $2 ~ hex"$" { found=1 } END { exit found ? 0 : 1 }' "$f"; then
             found=1
         fi
     done
-    # No /proc/net/tcp and no lsof: assume free rather than falsely abort.
+    # No /proc/net/tcp and no lsof: assume free rather than falsely abort
     [ "$found" -eq 1 ]
 }
 for port in "$SMOKE_PUBLIC_PORT" "$SMOKE_ADMIN_PORT"; do
@@ -158,9 +145,8 @@ random_secret() {
     fi
 }
 
-# Two credentials: the admin panel token and the controller secret of the
-# proxy kernel (the kernel refuses to start without one). Both are
-# generated unless the operator supplied them.
+# Two credentials: the admin panel token and the proxy kernel's controller
+# secret (the kernel refuses to start without one)
 if [ -z "${FUMOX_ADMIN__TOKEN:-}" ]; then
     FUMOX_ADMIN__TOKEN="$(random_secret)"
     GENERATED_TOKEN=1
@@ -170,8 +156,8 @@ if [ -z "${FUMOX_MEOW__API_TOKEN:-}" ]; then
     GENERATED_MEOW_TOKEN=1
 fi
 
-# A generated credential goes into a private file (0600, in a 0700
-# directory), never into the terminal scrollback by default.
+# Generated credentials go to private files (0600 in a 0700 dir), never to
+# the terminal scrollback by default
 if [ "$GENERATED_TOKEN" = 1 ] || [ "$GENERATED_MEOW_TOKEN" = 1 ]; then
     if TOKEN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fumox-smoke.XXXXXX" 2>/dev/null)" \
        && chmod 700 "$TOKEN_DIR" 2>/dev/null; then
@@ -192,17 +178,15 @@ if [ "$GENERATED_TOKEN" = 1 ] || [ "$GENERATED_MEOW_TOKEN" = 1 ]; then
     fi
 fi
 export FUMOX_ADMIN__TOKEN FUMOX_MEOW__API_TOKEN FUMOX_PUBLIC_PORT="$SMOKE_PUBLIC_PORT" FUMOX_ADMIN_BIND="$SMOKE_BIND" FUMOX_ADMIN_PORT="$SMOKE_ADMIN_PORT"
-# Named volumes are project-scoped, the ./config bind mount is not: both stands
-# mount the same host directory. Keep the smoke stand's config read-only so
-# its admin *Edit settings* page can never rewrite the main stack's app.toml.
-# Not a knob, the isolation guarantee is the point of the stand.
+# The ./config bind mount is not project-scoped, both stands mount the same
+# host directory: read-only keeps the smoke admin page from rewriting the
+# main stack's app.toml
 export FUMOX_CONFIG_ACCESS=ro
 
 echo ">> smoke stand: project=$SMOKE_PROJECT public=$SMOKE_BIND:$SMOKE_PUBLIC_PORT admin=$SMOKE_BIND:$SMOKE_ADMIN_PORT"
 
-# The container identity and restart counter before `up`: a container that
-# `up -d` recreates starts its counter at zero again, so the baseline is
-# only meaningful together with the container's id.
+# Baseline before `up`: a recreated container starts its restart counter at
+# zero, so the counter is only meaningful together with the container id
 container_facts() { # container_facts <service> -> "<id> <state> <restarts>"
     local id state count
     [ "${#CONTAINER_CLI[@]}" -gt 0 ] || return 1
@@ -238,31 +222,27 @@ fi
 # "unset" for bash 3.2 (macOS), which would abort the script.
 "${COMPOSE[@]}" "${COMPOSE_FILES[@]}" -p "$SMOKE_PROJECT" up -d ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
 
-# From here the stand exists, so an unsuccessful exit must not leave it
-# behind: the trap tears the project down again (no -v, the volumes survive
-# a failed run, exactly what scripts/smoke-down.sh does by default). It is
-# disarmed once the checks have passed, further down.
+# From here the stand exists, so a failed exit must tear it down again (no
+# -v: the volumes survive a failed run, like smoke-down.sh by default). The
+# trap is disarmed once the checks pass
 smoke_teardown_on_fail() {
     echo ">> the smoke checks failed, tearing the stand down (volumes kept, project $SMOKE_PROJECT)" >&2
     "${COMPOSE[@]}" "${COMPOSE_FILES[@]}" -p "$SMOKE_PROJECT" down --remove-orphans >&2 2>&1 || true
 }
 trap smoke_teardown_on_fail EXIT
 
-# wait for startup and run the checks
 wait_for() { # wait_for <what> <url> <expected_code> <timeout_s>
     local what="$1" url="$2" expected="$3" deadline=$((SECONDS + $4)) code
     while [ "$SECONDS" -lt "$deadline" ]; do
-        # A request that hangs must not eat the whole deadline: the connect
-        # and the whole transfer are bounded, and a timeout counts as a
-        # failed attempt (the code comes back as 000).
+        # Bounded connect and transfer so a hang cannot eat the deadline, a
+        # timeout counts as a failed attempt (code 000)
         code="$(curl -s -o /dev/null -w '%{http_code}' \
             --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)"
         [ "$code" = "$expected" ] && return 0
         sleep 2
     done
-    # An empty code is not a 000: it means curl itself produced no answer at
-    # all, which is a different failure from the stand answering something
-    # else, and it needs a different diagnosis.
+    # An empty code is not 000: curl itself produced no answer, a different
+    # failure from the stand answering something else
     if [ -n "$code" ]; then
         echo "error: $what did not answer $expected within the deadline (last HTTP code: $code)" >&2
     else
@@ -271,11 +251,9 @@ wait_for() { # wait_for <what> <url> <expected_code> <timeout_s>
     return 1
 }
 
-# Container-level liveness, independent of the configured log level: the
-# probe's own startup line is INFO and invisible when [log] levels are
-# error/warn, so the state is the reliable signal. The restart counter is
-# compared against the baseline taken before `up`: the container must be
-# running and must not have been restarted since.
+# Container liveness independent of the log level: the probe's startup line
+# is INFO and invisible under error/warn [log] levels, so the state is the
+# reliable signal. The restart counter is compared against the `up` baseline
 container_settled() { # container_settled <service> <base_id> <base_count>
     local facts id state count
     facts="$(container_facts "$1")" || return 1
@@ -283,7 +261,7 @@ container_settled() { # container_settled <service> <base_id> <base_count>
     state="$(printf '%s' "$facts" | cut -d' ' -f2)"
     count="$(printf '%s' "$facts" | cut -d' ' -f3)"
     [ "$state" = "running" ] || return 1
-    # A container `up` recreated starts its counter at zero.
+    # A container `up` recreated starts its counter at zero
     if [ "$id" != "$2" ]; then
         [ "$count" -eq 0 ] 2>/dev/null || return 1
         return 0
@@ -324,15 +302,13 @@ until container_settled server "$base_id_server" "$base_count_server" \
 done
 echo ">> server, probe and meow are up"
 
-# Soft check: meow-rs backoff in the fresh probe logs means the T2 kernel is
-# unreachable over the compose network. Not fatal for the smoke verdict, but
-# worth flagging.
+# Soft check: a meow-rs backoff in the fresh probe logs means the T2 kernel
+# is unreachable over the compose network, not fatal for the verdict
 if "${COMPOSE[@]}" "${COMPOSE_FILES[@]}" -p "$SMOKE_PROJECT" logs probe 2>/dev/null | grep -qi "backoff"; then
     echo "WARNING: the probe logged a meow-rs backoff: T2 tunnel checks may be down"
 fi
 
-# The stand is up and verified: the exit trap would tear it down again, so
-# it is disarmed here and the stand stays for the operator.
+# Stand verified, so the exit trap is disarmed and the stand stays up
 trap - EXIT
 
 echo

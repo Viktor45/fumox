@@ -85,15 +85,11 @@ fn filter_query_suffix(result: &str, class: &str, source: &str) -> String {
 
 impl_i18n!(FetchLogsTemplate);
 
-// Keyset cursor
-//
-// The browser pages with a cursor instead of a page number: the link to
-// the next page carries the `(fetched_at, id)` of the last row of the
-// current one, so the database seeks straight to it instead of walking
-// over every row the page skips. The cursor travels as one opaque
-// base64url token, the same way the proxy browser's does. The source
-// card's log pages by the same token, so the codec lives here next to
-// the journal read it pages.
+// Keyset cursor: the browser pages with a cursor instead of a page
+// number, so the database seeks straight to the last row instead of
+// walking over every row the page skips. The source card's log pages by
+// the same token, so the codec lives here next to the journal read it
+// pages.
 
 /// The token of one journal cursor: `side|fetched_at|id`, base64url-encoded.
 pub(super) fn encode_fetch_cursor(cursor: FetchLogCursor, direction: FetchLogDirection) -> String {
@@ -134,7 +130,7 @@ pub(super) fn journal_page_link(
 ) -> String {
     let mut link = format!("{base}?per_page={per_page}");
     if let Some((cursor, direction)) = page {
-        // The base64url alphabet needs no escaping in a query string.
+        // The base64url alphabet needs no escaping in a query string
         link.push_str(&format!("&cur={}", encode_fetch_cursor(cursor, direction)));
     }
     link.push_str(suffix);
@@ -170,9 +166,9 @@ pub(super) fn keyset_page<T, C>(
     let last_cursor = rows.last().map(&cursor_of);
     if backward {
         (
-            // Further back only when the list holds rows before this page.
+            // Further back only when the list holds rows before this page
             if has_more { first_cursor } else { None },
-            // Forwards again: the rows after this page.
+            // Forwards again: the rows after this page
             last_cursor,
         )
     } else {
@@ -208,7 +204,7 @@ pub async fn fetch_logs(
 
     // The cursor of the requested page. A token of another sort is not a
     // position in this one, so the journal falls back to its first page
-    // instead of paging from a key that means nothing here.
+    // instead of paging from a key that means nothing here
     let page = params
         .get("cur")
         .and_then(|token| decode_fetch_cursor(token))
@@ -216,7 +212,7 @@ pub async fn fetch_logs(
 
     // The filter clause set lives once in the repo (`FetchLogFilter`):
     // count and rows below apply exactly the same clauses, and every
-    // value flows through a bind.
+    // value flows through a bind
     let filter = FetchLogFilter {
         ok: result_ok_filter(&f_result),
         error_class: f_class.clone(),
@@ -225,9 +221,9 @@ pub async fn fetch_logs(
 
     // The three reads are independent — the count only feeds the header's
     // total, it does not place the page — so one `try_join!` runs them
-    // concurrently and keeps one error site for their identical handlers.
+    // concurrently and keeps one error site for their identical handlers
     // The rows over-fetch by one: the extra row says whether a further
-    // page exists without a second count.
+    // page exists without a second count
     let (total, mut rows, sources) = match tokio::try_join!(
         fetch_log::count_filtered(&state.pool, &filter),
         fetch_log::list_page(&state.pool, &filter, per_page + 1, page.as_ref()),
@@ -239,13 +235,13 @@ pub async fn fetch_logs(
 
     // The side of the cursor the page takes: a page reached backwards
     // holds the rows right before the cursor, a page reached forwards
-    // the rows right after it.
+    // the rows right after it
     let backward = page
         .as_ref()
         .is_some_and(|page| page.direction == FetchLogDirection::Backward);
 
     // The page body and its neighbours, the shape shared with the source
-    // card's log and the proxy browser (`keyset_page`).
+    // card's log and the proxy browser (`keyset_page`)
     let (prev_cursor, next_cursor) =
         keyset_page(&mut rows, page.is_some(), backward, per_page, |row| {
             FetchLogCursor {
@@ -283,7 +279,7 @@ pub async fn fetch_logs(
         .collect();
     // A filter value the schema does not know (an old link, a hand-typed
     // ?class=) filters the rows below all the same; it must also stay
-    // visible as the selected option of the select it is set in.
+    // visible as the selected option of the select it is set in
     if !f_class.is_empty() && !error_classes.iter().any(|(class, _)| class == &f_class) {
         error_classes.push((f_class.clone(), true));
     }
@@ -337,15 +333,15 @@ mod tests {
             (rows, prev, next)
         };
         // First forward page: no predecessor, a successor while the
-        // over-fetch saw one.
+        // over-fetch saw one
         assert_eq!(case(4, false, false, 3), (vec![0, 1, 2], None, Some(2)));
-        // A later forward page: the over-fetch saw nothing more.
+        // A later forward page: the over-fetch saw nothing more
         assert_eq!(case(3, true, false, 3), (vec![0, 1, 2], Some(0), None));
         // A page reached backwards keeps the rows right before the
-        // cursor: the over-fetched row is the farthest one.
+        // cursor: the over-fetched row is the farthest one
         assert_eq!(case(4, true, true, 3), (vec![1, 2, 3], Some(1), Some(3)));
         // A backwards page with nothing further back still has a
-        // successor.
+        // successor
         assert_eq!(case(2, true, true, 3), (vec![0, 1], None, Some(1)));
     }
 
@@ -365,7 +361,7 @@ mod tests {
             assert_eq!(side, direction);
         }
         // Not base64 at all, then base64 of a payload with an unknown
-        // side, a non-numeric second and a non-numeric timestamp.
+        // side, a non-numeric second and a non-numeric timestamp
         assert_eq!(decode_fetch_cursor("garbage"), None);
         assert_eq!(decode_fetch_cursor(""), None);
         assert_eq!(decode_fetch_cursor(&URL_SAFE_NO_PAD.encode("x|1|2")), None);
@@ -384,20 +380,20 @@ mod tests {
     /// it travels in.
     #[test]
     fn the_pagination_link_encodes_every_filter() {
-        // No filter: no suffix at all.
+        // No filter: no suffix at all
         assert_eq!(filter_query_suffix("", "", ""), "");
-        // The ordinary case: the filters travel as they are.
+        // The ordinary case: the filters travel as they are
         assert_eq!(
             filter_query_suffix("ok", "network", "src1"),
             "&result=ok&class=network&source=src1"
         );
         // A value with a special character is encoded, not dropped and
-        // not pasted in raw.
+        // not pasted in raw
         assert_eq!(
             filter_query_suffix("ok", "a&b=c", "src 1"),
             "&result=ok&class=a%26b%3Dc&source=src%201"
         );
-        // An empty filter is left out, the others still travel.
+        // An empty filter is left out, the others still travel
         assert_eq!(filter_query_suffix("", "network", ""), "&class=network");
     }
 

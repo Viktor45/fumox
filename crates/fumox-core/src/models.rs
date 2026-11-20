@@ -1,18 +1,14 @@
-//! Domain models shared by `fumox-server` and `fumox-probe`.
-//!
-//! The types mirror the SQLite schema. The
-//! persistence mapping itself lives in the repository layer; these structs
-//! stay database-agnostic so parsers and the pipeline can work with them
-//! without a database handle.
+//! Domain models shared by `fumox-server` and `fumox-probe`, mirroring the
+//! SQLite schema but database-agnostic: the persistence mapping lives in the
+//! repository layer, so parsers and the pipeline work without a handle.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Proxy protocol scheme (`proxies.scheme`).
-///
-/// Serialized as the lower-case wire name used in subscription URIs and in
-/// the database. `naive` covers both `naive+https` and `naive+quic` origins.
+/// Proxy protocol scheme (`proxies.scheme`), serialized as the lower-case
+/// wire name used in subscription URIs and in the database. `naive` covers
+/// both `naive+https` and `naive+quic` origins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scheme {
     Vless,
@@ -24,11 +20,10 @@ pub enum Scheme {
     Mieru,
     Socks5,
     Naive,
-    /// Snell (v1-v6), an obfuscated TCP proxy. meow-rs gained v6 in
-    /// 0.22.0 (`default`/`unshaped`/`unsafe-raw` record modes, pooled
-    /// connections); older servers keep their own version in `params`.
+    /// Snell (v1-v6), an obfuscated TCP proxy; meow-rs gained v6 in 0.22.0,
+    /// older servers keep their own version in `params`.
     Snell,
-    /// AnyTLS, a TLS-shaped proxy that pads to traffic shape. Native in
+    /// AnyTLS, a TLS-shaped proxy that pads to traffic shape; native in
     /// meow-rs since 0.21.x.
     AnyTls,
 }
@@ -50,13 +45,9 @@ impl Scheme {
         }
     }
 
-    /// Every accepted spelling of this scheme, the canonical wire name
-    /// first.
-    ///
-    /// The table is the single source of truth: [`FromStr`] and the
-    /// `Deserialize` impl both read it, so a spelling one of them accepts
-    /// the other accepts too. `hy2` is the spelling subscription feeds
-    /// actually use for `hysteria2`.
+    /// Every accepted spelling, the canonical wire name first. The single
+    /// source of truth: [`FromStr`] and the `Deserialize` impl both read it,
+    /// so a spelling one accepts the other accepts too.
     pub const fn aliases(self) -> &'static [&'static str] {
         match self {
             Scheme::Vless => &["vless"],
@@ -73,7 +64,7 @@ impl Scheme {
         }
     }
 
-    /// All schemes the MVP parsers accept, in parse-priority order.
+    /// All schemes the parsers accept, in parse-priority order.
     pub const fn all() -> &'static [Scheme] {
         &[
             Scheme::Vless,
@@ -90,8 +81,6 @@ impl Scheme {
         ]
     }
 
-    /// Whether the probe daemon can actively health-check this scheme.
-    ///
     /// tuic and mieru are UDP-only with no T2 support, so they stay
     /// permanently `unknown` and pass health filters.
     pub const fn is_probeable(self) -> bool {
@@ -125,9 +114,7 @@ impl FromStr for Scheme {
     }
 }
 
-/// The wire format reads the same alias table as [`FromStr`]: a config or
-/// an import file that spells a scheme `hy2` parses exactly like the string
-/// `"hy2"` does.
+/// The wire format reads the same alias table as [`FromStr`].
 impl<'de> Deserialize<'de> for Scheme {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -138,8 +125,8 @@ impl<'de> Deserialize<'de> for Scheme {
     }
 }
 
-/// The wire name of a scheme is its canonical alias, the spelling the
-/// database and the subscription URIs use.
+/// Serializes to the canonical alias, the spelling the database and the
+/// subscription URIs use.
 impl Serialize for Scheme {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -149,29 +136,25 @@ impl Serialize for Scheme {
     }
 }
 
-/// Proxy lifecycle status (`proxies.status`).
+/// Proxy lifecycle status (`proxies.status`). The tiers do not overlap:
+/// `alive` is T1-alive without a fresh successful T2, `ready` is alive plus
+/// the confirmed tunnel, assigned only while the latest T2 check succeeded
+/// and demoted back to `alive` by any failed T2 outcome.
 ///
-/// `ready` is the tunnel-verified tier: it is
-/// assigned only while the latest T2 check succeeded and demoted back to
-/// `alive` by any failed T2 outcome. The tiers do not overlap, `alive`
-/// means T1-alive without a fresh successful T2, `ready` means alive plus
-/// the confirmed tunnel.
-///
-/// The other three tiers, and who moves a row into them:
+/// Who moves a row into the other tiers:
 ///
 /// - `unknown` — not checked yet: the state every freshly ingested row
-///   starts in (the probe daemon has no verdict on it), and the state the
-///   admin "reset status" action returns a row to.
+///   starts in, and the state the admin "reset status" action returns a row
+///   to.
 /// - `quarantine` — set by the probe daemon through the fail ladder
-///   (`apply_failed_check` in `crates/fumox-core/src/repo/proxies.rs`):
-///   after `[probe].fail_limit` consecutive failed checks, with the
-///   second chance scheduled at `quarantined_at + min + jitter`. The row
-///   waits there for the second chance and the recheck ladder.
-/// - `removed` — terminal: the end of the recheck ladder (the final
-///   recheck failed) or an admin removal (the `status = 'removed'`
-///   transitions in `crates/fumox-core/src/repo/proxies.rs`). A feed that
-///   still carries the proxy can revive it only when
-///   `[ingest].removed_as_unknown` is on, or the admin resets it.
+///   (`apply_failed_check` in `crates/fumox-core/src/repo/proxies.rs`) after
+///   `[probe].fail_limit` consecutive failed checks, with the second chance
+///   scheduled at `quarantined_at + min + jitter`.
+/// - `removed` — terminal: the end of the recheck ladder or an admin removal
+///   (the `status = 'removed'` transitions in
+///   `crates/fumox-core/src/repo/proxies.rs`). A feed that still carries the
+///   proxy can revive it only when `[ingest].removed_as_unknown` is on, or
+///   the admin resets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyStatus {
@@ -183,9 +166,8 @@ pub enum ProxyStatus {
 }
 
 impl ProxyStatus {
-    /// Every status in schema order, the source for the admin UI option
-    /// lists (pipeline editor health filter), the proxy filter whitelist
-    /// and the status badge map.
+    /// Every status in schema order; the source for the admin UI option
+    /// lists, the proxy filter whitelist and the status badge map.
     pub const fn all() -> &'static [ProxyStatus] {
         &[
             ProxyStatus::Unknown,
@@ -229,17 +211,15 @@ impl FromStr for ProxyStatus {
     }
 }
 
-/// The comma-separated wire names of an enum's `all()` list: the text the
-/// `FromStr` errors quote, so the operator sees which values are accepted
-/// without reading the source. One shared helper, so the six wire-name
-/// enums cannot drift into six different spellings of the same sentence.
+/// The comma-separated wire names of an enum's `all()` list, the text the
+/// `FromStr` errors quote. One shared helper, so the wire-name enums cannot
+/// drift into six different spellings of the same sentence.
 fn wire_name_list<T>(values: &[T], name: impl Fn(&T) -> &'static str) -> String {
     values.iter().map(name).collect::<Vec<_>>().join(", ")
 }
 
 /// Fetch error classification (`sources.error_class`, `fetch_log.error_class`).
-/// This is the only permitted vocabulary, the legacy
-/// `stale|unreachable|…` set is removed.
+/// The only permitted vocabulary; the legacy `stale|unreachable|…` set is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
@@ -247,10 +227,9 @@ pub enum ErrorClass {
     HttpServer,
     HttpClient,
     ParseError,
-    /// The fetch succeeded, but the payload could not be stored: the
-    /// database rejected the write. Unlike the other classes this one
-    /// says nothing about the upstream — the feed was fine and this
-    /// process failed — so it must not be reported as a fetch error.
+    /// The fetch succeeded but the payload could not be stored: unlike the
+    /// other classes this says nothing about the upstream, so it must not be
+    /// reported as a fetch error.
     Storage,
 }
 
@@ -265,8 +244,8 @@ impl ErrorClass {
         }
     }
 
-    /// Every class, the source for the `FromStr` error and the wire-name
-    /// round-trip test.
+    /// Every class, the source for the `FromStr` error and the round-trip
+    /// test.
     pub const fn all() -> &'static [ErrorClass] {
         &[
             ErrorClass::Network,
@@ -300,13 +279,10 @@ impl FromStr for ErrorClass {
     }
 }
 
-/// A single protocol parameter kept in its original position.
-///
-/// Order matters for byte-faithful round-trip serialization of URI schemes,
-/// so parameters are stored as an ordered list rather than a map. `known`
-/// records whether the parser recognized the key for this scheme; unknown
-/// parameters pass through untouched and are persisted into
-/// `proxies.unknown_params`.
+/// A single protocol parameter kept in its original position: order matters
+/// for byte-faithful round-trip serialization of URI schemes, so parameters
+/// are stored as an ordered list rather than a map. Unknown parameters pass
+/// through untouched and are persisted into `proxies.unknown_params`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Param {
     pub key: String,
@@ -315,21 +291,18 @@ pub struct Param {
     /// serialization can emit the original bytes.
     pub value: String,
     pub known: bool,
-    /// The source wrote the pair without an `=` separator (`?k`, not
-    /// `?k=`), so serialization must emit the bare key again to keep the
-    /// byte-exact round-trip. Only the URI query parser sets it; every
-    /// other source leaves it `false`.
+    /// The source wrote the pair without an `=` separator (`?k`), so
+    /// serialization must emit the bare key again for the byte-exact
+    /// round-trip. Only the URI query parser sets it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bare: bool,
 }
 
-/// Certificate-verification toggle spellings seen across the wire formats:
-/// the URI families ship `insecure` / `allowInsecure` / `skip-cert-verify`,
-/// sing-box links (tuic) the underscore `allow_insecure`. One list shared by
-/// every consumer, the fingerprint normalisation, the output writers and the
-/// forbid-insecure pipeline filter, so a feed spelling the toggle
-/// differently is never missed by one of them and two spellings of the same
-/// node collapse onto one deduplication key.
+/// Certificate-verification toggle spellings seen across the wire formats
+/// (the URI families, sing-box links' `allow_insecure`). One list shared by
+/// the fingerprint normalisation, the output writers and the forbid-insecure
+/// pipeline filter, so no consumer misses a spelling and two spellings of the
+/// same node collapse onto one deduplication key.
 pub const INSECURE_ALIASES: [&str; 4] = [
     "insecure",
     "allowinsecure",
@@ -337,21 +310,17 @@ pub const INSECURE_ALIASES: [&str; 4] = [
     "allow_insecure",
 ];
 
-/// The Shadowsocks cipher assumed when a source spells the password only:
-/// the ss credential is stored as `method:password`, so every producer of a
-/// colon-less credential (the Clash parser, the writers' fallback for rows
-/// predating the parse-time canonicalization) must name the same default,
-/// or the same node would serialize with two different ciphers and the
-/// fingerprint would not merge it with its explicit-cipher twin.
+/// The Shadowsocks cipher assumed when a source spells the password only: the
+/// ss credential is stored as `method:password`, so every producer of a
+/// colon-less credential (the Clash parser, the writers' fallback for old
+/// rows) must name the same default, or the fingerprint would not merge the
+/// node with its explicit-cipher twin.
 pub const DEFAULT_SS_CIPHER: &str = "chacha20-ietf-poly1305";
 
 /// Whether `value` spells a truthy toggle (`1` / `true` / `yes` / `on`,
-/// trimmed and case-insensitive). The one vocabulary shared by every toggle
-/// consumer: the certificate-verification aliases (the fingerprint
-/// normalisation, the output writers, the forbid-insecure filter), the
-/// parsers' Clash booleans and the writers' `param_truthy`. Splitting it
-/// made `allowInsecure=yes` keep a node that `allowInsecure=1` dropped and
-/// let the fingerprint merge a `yes` row with the secure variant.
+/// trimmed, case-insensitive). The one vocabulary shared by every toggle
+/// consumer; splitting it made `allowInsecure=yes` keep a node that
+/// `allowInsecure=1` dropped.
 pub(crate) fn is_truthy_toggle(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -359,12 +328,9 @@ pub(crate) fn is_truthy_toggle(value: &str) -> bool {
     )
 }
 
-/// Whether `value` spells a falsy toggle (`0` / `false` / `no` / `off`,
-/// trimmed and case-insensitive).
-///
-/// The counterpart of [`is_truthy_toggle`]: an explicit switch that says
-/// "off" has to be honoured, otherwise a stated `tls: false` would be
-/// overruled by the SNI-implies-TLS rule.
+/// The counterpart of [`is_truthy_toggle`]: an explicit "off" has to be
+/// honoured, otherwise a stated `tls: false` would be overruled by the
+/// SNI-implies-TLS rule.
 pub(crate) fn is_falsy_toggle(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -406,21 +372,19 @@ pub struct ProxyEntry {
     #[serde(skip_serializing)]
     pub raw_line: String,
     /// Cached canonical (URI-vocabulary) parameters of a structured entry,
-    /// computed once at parse time so a repeated `serialize` does not
-    /// re-parse the stored YAML blocks (`parsers::with_canonical_cache`).
-    /// `None` for URI-parsed entries (they keep their stored spellings) and
-    /// for records rebuilt from SQLite, where `parsers::canonical_uri_entry`
-    /// is the fallback. A transient cache: never serialized, and the
-    /// parameters it mirrors are not mutated after parsing.
+    /// computed once at parse time so a repeated `serialize` does not re-parse
+    /// the stored YAML blocks (`parsers::with_canonical_cache`). `None` for
+    /// URI-parsed entries and for records rebuilt from SQLite (the fallback
+    /// is `parsers::canonical_uri_entry`). A transient cache: never
+    /// serialized, never mutated after parsing.
     #[serde(skip)]
     pub canonical: Option<Vec<Param>>,
 }
 
 impl ProxyEntry {
-    /// An entry that carries nothing but a scheme, for the support
-    /// question the output encoders answer (`formats::clash::is_supported`,
-    /// `formats::singbox::is_supported`): the mapping reads the scheme
-    /// alone, every other field stays at its zero value.
+    /// An entry carrying nothing but a scheme, for the support question the
+    /// output encoders answer (`formats::clash::is_supported`,
+    /// `formats::singbox::is_supported`): the mapping reads the scheme alone.
     pub fn scheme_only(scheme: Scheme) -> Self {
         Self {
             scheme,
@@ -454,10 +418,9 @@ impl ProxyEntry {
             .map(|p| p.value.as_str())
     }
 
-    /// Recognized parameters as a JSON object for `proxies.params`.
-    ///
-    /// On duplicate keys the first occurrence wins; order is not guaranteed
-    /// in the stored JSON (the ordered list stays the round-trip source).
+    /// Recognized parameters as a JSON object for `proxies.params`. On
+    /// duplicate keys the first occurrence wins; the ordered list stays the
+    /// round-trip source.
     pub fn known_params_json(&self) -> serde_json::Map<String, serde_json::Value> {
         Self::split_params_json(&self.params, true)
     }
@@ -488,32 +451,24 @@ impl ProxyEntry {
     }
 }
 
-/// Normalise a protocol allowlist: an empty list means "accept every
-/// scheme", the same as `None`.
-///
-/// The two spellings used to mean different things — `None` accepts every
-/// scheme, an empty list accepts none — but nothing checked the difference:
-/// a source with an empty allowlist dropped every entry at ingest and
-/// then failed every fetch with "no proxies left after the protocol
-/// allowlist", looking configured while loading nothing.
+/// Normalise a protocol allowlist: an empty list means "accept every scheme",
+/// the same as `None`. Nothing used to check the difference: a source with an
+/// empty allowlist dropped every entry at ingest and then failed every fetch
+/// with "no proxies left after the protocol allowlist".
 pub fn normalize_protocols(protocols: Option<Vec<Scheme>>) -> Option<Vec<Scheme>> {
     protocols.filter(|list| !list.is_empty())
 }
 
 /// An ISO 3166-1 alpha-2 country code in stored form: exactly two ASCII
-/// letters, uppercase.
-///
-/// One parser for every entry point that accepts a typed code — the
-/// profile allowlist field, the import validation and the admin
-/// cleanup/revival forms — so the rule (case-insensitive input, uppercase
-/// at rest) cannot drift apart between them and a code one path accepts
-/// another refuses.
+/// letters, uppercase. One parser for every entry point that accepts a typed
+/// code (the profile allowlist, the import validation, the admin
+/// cleanup/revival forms), so the rule cannot drift between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CountryCode(String);
 
 impl CountryCode {
-    /// The code a typed value normalizes to; `None` for anything that is
-    /// not two ASCII letters. Whitespace around the value is tolerated.
+    /// `None` for anything that is not two ASCII letters; whitespace
+    /// tolerated.
     pub fn parse(raw: &str) -> Option<Self> {
         let code = raw.trim().to_ascii_uppercase();
         (code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic())).then_some(Self(code))
@@ -532,10 +487,9 @@ pub struct Source {
     pub id: String,
     /// Optional human-readable identifier for `/sub/{slug}`-style references.
     pub slug: Option<String>,
-    /// Optional access token for `/src`; `None` = public. A profile's
-    /// access token guards `/sub` only and does not extend here: the
-    /// source row carries its own. The token is a secret (the database
-    /// keeps its hash), so it never leaves the server in a serialised
+    /// Optional access token for `/src`; `None` = public. A profile's access
+    /// token guards `/sub` only and does not extend here: the source row
+    /// carries its own. A secret, never leaves the server in a serialised
     /// form.
     #[serde(default, skip_serializing)]
     pub access_token: Option<String>,
@@ -551,8 +505,8 @@ pub struct Source {
     pub protocols: Option<Vec<Scheme>>,
     pub cache_ttl_seconds: i64,
     pub tags: Option<Vec<String>>,
-    /// Processing rules, pipeline JSON v1. Validated by the
-    /// pipeline module before storage.
+    /// Processing rules, pipeline JSON v1, validated by the pipeline module
+    /// before storage.
     pub pipeline: Option<serde_json::Value>,
     /// Extra HTTP headers sent with the fetch request. They usually carry
     /// an `Authorization`, so the map is a secret and never leaves the
@@ -572,15 +526,12 @@ pub struct Source {
 }
 
 impl Source {
-    /// A test fixture: the `https://example.com` source the repo tests
-    /// seed, every optional field unset, both timestamps at `now`.
-    ///
-    /// Production code has no use for a fixed row; the constructor lives
-    /// under `cfg(any(test, feature = "test-util"))` so the fixture shape
-    /// (cache TTL, the timestamp pair) cannot drift between the test
-    /// modules that seed a source — in this crate and, via the `test-util`
-    /// feature the sibling crates enable in their dev-dependencies, in
-    /// theirs too.
+    /// Test fixture: the `https://example.com` source the repo tests seed,
+    /// every optional field unset, both timestamps at `now`. Lives under
+    /// `cfg(any(test, feature = "test-util"))` so the fixture shape (cache
+    /// TTL, the timestamp pair) cannot drift between the test modules that
+    /// seed a source, in this crate and, via the `test-util` feature the
+    /// sibling crates enable in their dev-dependencies, in theirs too.
     #[cfg(any(test, feature = "test-util"))]
     pub fn fixture(id: &str, now: i64) -> Self {
         Self {
@@ -616,9 +567,7 @@ pub enum IpFamily {
     /// historical behavior).
     #[default]
     Any,
-    /// Connect via IPv4 addresses only.
     Ipv4,
-    /// Connect via IPv6 addresses only.
     Ipv6,
 }
 
@@ -631,16 +580,15 @@ impl IpFamily {
         }
     }
 
-    /// Every family, the source for the `FromStr` error and the wire-name
-    /// round-trip test.
+    /// Every family, the source for the `FromStr` error and the round-trip
+    /// test.
     pub const fn all() -> &'static [IpFamily] {
         &[IpFamily::Any, IpFamily::Ipv4, IpFamily::Ipv6]
     }
 
-    /// Every family as its wire string, `all()` rendered through
-    /// [`IpFamily::as_str`]. This is the closed set `FromStr` accepts, so
-    /// it is also what the admin settings editor validates its dropdown
-    /// against — the two must not drift.
+    /// Every family as its wire string, the closed set `FromStr` accepts and
+    /// the admin settings editor validates its dropdown against; the two
+    /// must not drift.
     pub const ALL_AS_STR: &'static [&'static str] = &["any", "ipv4", "ipv6"];
 }
 
@@ -666,9 +614,8 @@ pub struct Profile {
     /// `nanoid(12)`; doubles as the `/sub/{id}` token when `slug` is unset.
     pub id: String,
     pub slug: Option<String>,
-    /// Optional access token for `/sub`; `None` = public. The token is a
-    /// secret (the database keeps its hash), so it never leaves the server
-    /// in a serialised form.
+    /// Optional access token for `/sub`; `None` = public. A secret, never
+    /// leaves the server in a serialised form.
     #[serde(default, skip_serializing)]
     pub access_token: Option<String>,
     pub name: String,
@@ -677,15 +624,15 @@ pub struct Profile {
     pub pipeline: Option<serde_json::Value>,
     /// Country allowlist for `/sub`: ISO 3166-1 alpha-2 codes, uppercase.
     /// Empty = every country; while set, proxies with no determined country
-    /// stay out, the filter passes confirmed geo facts only.
+    /// stay out.
     pub countries: Vec<String>,
     /// Whether proxies with no determined country stay in the subscription
     /// while `countries` is set. `false` (the default) is the historical
-    /// semantics: the geo filter passes confirmed facts only, so a profile
-    /// pinned to a country serves nothing while geo enrichment is off and
-    /// every row of it looks silently gone. The flag is persisted
-    /// (`profiles.include_unknown_country`) and round-trips through the
-    /// document formats; the runtime geo filter does not honor it yet.
+    /// semantics: a profile pinned to a country serves nothing while geo
+    /// enrichment is off, and every row of it looks silently gone. The flag
+    /// is persisted (`profiles.include_unknown_country`) and round-trips
+    /// through the document formats; the runtime geo filter does not honor
+    /// it yet.
     #[serde(default)]
     pub include_unknown_country: bool,
     pub enabled: bool,
@@ -712,8 +659,8 @@ impl Encoding {
         }
     }
 
-    /// Every encoding, the source for the `FromStr` error and the
-    /// wire-name round-trip test.
+    /// Every encoding, the source for the `FromStr` error and the round-trip
+    /// test.
     pub const fn all() -> &'static [Encoding] {
         &[Encoding::Plain, Encoding::Base64, Encoding::Auto]
     }
@@ -755,7 +702,7 @@ impl InputFormat {
     }
 
     /// Every input format, the source for the `FromStr` error and the
-    /// wire-name round-trip test.
+    /// round-trip test.
     pub const fn all() -> &'static [InputFormat] {
         &[
             InputFormat::UriList,
@@ -803,7 +750,7 @@ impl OutputFormat {
     }
 
     /// Every output format, the source for the `FromStr` error and the
-    /// wire-name round-trip test.
+    /// round-trip test.
     pub const fn all() -> &'static [OutputFormat] {
         &[
             OutputFormat::UriList,
@@ -843,10 +790,9 @@ pub fn new_id() -> String {
     nanoid::nanoid!(12, ID_ALPHABET)
 }
 
-/// Current Unix timestamp in seconds (UTC), the timestamp convention used
-/// across the schema. Panicking on a pre-epoch clock is deliberate: a clock
-/// error that far off would poison every stored timestamp, and failing the
-/// first write is easier to diagnose than silently negative ages.
+/// Current Unix timestamp in seconds (UTC), the convention used across the
+/// schema. Panicking on a pre-epoch clock is deliberate: a clock error that
+/// far off would poison every stored timestamp.
 #[expect(
     clippy::expect_used,
     reason = "a pre-epoch clock would poison every stored timestamp; see the docs above"
@@ -872,8 +818,6 @@ mod tests {
         }
     }
 
-    /// The shared country-code parser: case-insensitive input, whitespace
-    /// tolerated, exactly two ASCII letters at rest — and nothing else.
     #[test]
     fn country_code_parse_normalizes_to_two_uppercase_letters() {
         for raw in ["de", "DE", " De ", "dE"] {
@@ -903,10 +847,6 @@ mod tests {
         }
     }
 
-    /// One alias table, two entry points: every spelling a scheme accepts
-    /// is accepted by `FromStr` *and* by the serde deserializer, so a
-    /// config or an import file that spells a scheme `hy2` is not rejected
-    /// while the same word parses as a string.
     #[test]
     fn every_scheme_alias_parses_on_both_paths() {
         for scheme in Scheme::all() {
@@ -925,8 +865,6 @@ mod tests {
         }
     }
 
-    /// The alias table is the single source of truth: the canonical wire
-    /// name is the first alias of its scheme.
     #[test]
     fn the_canonical_wire_name_is_the_first_alias() {
         for scheme in Scheme::all() {
@@ -939,8 +877,6 @@ mod tests {
         assert_eq!("hy2".parse::<Scheme>().unwrap(), Scheme::Hysteria2);
     }
 
-    /// A serialised model carries no secret: the proxy credential, the
-    /// source headers and the profile access token never reach a JSON dump.
     #[test]
     fn serialised_models_carry_no_secret() {
         let entry = ProxyEntry {
@@ -983,11 +919,9 @@ mod tests {
         };
         let json = serde_json::to_string(&source).unwrap();
         assert!(!json.contains("super-secret-header"), "{json}");
-        // The field is gone entirely, not emptied: there is no key to fill
-        // with a secret later.
+        // The field is gone entirely, not emptied: no key to fill with a
+        // secret later
         assert!(!json.contains("headers"), "{json}");
-        // The endpoint token is a secret like the headers: it never
-        // reaches a serialised form either.
         assert!(!json.contains("access_token"), "{json}");
         assert!(!json.contains("super-secret-token"), "{json}");
 
@@ -1029,9 +963,8 @@ mod tests {
             assert_eq!(status.as_str(), name);
             assert_eq!(name.parse::<ProxyStatus>().unwrap(), status);
         }
-        // ALL carries every wire name exactly once (admin option lists
-        // derive from it): the name set must equal the full variant list,
-        // and no name may repeat.
+        // Admin option lists derive from `all()`: every wire name exactly
+        // once, the full known set, no repeats
         let names: Vec<&str> = ProxyStatus::all().iter().map(|s| s.as_str()).collect();
         let expected: Vec<&str> = vec!["unknown", "alive", "ready", "quarantine", "removed"];
         let mut sorted = names.clone();
@@ -1068,11 +1001,9 @@ mod tests {
         }
     }
 
-    /// Every wire-name enum round-trips its canonical name through the
-    /// serde deserializer (the import/export files and the pipeline JSON
-    /// ride on it) and refuses an unknown value with an error that names
-    /// it. One parameterized pass over the five enums, so a renamed
-    /// variant or a dropped deserializer rule cannot slip through.
+    /// One parameterized pass over the five wire-name enums: round-trip
+    /// through the serde deserializer (the import/export files and the
+    /// pipeline JSON ride on it) plus refusal of an unknown value.
     #[test]
     fn wire_name_enums_round_trip_through_serde() {
         fn check<T>(label: &str, values: &[T], name: impl Fn(&T) -> &'static str, unknown: &str)
@@ -1105,10 +1036,6 @@ mod tests {
         check("OutputFormat", OutputFormat::all(), |f| f.as_str(), "json");
     }
 
-    /// `include_unknown_country` is a documented Profile flag with the
-    /// historical semantics as its explicit default: a stored profile
-    /// without the key keeps geo-filtering unknowns out, and the flag
-    /// round-trips through the document formats.
     #[test]
     fn profile_include_unknown_country_defaults_false_and_parses() {
         let base = "\
@@ -1133,7 +1060,6 @@ updated_at = 0
         let profile: Profile = toml::from_str(&with_flag).expect("the flag must parse");
         assert!(profile.include_unknown_country);
 
-        // The stored document carries the flag back out.
         let json = serde_json::to_value(&profile).unwrap();
         assert_eq!(
             json["include_unknown_country"],
@@ -1207,7 +1133,6 @@ updated_at = 0
                 known: false,
                 bare: false,
             },
-            // Duplicate known key: first occurrence wins in the JSON view.
             Param {
                 key: "security".into(),
                 value: "tls".into(),
@@ -1241,7 +1166,7 @@ updated_at = 0
     #[test]
     fn now_ts_is_reasonable() {
         // Somewhere after 2286-11-20 is impossible for the next centuries;
-        // before 2020 means the clock helper is broken.
+        // before 2020 means the clock helper is broken
         let ts = now_ts();
         assert!(ts > 1_577_836_800 && ts < 10_000_000_000);
     }

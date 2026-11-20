@@ -1,5 +1,3 @@
-//! CRUD for the `profiles` and `profile_sources` tables.
-
 use crate::db::DbPool;
 use crate::models::Profile;
 use sqlx::{FromRow, Sqlite};
@@ -26,7 +24,7 @@ impl TryFrom<ProfileRow> for Profile {
     fn try_from(row: ProfileRow) -> Result<Self, Self::Error> {
         Ok(Profile {
             // Cloned so the id can still name the row in the corrupt-JSON
-            // errors the field mappings below may raise.
+            // errors the field mappings below may raise
             id: row.id.clone(),
             slug: row.slug,
             access_token: row.access_token,
@@ -68,9 +66,8 @@ fn normalize_countries(list: Vec<String>) -> Vec<String> {
 }
 
 /// `Vec<String>` → stored TEXT: `None` when empty, else a JSON array.
-/// The list is normalized on the way in (trimmed, uppercased,
-/// blank- and duplicate-free), so the stored JSON is canonical; the
-/// read path normalizes too, as a guard for rows written before this.
+/// Normalized on the way in, so the stored JSON is canonical; the read
+/// path normalizes too, as a guard for rows written before this.
 fn countries_to_text(list: &[String]) -> crate::Result<Option<String>> {
     let norm = normalize_countries(list.to_vec());
     if norm.is_empty() {
@@ -84,19 +81,16 @@ fn countries_to_text(list: &[String]) -> crate::Result<Option<String>> {
 const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, countries, include_unknown_country, enabled, created_at, updated_at";
 
 /// Insert a new profile. The caller assigns `id` (see [`crate::models::new_id`]).
-///
 /// The access token is stored as a hash: the repository is the only place
 /// that writes the column, so the secret never reaches the database in
-/// plain text, whichever caller filled the model.
-///
-/// The row is written on the caller's executor: the pool, or the
-/// connection of an open transaction (see [`crate::repo::sources::create`]).
+/// plain text. The row is written on the caller's executor (see
+/// [`crate::repo::sources::create`]).
 pub async fn create<'c, E>(executor: E, profile: &Profile) -> crate::Result<()>
 where
     E: sqlx::Executor<'c, Database = Sqlite>,
 {
     // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
-    // flows through .bind().
+    // flows through .bind()
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )))
@@ -157,22 +151,17 @@ where
     .rows_affected();
     if affected == 0 {
         // The row is gone, not the database: the caller can answer "not
-        // found" instead of "the write failed".
+        // found" instead of "the write failed"
         return Err(crate::Error::NotFound(format!("profile {}", profile.id)));
     }
     Ok(())
 }
 
-/// Write a profile and its source composition in one transaction.
-///
-/// The profile row and the composition rows are one object: a profile
-/// whose composition failed to write would be a profile without (or with
-/// a stale) sources, and the caller would have to repair it by hand. The
-/// pair is written atomically instead, so the row and its composition
-/// are either both there or both absent.
-///
-/// `is_new` selects the insert ([`create`]) over the update ([`update`]).
-/// The composition is `source_id, position` in merge order.
+/// Write a profile and its source composition in one transaction: the
+/// profile row and the composition rows are one object, so the row and
+/// its composition are either both there or both absent.
+/// `is_new` selects the insert ([`create`]) over the update ([`update`]);
+/// the composition is `source_id, position` in merge order.
 pub async fn upsert_with_sources(
     pool: &DbPool,
     profile: &Profile,
@@ -180,7 +169,7 @@ pub async fn upsert_with_sources(
     is_new: bool,
 ) -> crate::Result<()> {
     // BEGIN IMMEDIATE: grabs the WAL write lock up front instead of a
-    // deferred read→write upgrade (see [`replace_sources`]).
+    // deferred read→write upgrade (see [`replace_sources`])
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if is_new {
         create(&mut *tx, profile).await?;
@@ -193,11 +182,9 @@ pub async fn upsert_with_sources(
 }
 
 /// Flip the enabled flag of a profile and return the new state with the
-/// stamp of the change.
-///
-/// A targeted `UPDATE` instead of rewriting the whole row: the toggle
-/// must not depend on the row the caller read a moment earlier, and it
-/// must not write back fields it never looked at.
+/// stamp of the change. A targeted `UPDATE` instead of rewriting the
+/// whole row: the toggle must not depend on the row the caller read a
+/// moment earlier, and it must not write back fields it never looked at.
 pub async fn toggle_enabled(pool: &DbPool, id: &str) -> crate::Result<(bool, i64)> {
     let now = crate::models::now_ts();
     let row: Option<(bool, i64)> = sqlx::query_as(
@@ -232,13 +219,10 @@ pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Prof
     row.map(Profile::try_from).transpose()
 }
 
-/// Resolve a `/sub/{token}` path segment: slug first, then raw id.
-///
-/// The order is by the *match*, not by the NULL-ness of the slug: a
-/// profile whose slug collides with another profile's id must lose
-/// against the profile that owns the slug, whatever the row order of the
-/// table happens to be. `ORDER BY (slug = ?) DESC` puts the slug match
-/// first (1 before 0) and leaves the id match as the fallback.
+/// Resolve a `/sub/{token}` path segment: slug first, then raw id. The
+/// order is by the *match*, not by the NULL-ness of the slug: a profile
+/// whose slug collides with another profile's id must lose against the
+/// profile that owns the slug (`ORDER BY (slug = ?) DESC`).
 pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<Profile>> {
     let row: Option<ProfileRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM profiles WHERE slug = ? OR id = ? ORDER BY (slug = ?) DESC LIMIT 1"
@@ -284,12 +268,10 @@ pub async fn delete(pool: &DbPool, id: &str) -> crate::Result<bool> {
 }
 
 /// Rewrite the access tokens of the rows written before hashing into
-/// their stored form.
-///
-/// A deployment whose rows still hold the token in plain text keeps
-/// serving its subscribers either way (see [`crate::token::verify`]), but
-/// the secret sits on disk until this runs. Returns the number of rows it
-/// rewrote.
+/// their stored form. A deployment whose rows still hold the token in
+/// plain text keeps serving its subscribers either way (see
+/// [`crate::token::verify`]), but the secret sits on disk until this
+/// runs. Returns the number of rows it rewrote.
 pub async fn hash_legacy_tokens(pool: &DbPool) -> crate::Result<usize> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT id, access_token FROM profiles WHERE access_token IS NOT NULL")
@@ -311,11 +293,8 @@ pub async fn hash_legacy_tokens(pool: &DbPool) -> crate::Result<usize> {
 }
 
 /// Replace the full source composition of a profile.
-/// `sources` is `(source_id, position)` in merge order.
-///
-/// The rows are written on the caller's connection: inside a transaction
-/// they join that transaction, so a caller that writes the profile and
-/// its composition together can make both atomic.
+/// `sources` is `(source_id, position)` in merge order. The rows are
+/// written on the caller's connection, so they can join a transaction.
 pub async fn set_sources(
     conn: &mut sqlx::SqliteConnection,
     profile_id: &str,
@@ -339,11 +318,9 @@ pub async fn set_sources(
 }
 
 /// Replace the composition of a profile in a transaction of its own.
-///
 /// BEGIN IMMEDIATE: grabs the WAL write lock up front instead of a
-/// deferred read→write upgrade (which busy_timeout cannot cover, the
-/// upgrade fails with SQLITE_BUSY_SNAPSHOT when another process
-/// committed since our snapshot; see proxies::reconcile_source).
+/// deferred read→write upgrade, which busy_timeout cannot cover (see
+/// proxies::reconcile_source).
 pub async fn replace_sources(
     pool: &DbPool,
     profile_id: &str,
@@ -390,10 +367,9 @@ pub async fn sources_by_profile(
     Ok(by_profile)
 }
 
-// Admin profile screens
-//
-// Fixed-shape reads of the profiles list and card, typed so the admin
-// handlers go through the repository like every other caller.
+// Admin profile screens: fixed-shape reads of the profiles list and card,
+// typed so the admin handlers go through the repository like every other
+// caller.
 
 /// One row of the admin profiles list: the display columns plus the
 /// composition size and the ready-proxy count ([`list_with_counts`]).
@@ -416,12 +392,9 @@ pub struct ProfileListRow {
 }
 
 /// The admin profiles list, newest profile first — the same order the
-/// sources screen uses.
-///
-/// Both counts come from one grouped pass each (a subquery per row used
-/// to re-run the ready-proxy join once per profile): the aggregates are
-/// computed once over the whole composition table and joined back, so
-/// the screen costs two grouped scans instead of `2 * profiles` joins.
+/// sources screen uses. Both counts come from one grouped pass each: the
+/// aggregates are computed once over the whole composition table and
+/// joined back, instead of one subquery per row.
 pub async fn list_with_counts(pool: &DbPool) -> crate::Result<Vec<ProfileListRow>> {
     let rows: Vec<ProfileListRow> = sqlx::query_as(
         "SELECT p.id, p.name, p.slug, p.output_format, p.enabled,
@@ -530,7 +503,7 @@ mod tests {
         let mut profile = sample_profile("prf1aaaaaaa");
         create(&pool, &profile).await.unwrap();
         let loaded = get(&pool, "prf1aaaaaaa").await.unwrap().unwrap();
-        // The token comes back hashed: the column never holds the secret.
+        // The token comes back hashed: the column never holds the secret
         assert_eq!(
             loaded.access_token.as_deref(),
             Some(crate::token::hash("secret-token").as_str())
@@ -546,7 +519,6 @@ mod tests {
                 .id,
             "prf1aaaaaaa"
         );
-        // The raw id resolves too; an unknown token resolves to nothing.
         assert_eq!(
             resolve_token(&pool, "prf1aaaaaaa")
                 .await
@@ -561,7 +533,7 @@ mod tests {
         profile.output_format = OutputFormat::UriList;
         profile.access_token = None;
         // Mixed case, blanks and duplicates normalize on the way out;
-        // clearing the list stores NULL (= no filter).
+        // clearing the list stores NULL (= no filter)
         profile.countries = vec!["us".into(), " DE ".into(), "US".into(), "de".into()];
         update(&pool, &profile).await.unwrap();
         let loaded = get(&pool, "prf1aaaaaaa").await.unwrap().unwrap();
@@ -580,16 +552,12 @@ mod tests {
     }
 
     /// A token that matches one profile's slug and another profile's id
-    /// must resolve to the slug owner, whatever the row order of the
-    /// table happens to be: `ORDER BY (slug = ?) DESC` in
-    /// [`resolve_token`] puts the slug match first. Both insertion orders
-    /// are exercised — with the id-owner inserted first, the id-owner
-    /// would win without that ORDER BY.
+    /// must resolve to the slug owner, whatever the row order: the
+    /// id-owner would win without the ORDER BY in [`resolve_token`].
     #[tokio::test]
     async fn a_slug_matching_another_profiles_id_resolves_to_the_slug_owner() {
         // prfAaaaaaaa owns the string "prfBaaaaaaa" as its slug,
-        // prfBaaaaaaa owns it as its id: the token hits both rows once,
-        // and the slug owner must win in either row order.
+        // prfBaaaaaaa owns it as its id: the token hits both rows
         for insert_order in [
             ["prfBaaaaaaa", "prfAaaaaaaa"], // id-owner first
             ["prfAaaaaaaa", "prfBaaaaaaa"], // slug-owner first
@@ -631,7 +599,6 @@ mod tests {
             "the flag must survive create → get, not die at the row mapping"
         );
 
-        // An update that does not touch the flag keeps it.
         profile.name = "Renamed".into();
         update(&pool, &profile).await.unwrap();
         let loaded = get(&pool, "prf6fffffff").await.unwrap().unwrap();
@@ -640,7 +607,6 @@ mod tests {
             "an update must not silently reset the stored flag"
         );
 
-        // Flipping it off writes through as well.
         profile.include_unknown_country = false;
         update(&pool, &profile).await.unwrap();
         let loaded = get(&pool, "prf6fffffff").await.unwrap().unwrap();
@@ -667,7 +633,6 @@ mod tests {
         assert!(crate::token::is_hashed(&token));
         assert!(crate::token::verify("legacy-secret", &token));
 
-        // A second run has nothing left to do.
         assert_eq!(hash_legacy_tokens(&pool).await.unwrap(), 0);
     }
 
@@ -694,7 +659,7 @@ mod tests {
             vec![("srcB0000000".into(), 0), ("srcA0000000".into(), 1)]
         );
 
-        // Replacement is full, not incremental.
+        // Replacement is full, not incremental
         replace_sources(&pool, "prf2bbbbbbb", &[("srcA0000000".into(), 0)])
             .await
             .unwrap();
@@ -703,16 +668,14 @@ mod tests {
             vec![("srcA0000000".into(), 0)]
         );
 
-        // Deleting the profile cascades to the composition.
+        // Deleting the profile cascades to the composition
         delete(&pool, "prf2bbbbbbb").await.unwrap();
         assert!(get_sources(&pool, "prf2bbbbbbb").await.unwrap().is_empty());
     }
 
     /// A composition naming a source that does not exist is refused, and
-    /// the failure leaves the stored composition untouched: the write runs
-    /// in one transaction, so a broken insert anywhere in the list rolls
-    /// the whole replacement back. A partially valid list fails the same
-    /// way — one bad source id must not wipe the members before it.
+    /// the failure leaves the stored composition untouched: one bad
+    /// source id must not wipe the members before it.
     #[tokio::test]
     async fn a_failing_composition_write_keeps_the_previous_members() {
         let (_dir, pool) = temp_pool().await;
@@ -733,7 +696,6 @@ mod tests {
         let stored = || async { get_sources(&pool, "prf5eeeeeee").await.unwrap() };
         let before = stored().await;
 
-        // Full replacement with one unknown id: refused, nothing written.
         assert!(
             replace_sources(&pool, "prf5eeeeeee", &[("srcXzzzzzzzz".into(), 0)])
                 .await
@@ -742,8 +704,7 @@ mod tests {
         assert_eq!(stored().await, before, "the refused write changes nothing");
 
         // A partially valid list fails on the bad id and keeps the old
-        // members whole: the members inserted before the failure are rolled
-        // back with it.
+        // members whole
         assert!(
             replace_sources(
                 &pool,
@@ -765,7 +726,7 @@ mod tests {
 
         // The same refusal through `upsert_with_sources`, the writer the
         // admin form uses: the profile row and the composition roll back
-        // together.
+        // together
         assert!(
             upsert_with_sources(&pool, &profile, &[("srcXzzzzzzzz".into(), 0)], false,)
                 .await
@@ -826,7 +787,7 @@ mod tests {
         .unwrap();
 
         // X is ready and linked from both sources (counted once); Y is
-        // alive and linked from srcA only (outside the ready count).
+        // alive and linked from srcA only (outside the ready count)
         let x = insert_proxy(&pool, "fp-x", "ready").await;
         let y = insert_proxy(&pool, "fp-y", "alive").await;
         link(&pool, x, "srcA0000000").await;
@@ -841,7 +802,6 @@ mod tests {
         assert_eq!(row.proxies_count, 1, "only the ready proxy counts");
         assert_eq!(row.output_format, "base64");
 
-        // Card: composition in merge order with resolved names.
         let composition = composition(&pool, "prf3ccccccc").await.unwrap();
         assert_eq!(
             composition
@@ -853,7 +813,6 @@ mod tests {
         assert_eq!(composition[0].name.as_deref(), Some("s"));
         assert_eq!(composition[0].enabled, Some(true));
 
-        // Card: three link rows, two distinct fingerprints.
         let stats = dedup_stats(&pool, "prf3ccccccc").await.unwrap();
         assert_eq!(
             stats,
@@ -866,8 +825,7 @@ mod tests {
 
     /// The export's batched reads: one query groups the whole
     /// `profile_sources` table by profile (each list in position order,
-    /// profiles without sources absent), and the slug column reads back
-    /// on its own, `None` for a row without one.
+    /// profiles without sources absent).
     #[tokio::test]
     async fn sources_by_profile_and_list_slugs_cover_the_whole_table() {
         let (_dir, pool) = temp_pool().await;
@@ -880,7 +838,7 @@ mod tests {
             .await
             .unwrap();
         // Written out of order on purpose: the read must restore the
-        // position order.
+        // position order
         replace_sources(
             &pool,
             "prfAaaaaaaa",
@@ -915,7 +873,7 @@ mod tests {
             ]
         );
 
-        // A row without a slug reads back as `None`.
+        // A row without a slug reads back as `None`
         let mut bare = sample_profile("prfCaaaaaaa");
         bare.slug = None;
         create(&pool, &bare).await.unwrap();

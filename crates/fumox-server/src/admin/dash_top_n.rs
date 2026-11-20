@@ -1,15 +1,10 @@
-//! Configurable Top-N selector for the dashboard widgets.
-//!
-//! The choice is persisted in a plain `fumox_dash_top_n` cookie, mirroring
-//! the language and theme cookies: the server reads the value from each
-//! request, and the `?n=…` setter redirects back to the originating admin
-//! page with a fresh `Set-Cookie`. Mirrors the `fumox_theme` pattern from
-//! `theme.rs`.
-//!
-//! The only recognised values are `[5, 10, 15, 25, 50]`, anything else
-//! (including `0`, negative numbers, non-numeric) collapses to the default
-//! `10`. The dashboard widgets respect this limit when paging
-//! `recent_errors`, `top_alive`, `top_failures`, and the country split.
+//! Configurable Top-N selector for the dashboard widgets. The choice is
+//! persisted in a plain `fumox_dash_top_n` cookie, mirroring the language
+//! and theme cookies: the server reads the value per request, the `?n=…`
+//! setter redirects back with a fresh `Set-Cookie`. Only
+//! `[5, 10, 15, 25, 50]` are recognised, anything else collapses to the
+//! default `10`; the dashboard widgets apply it when paging
+//! `recent_errors`, `top_alive`, `top_failures` and the country split.
 
 use axum::extract::Form;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -143,11 +138,11 @@ mod tests {
         headers.insert(header::COOKIE, "fumox_dash_top_n=5".parse().unwrap());
         assert_eq!(from_headers(&headers).as_i64(), 5);
 
-        // Garbled value falls back to the default.
+        // Garbled value falls back to the default
         headers.insert(header::COOKIE, "fumox_dash_top_n=999".parse().unwrap());
         assert_eq!(from_headers(&headers).as_i64(), DEFAULT);
 
-        // No cookie at all also yields the default.
+        // No cookie at all also yields the default
         let empty = HeaderMap::new();
         assert_eq!(from_headers(&empty).as_i64(), DEFAULT);
     }
@@ -173,7 +168,7 @@ mod tests {
         )
         .expect("dashboard template readable");
         // The menu is the `{% for n in [...] %}` list of the top-n picker
-        // form; the `<option>` tags render `{{ n }}`, not a literal.
+        // form; the `<option>` tags render `{{ n }}`, not a literal
         let list = template
             .split("{% for n in [")
             .nth(1)

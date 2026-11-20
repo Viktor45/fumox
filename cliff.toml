@@ -1,20 +1,16 @@
 # git-cliff ~ configuration file
 # https://git-cliff.org/docs/configuration
-#
 # Dated image-snapshot changelog (rolling release): a section per publishing
-# batch, keyed by the image sha-tag. The body template is deliberately FLAT,
-# one machine-readable line per commit, `date|sha|category|message`, because
+# batch, keyed by the image sha-tag. The body template is deliberately flat,
+# one machine-readable line per commit `date|sha|category|message`, because
 # Tera cannot group by a computed attribute (the calendar day of a Unix
-# timestamp). The day-sectioning is done by scripts/make-changelog.py,
-# which reads this draft on stdin; a human pass afterwards rewrites the
-# terse subjects and drops what never shipped in an image.
-#
-# Pipeline:
-#   git-cliff --config cliff.toml | scripts/make-changelog.py
-#
+# timestamp); scripts/make-changelog.py does the day-sectioning from this
+# draft on stdin, then a human pass rewrites the terse subjects and drops
+# what never shipped in an image
+# Pipeline: git-cliff --config cliff.toml | scripts/make-changelog.py
 # Category mapping (Keep a Changelog taxonomy): feat → Added, fix → Fixed,
 # perf/refactor/upd → Changed, docs/manual → Docs, chore and dependabot
-# merges → dropped (they never change the shipped image).
+# merges → dropped (they never change the shipped image)
 
 [changelog]
 header = """
@@ -32,21 +28,17 @@ body = """
 {{ commit.committer.timestamp | date(fmt="%Y-%m-%d") }}|{{ commit.id | truncate(length=7, end="") }}|{{ commit.group }}|{{ commit.message | upper_first | replace(from="\n", to=" ") }}
 {% endfor %}\
 """
-# Remove leading and trailing whitespaces from the changelog's body.
 trim = true
-# Render body even when there are no releases to process.
 render_always = true
 
 [git]
-# Parse commits according to the conventional commits specification.
 conventional_commits = true
 # Non-conventional subjects (Initial commit, Create README.md) are filed
-# under Changed instead of being dropped.
+# under Changed instead of being dropped
 filter_unconventional = false
-# Split commits on newlines, treating each line as an individual commit.
 split_commits = false
-# Order commits within a day oldest-first (the script writes the day
-# header at the batch's last commit, matching the image tag).
+# Oldest-first within a day: the script writes the day header at the
+# batch's last commit, matching the image tag
 sort_commits = "oldest"
 
 commit_parsers = [
@@ -57,15 +49,14 @@ commit_parsers = [
     { message = "^docs", group = "Docs" },
     { message = "^manual", group = "Docs" },
     { message = "^upd", group = "Changed" },
-    # dependency bumps and merge noise never change the shipped image.
-    # dependabot speaks both languages: conventional (`build(deps): bump
+    # dependency bumps and merge noise never change the shipped image;
+    # dependabot speaks both languages, conventional (`build(deps): bump
     # ...`) and plain (`Bump ... from ... to ...`); `filter_commits` below
-    # removes everything the parsers mark `skip`.
+    # removes everything the parsers mark `skip`
     { message = "^(build|chore)\\(deps\\)", group = "Internal", skip = true },
     { message = "^Bump .* from .* to ", group = "Internal", skip = true },
     { message = "^chore", group = "Internal", skip = true },
     { message = "^Merge pull request", group = "Internal", skip = true },
     { message = ".*", group = "Changed" },
 ]
-# Exclude the commits the parsers above skip.
 filter_commits = true

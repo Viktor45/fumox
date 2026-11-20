@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# Container smoke test for the fumox runtime image.
-#
-# What it proves on every architecture the CI builds:
+# Container smoke test for the fumox runtime image, on every architecture the
+# CI builds:
 #   1. the image starts with the bind mounts a deployment uses: /app/data
-#      owned by the fumox uid (999), /app/config read-only;
-#   2. the server comes up and /healthz answers 200;
-#   3. the SQLite database is created inside the data mount;
-#   4. a read-only data mount fails PREDICTABLY: the container exits with
-#      a non-zero code, it does not hang and it does not serve anyway.
+#      owned by the fumox uid (999), /app/config read-only
+#   2. the server comes up and /healthz answers 200
+#   3. the SQLite database is created inside the data mount
+#   4. a read-only data mount fails PREDICTABLY: the container exits with a
+#      non-zero code, it does not hang and it does not serve anyway
 #
-# The last case is the one that matters for a deployment: a misconfigured
-# mount must surface as a failed start, not as a container that looks alive
-# and silently keeps nothing.
+# Case 4 is the one that matters for a deployment: a misconfigured mount must
+# surface as a failed start, not as a container that looks alive and silently
+# keeps nothing
 #
 # Usage:
 #   scripts/container-smoke.sh [image]
@@ -39,9 +38,8 @@ rm -rf "$WORK"
 mkdir -p "$WORK/data" "$WORK/config" "$WORK/ro-data"
 cp "$ROOT/config/app.toml" "$WORK/config/app.toml"
 
-# The container runs as uid 999: the data mount must be writable by it.
-# On a rootless engine or on macOS the ownership is virtualized and the
-# chown is neither possible nor needed.
+# The data mount must be writable by uid 999. On a rootless engine or macOS
+# the ownership is virtualized and the chown is neither possible nor needed
 if ! chown -R 999:999 "$WORK/data" 2>/dev/null; then
     if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
         sudo -n chown -R 999:999 "$WORK/data"
@@ -66,7 +64,6 @@ fail() {
 
 echo ">> image: $IMAGE"
 
-# 1. the server starts and answers
 echo ">> starting the server with the deployment mounts"
 "${CLI[@]}" run -d --name "$NAME" \
     -p 127.0.0.1::8080 \
@@ -92,7 +89,6 @@ until curl -fsS --max-time 3 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; d
 done
 echo ">> /healthz answers 200"
 
-# 2. the database is created in the data mount
 if [ ! -f "$WORK/data/fumox.db" ]; then
     fail "the SQLite database was not created in the data mount"
 fi
@@ -100,7 +96,6 @@ echo ">> the database was created in the data mount"
 
 "${CLI[@]}" rm -f "$NAME" >/dev/null 2>&1 || true
 
-# 3. a read-only data mount must fail, not hang
 echo ">> starting the server with a read-only data mount (must fail fast)"
 "${CLI[@]}" run -d --name "$RO_NAME" \
     -v "$WORK/ro-data:/app/data:ro" \

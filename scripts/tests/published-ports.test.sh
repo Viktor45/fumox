@@ -3,17 +3,9 @@
 # quadlet pod (docker/quadlet/fumox.pod) and the kube manifest
 # (docker/kube/fumox-pod.yaml) expose to the host.
 #
-# Needs nothing but bash: it parses the two files, no container engine and
-# no network. The invariants it guards are the isolation design of the pod
-# layout — the admin panel loopback-only, the kernel's controller (9090)
-# and the meow proxy port (7890) never published:
-#
-#   - fumox.pod declares exactly two PublishPort lines;
-#   - the admin mapping (8081) carries the 127.0.0.1: prefix;
-#   - no published host port anywhere is 9090 or 7890;
-#   - the worker pod publishes nothing at all;
-#   - in the kube manifest, the hostPort 8081 entry carries
-#     hostIP: "127.0.0.1".
+# Needs nothing but bash (it parses the two files). The invariants guard the
+# isolation design of the pod layout: the admin panel loopback-only, the
+# kernel's controller (9090) and the meow proxy port (7890) never published.
 #
 # Run directly:  bash scripts/tests/published-ports.test.sh
 
@@ -35,7 +27,6 @@ for f in "$POD" "$WORKER_POD" "$KUBE"; do
     [ -f "$f" ] || fail "$f not found"
 done
 
-# quadlet pod
 mapfile -t publishes < <(grep -E '^PublishPort=' "$POD" || true)
 count="${#publishes[@]}"
 
@@ -60,8 +51,7 @@ if grep -qE '^PublishPort=' "$WORKER_POD"; then
 fi
 note "the worker pod publishes nothing"
 
-# kube manifest
-# hostPort 8081 must sit inside an entry that also declares hostIP 127.0.0.1.
+# hostPort 8081 must sit inside an entry that also declares hostIP 127.0.0.1
 if ! grep -E 'hostPort: 8081' -A2 "$KUBE" | grep -E 'hostIP: "127\.0\.0\.1"' >/dev/null; then
     fail "the kube manifest must declare hostPort 8081 with hostIP \"127.0.0.1\""
 fi

@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Controller smoke test for the fumox-meow image.
-#
-# What it proves:
+# Controller smoke test for the fumox-meow image:
 #   1. the kernel refuses to start without a controller secret: an
 #      external-controller without authentication can rewrite the proxy
 #      configuration, so a missing secret must be a failed start, not a
-#      running controller that answers everyone;
-#   2. the controller rejects a request that carries no Authorization
-#      header (or a wrong one);
-#   3. the controller answers a request that presents the secret.
+#      running controller that answers everyone
+#   2. the controller rejects a request with no Authorization header
+#      (or a wrong one)
+#   3. the controller answers a request that presents the secret
 #
 # Usage:
 #   scripts/meow-controller-smoke.sh [image]
@@ -47,7 +45,6 @@ SECRET="$(openssl rand -hex 32)"
 
 echo ">> image: $IMAGE"
 
-# 1. no secret: the kernel must not start
 echo ">> starting the kernel without a controller secret (must fail)"
 "${CLI[@]}" run -d --name "$NOAUTH_TOKEN_NAME" \
     --tmpfs /run/meow:rw,noexec,nosuid,nodev,mode=1777,size=16m \
@@ -70,7 +67,6 @@ if [ "$code" = "0" ]; then
 fi
 echo ">> the kernel refused to start without a secret (exit code $code)"
 
-# 2. the controller answers only with the secret
 echo ">> starting the kernel with a controller secret"
 "${CLI[@]}" run -d --name "$NAME" \
     -p 127.0.0.1::9090 \
@@ -85,8 +81,8 @@ if [ -z "$port" ]; then
 fi
 echo ">> controller on 127.0.0.1:$port"
 
-# The controller comes up asynchronously; wait for the socket to answer at
-# all (the answer may be a rejection, that is fine).
+# The controller comes up asynchronously: wait for the socket to answer at
+# all, the answer may be a rejection
 deadline=$((SECONDS + 60))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if [ "$("${CLI[@]}" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then
@@ -98,7 +94,6 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 1
 done
 
-# 3. no Authorization: the request must be rejected
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$port/version")"
 case "$code" in
     2*) fail "the controller answered $code to a request without Authorization" ;;
@@ -114,7 +109,6 @@ case "$wrong" in
 esac
 echo ">> the controller rejected a request with a wrong secret (HTTP $wrong)"
 
-# 4. with the secret: the controller answers
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
     -H "Authorization: Bearer $SECRET" "http://127.0.0.1:$port/version")"
 case "$code" in

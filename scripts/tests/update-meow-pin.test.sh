@@ -2,15 +2,13 @@
 # Fixture test for scripts/update-meow-pin.sh.
 #
 # The script rewrites the meow-rs pin in five files at once and refuses to
-# build a bump it cannot prove. Both halves need pinning: a bump must
-# reach every copy of the value (and only the copies that are pins, not
-# the prose examples), and a release whose archive does not hash to the
-# published sum must leave the tree untouched.
-#
-# `gh` and `curl` are stubs answering from a fixture directory, so no
-# network is involved. The script is COPIED into a fixture checkout along
-# with the five real files, because it resolves the repository root from
-# its own location: the real working tree is never written to.
+# build a bump it cannot prove: a bump must reach every copy of the value
+# (and only the copies that are pins, not the prose examples), and a release
+# whose archive does not hash to the published sum must leave the tree
+# untouched. `gh` and `curl` are stubs answering from a fixture directory,
+# no network involved. The script is COPIED into a fixture checkout because
+# it resolves the repository root from its own location: the real working
+# tree is never written to.
 #
 # Run directly:  bash scripts/tests/update-meow-pin.test.sh
 
@@ -51,15 +49,14 @@ if [ -z "$CUR_VERSION" ] || [ -z "$CUR_AMD64" ] || [ -z "$CUR_ARM64" ]; then
     fail "could not read the current pin from docker/meow/Dockerfile"
 fi
 
-# Snapshot the real files: nothing below may write to them.
+# Snapshot the real files: nothing below may write to them
 REAL_SNAPSHOT="$WORK/real-before"
 for f in "${PIN_FILES[@]}"; do
     printf '%s  %s\n' "$(sha256_of "$ROOT/$f")" "$f"
 done >"$REAL_SNAPSHOT"
 
-# the fixture releases
-# A version that is not the current pin, with archives whose real sums the
-# published .sha256 assets carry.
+# A fixture release that is not the current pin, with archives whose real
+# sums the published .sha256 assets carry
 NEW_VERSION="v0.99.0"
 AMD64_ASSET="meow-${NEW_VERSION}-x86_64-unknown-linux-musl.tar.gz"
 ARM64_ASSET="meow-${NEW_VERSION}-aarch64-unknown-linux-musl.tar.gz"
@@ -90,11 +87,10 @@ for pair in "x86_64-unknown-linux-musl:$CUR_AMD64" "aarch64-unknown-linux-musl:$
     printf '%s  %s\n' "${pair#*:}" "$asset" >"$CUR_ASSETS/$asset.sha256"
 done
 
-# the stubs
 STUB="$WORK/bin"
 mkdir -p "$STUB"
 
-# gh: answers the release lookup with $STUB_TAG.
+# gh: answers the release lookup with $STUB_TAG
 cat >"$STUB/gh" <<STUB
 #!/bin/sh
 if [ "\$1" = "api" ] && [ "\$2" = "repos/meow-rs/meow-rs/releases/latest" ]; then
@@ -182,7 +178,7 @@ grep -q "^previous_version=$CUR_VERSION$" "$WORK/output" || fail "expected previ
 grep -q "^sha256_amd64=$AMD64_SUM$" "$WORK/output" || fail "expected the amd64 sum in \$GITHUB_OUTPUT"
 grep -q "^sha256_arm64=$ARM64_SUM$" "$WORK/output" || fail "expected the arm64 sum in \$GITHUB_OUTPUT"
 
-# Both archives were downloaded and verified, not just the checksum files.
+# Both archives were downloaded and verified, not just the checksum files
 grep -qx "$AMD64_ASSET" "$STUB_FETCHED" || fail "the amd64 archive was not verified"
 grep -qx "$ARM64_ASSET" "$STUB_FETCHED" || fail "the arm64 archive was not verified"
 
@@ -219,7 +215,7 @@ for g in USERGUIDE.md USERGUIDE.ru.md; do
 done
 note "a bump rewrites all five files, the header example, and only the table cell in the guides"
 
-# The rewrite must not leave sed's backup files behind.
+# The rewrite must not leave sed's backup files behind
 if [ -n "$(find "$REPO" -name '*.bak' -print -quit)" ]; then
     fail "sed backup files were left in the tree"
 fi

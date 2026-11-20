@@ -1,32 +1,24 @@
 //! Write restriction for the probe daemon's database connection.
 //!
-//! SQLite has no roles: every process that opens the file may write
-//! every table. The probe only owns the health status of a proxy, but
-//! the file it opens is the same one the ingest pipeline writes, so
-//! without a guard a defect (or a compromised probe) could rewrite the
-//! subscription content itself — the hosts, the credentials, the
-//! sources.
+//! SQLite has no roles: every process that opens the file may write every
+//! table. The probe only owns the health status of a proxy, but the file it
+//! opens is the same one the ingest pipeline writes, so without a guard a
+//! defect (or a compromised probe) could rewrite the subscription content
+//! itself. Implemented with SQLite's authorizer, installed on the probe's
+//! connections only, so the server keeps full write access to the same file.
 //!
-//! The restriction is implemented with SQLite's authorizer, the
-//! callback SQLite asks before it prepares a statement. It is installed
-//! on the probe's connections only, so the server keeps full write
-//! access to the same file.
-//!
-//! The rules are an allow-list: a table the probe has no write business
-//! with is denied, so a table added later is denied by default instead
-//! of silently becoming writable. Schema changes are refused outright,
-//! and a pragma may only be queried: both would alter the shared file
-//! without touching a table the rules govern. The schema is applied
-//! before the restricted connections exist (see
-//! [`crate::db::connect_probe_pool`]), so the restriction never has to
-//! let a migration through.
+//! The rules are an allow-list: a table the probe has no write business with
+//! is denied, so a table added later is denied by default instead of silently
+//! becoming writable. Schema changes are refused outright and a pragma may
+//! only be queried; the schema is applied before the restricted connections
+//! exist (see [`crate::db::connect_probe_pool`]), so the restriction never
+//! has to let a migration through.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
 use libsqlite3_sys as ffi;
 use sqlx::sqlite::SqliteConnection;
 
-/// What the probe may do with one table.
 struct TableRule {
     table: &'static str,
     insert: bool,
@@ -37,13 +29,9 @@ struct TableRule {
     columns: &'static [&'static str],
 }
 
-/// The probe's write surface.
-///
-/// `proxies` carries the subscription content (host, credential,
-/// parameters, geo), so only the health columns are writable. The
-/// other tables are the probe's own bookkeeping: the check history,
-/// the request queue, the journal it rotates and the service
-/// key-value table.
+/// The probe's write surface. `proxies` carries the subscription content
+/// (host, credential, parameters, geo), so only the health columns are
+/// writable; the other tables are the probe's own bookkeeping.
 const RULES: &[TableRule] = &[
     TableRule {
         table: "probe_results",
@@ -100,18 +88,15 @@ const RULES: &[TableRule] = &[
     },
 ];
 
-/// Installs the authorizer on one connection.
-///
 /// Returns an error instead of leaving the connection unrestricted: a
 /// connection that silently lost its guard would be a write hole.
 pub(crate) async fn install(connection: &mut SqliteConnection) -> sqlx::Result<()> {
-    // `lock_handle` pauses the connection's worker thread and hands out
-    // the raw handle, so no statement can be running on it while the
-    // authorizer is installed.
+    // `lock_handle` pauses the worker thread and hands out the raw handle,
+    // so no statement can be running while the authorizer is installed
     let mut handle = connection.lock_handle().await?;
     let raw = handle.as_raw_handle();
     // SAFETY: the handle is locked, so this thread has exclusive access
-    // to the connection, and the authorizer is set on an idle handle.
+    // to the connection, and the authorizer is set on an idle handle
     let code = unsafe {
         ffi::sqlite3_set_authorizer(raw.as_ptr(), Some(authorizer), std::ptr::null_mut())
     };
@@ -123,10 +108,7 @@ pub(crate) async fn install(connection: &mut SqliteConnection) -> sqlx::Result<(
     Ok(())
 }
 
-/// The authorizer callback.
-///
-/// Called by SQLite before it prepares a statement. Returning
-/// `SQLITE_DENY` aborts the statement with "not authorized"; returning
+/// Called by SQLite before it prepares a statement; `SQLITE_DENY` aborts it,
 /// `SQLITE_OK` lets it through.
 unsafe extern "C" fn authorizer(
     _context: *mut c_void,
@@ -137,7 +119,7 @@ unsafe extern "C" fn authorizer(
     _trigger: *const c_char,
 ) -> c_int {
     // A temporary database is per-connection scratch space, not the
-    // shared subscription store.
+    // shared subscription store
     if cstr(database) == Some("temp") {
         return ffi::SQLITE_OK;
     }
@@ -151,10 +133,10 @@ unsafe extern "C" fn authorizer(
             }
         }
         // `ATTACH` would give the connection a second handle on the
-        // database file; nothing in the codebase attaches.
+        // database file; nothing in the codebase attaches
         ffi::SQLITE_ATTACH => ffi::SQLITE_DENY,
         // Dropping a table destroys the content the probe may not
-        // change.
+        // change
         ffi::SQLITE_DROP_TABLE => {
             let table = cstr(table).unwrap_or_default();
             if RULES.iter().any(|rule| rule.table == table && rule.drop) {
@@ -163,13 +145,11 @@ unsafe extern "C" fn authorizer(
                 ffi::SQLITE_DENY
             }
         }
-        // The schema belongs to the migration that runs before the
-        // restricted connections exist, so no DDL has business here.
-        // SQLite already refuses most of it on its own: preparing a
-        // schema change compiles into writes on `sqlite_master`, which
-        // `write_allowed` denies. The explicit deny keeps that
-        // guarantee a property of the guard, not of that implementation
-        // detail.
+        // The schema belongs to the migration that runs before the restricted
+        // connections exist, so no DDL has business here. SQLite already
+        // refuses most of it on its own (a schema change compiles into
+        // `sqlite_master` writes, which `write_allowed` denies); the explicit
+        // deny keeps that a property of the guard, not of that detail
         ffi::SQLITE_CREATE_TABLE
         | ffi::SQLITE_CREATE_INDEX
         | ffi::SQLITE_CREATE_TRIGGER
@@ -181,12 +161,11 @@ unsafe extern "C" fn authorizer(
         | ffi::SQLITE_DROP_VTABLE
         | ffi::SQLITE_ALTER_TABLE
         | ffi::SQLITE_REINDEX => ffi::SQLITE_DENY,
-        // The authorizer hands a pragma over as the table argument (the
-        // name) and the column argument (the value, absent for a bare
-        // read). A pragma with a value reconfigures what it names — and
-        // the ones that name a file property (`journal_mode`,
-        // `user_version`) write the shared file itself, outside every
-        // table the rules govern.
+        // The authorizer hands a pragma over as the table argument (the name)
+        // and the column argument (the value, absent for a bare read). A
+        // pragma with a value reconfigures what it names, and the ones that
+        // name a file property (`journal_mode`, `user_version`) write the
+        // shared file itself, outside every table the rules govern
         ffi::SQLITE_PRAGMA => {
             if pragma_allowed(cstr(table).unwrap_or_default(), cstr(column)) {
                 ffi::SQLITE_OK
@@ -198,19 +177,16 @@ unsafe extern "C" fn authorizer(
     }
 }
 
-/// Whether the probe may perform `action` on `table`.
 fn write_allowed(table: &str, action: c_int, column: Option<&str>) -> bool {
-    // SQLite reserves the `sqlite_` prefix for its own bookkeeping:
-    // `sqlite_sequence` holds the AUTOINCREMENT counters, `sqlite_stat1`
-    // the `ANALYZE` statistics. SQLite updates them on its own, so
-    // refusing them would break the statements the probe is allowed to
-    // make. `sqlite_master` is the exception: it holds the schema
-    // itself, and a write to it changes what the table looks like.
+    // SQLite reserves the `sqlite_` prefix for its own bookkeeping and
+    // updates those tables itself, so refusing them would break statements
+    // the probe is allowed to make. `sqlite_master` is the exception: it
+    // holds the schema itself
     if table.starts_with("sqlite_") && table != "sqlite_master" {
         return true;
     }
     let Some(rule) = RULES.iter().find(|rule| rule.table == table) else {
-        // Not on the list: the probe has no write business with it.
+        // Not on the list: the probe has no write business with it
         return false;
     };
     match action {
@@ -222,7 +198,7 @@ fn write_allowed(table: &str, action: c_int, column: Option<&str>) -> bool {
             }
             match column {
                 // An `UPDATE` names its columns; a rule without a column
-                // list accepts any of them.
+                // list accepts any of them
                 Some(column) => rule.columns.is_empty() || rule.columns.contains(&column),
                 None => false,
             }
@@ -231,10 +207,9 @@ fn write_allowed(table: &str, action: c_int, column: Option<&str>) -> bool {
     }
 }
 
-/// The argument-taking pragmas whose argument is the subject of the
-/// question, not a value to set: `PRAGMA table_info(proxies)` reads the
-/// columns of `proxies`, it configures nothing. Any other pragma handed
-/// a value is a write to the shared file and is refused.
+/// The argument-taking pragmas whose argument is the subject of the question,
+/// not a value to set: `PRAGMA table_info(proxies)` reads the columns of
+/// `proxies`, it configures nothing.
 const PRAGMA_READS: &[&str] = &[
     "table_info",
     "table_xinfo",
@@ -249,8 +224,8 @@ const PRAGMA_READS: &[&str] = &[
     "compile_options",
 ];
 
-/// Whether the probe may run the pragma `name` with the value `value`
-/// (`None` for a bare read). A read asks, it does not configure.
+/// Whether the probe may run the pragma `name` with the value `value`. A
+/// bare read asks, it does not configure.
 fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
     match value {
         None => true,
@@ -258,13 +233,12 @@ fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
     }
 }
 
-/// Reads a NUL-terminated string handed over by SQLite.
 fn cstr<'a>(value: *const c_char) -> Option<&'a str> {
     if value.is_null() {
         return None;
     }
     // SAFETY: SQLite passes NUL-terminated strings that stay valid for
-    // the duration of the callback.
+    // the duration of the callback
     unsafe { CStr::from_ptr(value) }.to_str().ok()
 }
 
@@ -361,8 +335,6 @@ mod tests {
 
     #[test]
     fn sqlite_internals_are_writable_but_the_schema_is_not() {
-        // SQLite updates these on its own while the probe's own
-        // statements run.
         assert!(write_allowed(
             "sqlite_sequence",
             ffi::SQLITE_UPDATE,
@@ -373,7 +345,6 @@ mod tests {
             ffi::SQLITE_INSERT,
             Some("tbl")
         ));
-        // The schema is not the probe's to change.
         assert!(!write_allowed(
             "sqlite_master",
             ffi::SQLITE_UPDATE,
@@ -392,18 +363,14 @@ mod tests {
 
     #[test]
     fn pragma_writes_are_refused_but_reads_are_not() {
-        // A bare pragma asks, it does not configure.
         assert!(pragma_allowed("journal_mode", None));
         assert!(pragma_allowed("foreign_keys", None));
         assert!(pragma_allowed("integrity_check", None));
-        // The file's own metadata is not the probe's to stamp.
         assert!(!pragma_allowed("user_version", Some("7")));
         assert!(!pragma_allowed("journal_mode", Some("DELETE")));
         assert!(!pragma_allowed("application_id", Some("x")));
-        // The introspection pragmas' argument is part of the question.
         assert!(pragma_allowed("table_info", Some("proxies")));
         assert!(pragma_allowed("index_list", Some("proxies")));
-        // Any other pragma handed a value is a write.
         assert!(!pragma_allowed("wal_checkpoint", Some("TRUNCATE")));
         assert!(!pragma_allowed("busy_timeout", Some("5000")));
     }

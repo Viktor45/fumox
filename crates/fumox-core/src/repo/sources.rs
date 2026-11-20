@@ -1,5 +1,3 @@
-//! CRUD for the `sources` table.
-
 use super::BindWhereFilter;
 use crate::db::DbPool;
 use crate::models::{ErrorClass, InputFormat, IpFamily, Scheme, Source};
@@ -35,7 +33,7 @@ impl TryFrom<SourceRow> for Source {
     fn try_from(row: SourceRow) -> Result<Self, Self::Error> {
         Ok(Source {
             // Cloned so the id can still name the row in the corrupt-JSON
-            // errors the field mappings below may raise.
+            // errors the field mappings below may raise
             id: row.id.clone(),
             slug: row.slug,
             access_token: row.access_token,
@@ -138,17 +136,14 @@ const COLUMNS: &str =
     last_fetched_at, last_error, error_class";
 
 /// Insert a new source. The caller assigns `id` (see [`crate::models::new_id`]).
-///
-/// The row is written on the caller's executor: the pool, or the
-/// connection of an open transaction. A caller that has to write several
-/// rows together passes the transaction's connection, so the whole batch
-/// lands or none of it does.
+/// The row is written on the caller's executor, so a caller writing several
+/// rows together passes its transaction's connection.
 pub async fn create<'c, E>(executor: E, source: &Source) -> crate::Result<()>
 where
     E: sqlx::Executor<'c, Database = Sqlite>,
 {
     // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
-    // flows through .bind().
+    // flows through .bind()
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO sources ({COLUMNS})
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -157,7 +152,7 @@ where
     .bind(source.slug.clone())
     // The endpoint token is stored as a hash, like the profile one: the
     // write is idempotent for an already-hashed value (an import carrying
-    // the stored form), so the admin form and the import share the path.
+    // the stored form), so the admin form and the import share the path
     .bind(crate::token::stored(source.access_token.clone()))
     .bind(source.name.clone())
     .bind(source.url.clone())
@@ -181,16 +176,11 @@ where
 }
 
 /// The fetch-stamp columns of a source row, as the raw values the
-/// database stores.
-///
-/// [`update_settings`] reads the current row through this projection
-/// instead of the [`TryFrom`] mapping: one corrupt enum string
-/// (`encoding`, `input_format`, `ip_family`, …) would fail the mapped
-/// read and with it the whole save, while the write below rewrites every
-/// one of these columns — saving over the corruption is exactly how the
-/// operator heals the row. The staleness comparison is a text-level diff
-/// of the same projection (see [`fetch_stamp_stale`]), so a corrupt
-/// stored value simply reads as "changed" and the next ingest re-fetches.
+/// database stores. [`update_settings`] reads the current row through
+/// this projection instead of the [`TryFrom`] mapping: one corrupt enum
+/// string would fail the mapped read and with it the whole save, while
+/// the write below rewrites these columns, so saving over the corruption
+/// is how the operator heals the row (see [`fetch_stamp_stale`]).
 #[derive(Debug, PartialEq, Eq, FromRow)]
 struct FetchStampRow {
     url: String,
@@ -238,9 +228,9 @@ impl FetchStampRow {
 /// The fields a change to which invalidates the freshness stamp
 /// (`last_fetched_at`): the stored rows were reconciled from a payload
 /// fetched under these settings, so after an edit the next ingest must
-/// re-fetch instead of trusting the old stamp (the TTL short-circuit of the
-/// server's `ingest::ingest_source` reads exactly this column). Cosmetic
-/// edits (name, slug, tags) keep the stamp.
+/// re-fetch (the TTL short-circuit of the server's `ingest::ingest_source`
+/// reads exactly this column). Cosmetic edits (name, slug, tags) keep the
+/// stamp.
 fn fetch_stamp_stale(old: &FetchStampRow, new: &FetchStampRow) -> bool {
     old.url != new.url
         || old.enabled != new.enabled
@@ -259,23 +249,16 @@ fn fetch_stamp_stale(old: &FetchStampRow, new: &FetchStampRow) -> bool {
 /// The admin write path owns the settings columns only. The fetcher's
 /// columns (`last_error`, `error_class`) are never written from here: a
 /// fetch outcome that lands while an operator saves the form must not be
-/// clobbered by the save. The freshness stamp is not written either, it
-/// is only reset (see below).
-///
-/// The current row is read raw (no [`TryFrom`] mapping, see
-/// [`FetchStampRow`]), so a corrupt enum string in the stored row cannot
-/// stop the save that rewrites it.
-///
-/// A change to a fetch-relevant field (see [`fetch_stamp_stale`]) resets
-/// `last_fetched_at`, so the next ingest re-fetches under the new settings
-/// instead of riding out the TTL window on a payload reconciled under the
-/// old ones.
+/// clobbered by the save. The current row is read raw (see
+/// [`FetchStampRow`]), so a corrupt enum string cannot stop the save that
+/// rewrites it, and a fetch-relevant change resets `last_fetched_at` (see
+/// [`fetch_stamp_stale`]).
 pub async fn update_settings(pool: &DbPool, source: &Source) -> crate::Result<()> {
     let fresh = FetchStampRow::of_source(source)?;
     let stale = match FetchStampRow::of_stored(pool, &source.id).await? {
         Some(stored) => fetch_stamp_stale(&stored, &fresh),
         // The row is gone: the write below affects nothing and the
-        // caller answers "not found".
+        // caller answers "not found"
         None => true,
     };
     let affected = sqlx::query(
@@ -289,7 +272,7 @@ pub async fn update_settings(pool: &DbPool, source: &Source) -> crate::Result<()
     .bind(&source.slug)
     // Admin-owned, like the profile token: hashed on the way in (idempotent
     // for the stored hash the edit form hands back), and not fetch-relevant
-    // — an endpoint-token change must not reset the freshness stamp.
+    // — an endpoint-token change must not reset the freshness stamp
     .bind(crate::token::stored(source.access_token.clone()))
     .bind(&source.name)
     .bind(&source.url)
@@ -310,24 +293,18 @@ pub async fn update_settings(pool: &DbPool, source: &Source) -> crate::Result<()
     .rows_affected();
     if affected == 0 {
         // The row is gone, not the database: the caller can answer "not
-        // found" instead of "the write failed".
+        // found" instead of "the write failed"
         return Err(crate::Error::NotFound(format!("source {}", source.id)));
     }
     Ok(())
 }
 
-/// Flip the enabled flag of a source row.
-///
-/// The toggle is the one admin action that does not go through the
-/// settings form, so it gets its own targeted write: the settings
-/// columns keep the values they have, and the fetcher's columns are not
-/// touched at all.
-///
-/// The flip is a fetch-relevant change, so the freshness stamp is reset:
-/// the next ingest must fetch under the new state instead of riding out
-/// the TTL window on a payload reconciled under the old one.
-///
-/// Returns whether the row was there.
+/// Flip the enabled flag of a source row. The toggle is the one admin
+/// action that does not go through the settings form, so it gets its own
+/// targeted write: the settings columns keep their values and the
+/// fetcher's columns are not touched. The flip is a fetch-relevant
+/// change, so the freshness stamp is reset (the next ingest fetches under
+/// the new state). Returns whether the row was there.
 pub async fn set_enabled(pool: &DbPool, id: &str, enabled: bool) -> crate::Result<bool> {
     let now = crate::models::now_ts();
     let affected = sqlx::query(
@@ -352,16 +329,14 @@ pub async fn get(pool: &DbPool, id: &str) -> crate::Result<Option<Source>> {
     row.map(Source::try_from).transpose()
 }
 
-/// Load several sources by id in one `WHERE id IN (...)` read, keyed by id.
-/// Ids with no row are absent from the map, duplicate ids read one row. A
-/// row whose columns fail to map is skipped with a warning, not failed on:
-/// one corrupt row must not break the whole subscription. The batched read
-/// backs `/sub`'s member load, which walks a profile's
-/// composition and would otherwise issue one indexed row-fetch per member
-/// on the public serving path; callers that need the ids in composition
-/// order order the results themselves from their link list.
+/// Load several sources by id in one `WHERE id IN (...)` read, keyed by
+/// id. Ids with no row are absent from the map, duplicate ids read one
+/// row. A row whose columns fail to map is skipped with a warning, not
+/// failed on: one corrupt row must not break the whole subscription. The
+/// batched read backs `/sub`'s member load; callers that need the ids in
+/// composition order order the results from their link list.
 pub async fn get_many(pool: &DbPool, ids: &[&str]) -> crate::Result<HashMap<String, Source>> {
-    // `IN ()` is not valid SQLite; an empty request has an empty answer.
+    // `IN ()` is not valid SQLite; an empty request has an empty answer
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -396,12 +371,10 @@ pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Sour
     row.map(Source::try_from).transpose()
 }
 
-/// Resolve a `/src/{token}` path segment: slug first, then raw id.
-///
-/// The order is by the *match*, not by the NULL-ness of the slug: a
-/// source whose slug collides with another source's id must lose
-/// against the source that owns the slug, whatever the row order of the
-/// table happens to be.
+/// Resolve a `/src/{token}` path segment: slug first, then raw id. The
+/// order is by the *match*, not by the NULL-ness of the slug: a source
+/// whose slug collides with another source's id must lose against the
+/// source that owns the slug.
 pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<Source>> {
     let row: Option<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM sources WHERE slug = ? OR id = ? ORDER BY (slug = ?) DESC LIMIT 1"
@@ -414,10 +387,9 @@ pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<S
     row.map(Source::try_from).transpose()
 }
 
-/// Every source, newest-created last. A row whose columns fail to map
-/// (a corrupt enum string) is skipped with a warning instead of failing
-/// the whole listing: one broken row must not take every healthy source
-/// out of the ingest rotation with it.
+/// Every source, newest-created last. A row whose columns fail to map is
+/// skipped with a warning instead of failing the whole listing: one
+/// broken row must not take every healthy source out of the rotation.
 pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Source>> {
     let query = if enabled_only {
         format!("SELECT {COLUMNS} FROM sources WHERE enabled = 1 ORDER BY created_at")
@@ -450,12 +422,9 @@ pub async fn list_slugs(pool: &DbPool) -> crate::Result<Vec<Option<String>>> {
     Ok(rows.into_iter().map(|(slug,)| slug).collect())
 }
 
-// Admin sources list
-//
-// The dynamic list screen: filter clauses are whitelisted fragments
-// assembled through the shared [`super::WhereFilter`], every value flows
-// through a bind. The whole list is returned (no pagination; the screen
-// renders every source), so one query serves count and rows.
+// Admin sources list: filter clauses are whitelisted fragments assembled
+// through the shared [`super::WhereFilter`], every value flows through a
+// bind. The whole list is returned (no pagination).
 
 /// One row of the admin sources list: the display columns plus the
 /// linked-proxy count subquery.
@@ -538,9 +507,6 @@ pub async fn list_filtered(
     if filter.query.is_empty() {
         return Ok(rows);
     }
-    // Literal case-insensitive substring match: `contains` on the
-    // lowercased strings has no wildcard syntax, so `%`, `_` and `\` in
-    // the query mean themselves, and the folding covers non-ASCII.
     let needle = filter.query.to_lowercase();
     Ok(rows
         .into_iter()
@@ -578,8 +544,7 @@ pub async fn delete(pool: &DbPool, id: &str) -> crate::Result<bool> {
 /// (and `updated_at`) and clears the error fields; failure stores the
 /// message and its class and leaves the freshness stamp alone. Both
 /// outcomes stamp `last_attempt_at` (migration 0015) with the moment of
-/// the attempt, so a source that keeps failing still shows *when* it was
-/// last tried.
+/// the attempt.
 pub async fn record_fetch_outcome(
     pool: &DbPool,
     id: &str,
@@ -674,7 +639,7 @@ mod tests {
         let loaded = get(&pool, "src1aaaaaaaa").await.unwrap().unwrap();
         assert_eq!(loaded, source);
 
-        // Token resolution: slug wins, id works too.
+        // Token resolution: slug wins, id works too
         assert_eq!(
             resolve_token(&pool, "slug-src1aaaaaaaa")
                 .await
@@ -695,7 +660,7 @@ mod tests {
 
         source.name = "Renamed".into();
         source.cache_ttl_seconds = 600;
-        // NULL (inherit) → explicit family → back to NULL round trip.
+        // NULL (inherit) → explicit family → back to NULL round trip
         source.ip_family = Some(IpFamily::Ipv6);
         source.updated_at += 10;
         update_settings(&pool, &source).await.unwrap();
@@ -752,14 +717,12 @@ mod tests {
 
     /// A failure after a success must not make the stored payload look
     /// fresh: `last_fetched_at` and `updated_at` keep the success's
-    /// stamps while `last_attempt_at` follows every attempt. A success
-    /// does move `updated_at`.
+    /// stamps while `last_attempt_at` follows every attempt.
     #[tokio::test]
     async fn fetch_failure_after_success_keeps_the_freshness_stamps() {
         let (_dir, pool) = temp_pool().await;
         create(&pool, &sample_source("srcAtttttttt")).await.unwrap();
 
-        // The success stamps the freshness columns.
         let success_at = crate::models::now_ts();
         record_fetch_outcome(
             &pool,
@@ -775,8 +738,6 @@ mod tests {
             "the success moves updated_at"
         );
 
-        // The later failure leaves both freshness stamps alone and only
-        // records the attempt moment.
         let failure_at = success_at + 120;
         record_fetch_outcome(
             &pool,
@@ -810,9 +771,8 @@ mod tests {
     }
 
     /// The sources search is a literal case-insensitive substring match,
-    /// compared in Rust: `LIKE` wildcards in the query mean themselves
-    /// (a `100%` plan is findable by `100%`), and the case folding works
-    /// beyond ASCII, which SQLite's `LIKE` does not.
+    /// compared in Rust: `LIKE` wildcards in the query mean themselves and
+    /// the case folding works beyond ASCII, which SQLite's `LIKE` does not.
     #[tokio::test]
     async fn source_search_matches_literal_and_folds_case() {
         let (_dir, pool) = temp_pool().await;
@@ -841,13 +801,11 @@ mod tests {
             found
         }
 
-        // Wildcards match literally, case folds, and non-ASCII folds too.
         assert_eq!(ids(&pool, "100%").await, vec!["srcPaaaaaaaa"]);
         assert_eq!(ids(&pool, "%").await, vec!["srcPaaaaaaaa"]);
         assert_eq!(ids(&pool, "_").await, vec!["srcPaaaaaaaa"]);
         assert_eq!(ids(&pool, "deal_de").await, vec!["srcPaaaaaaaa"]);
         assert_eq!(ids(&pool, "москва").await, vec!["srcRbbbbbbbb"]);
-        // A query with no literal match answers nothing.
         assert!(ids(&pool, "zzz").await.is_empty());
     }
 
@@ -861,7 +819,6 @@ mod tests {
         source.last_fetched_at = Some(crate::models::now_ts());
         create(&pool, &source).await.unwrap();
 
-        // Cosmetic edits: the stamp survives.
         source.name = "Renamed".into();
         source.slug = Some("renamed-slug".into());
         source.tags = Some(vec!["misc".into()]);
@@ -874,7 +831,7 @@ mod tests {
         );
 
         // A fetch-relevant edit resets the stamp; the rest of the row is
-        // written exactly as given.
+        // written exactly as given
         source.url = "https://example.com/other".into();
         update_settings(&pool, &source).await.unwrap();
         let loaded = get(&pool, "src5eeeeeeee").await.unwrap().unwrap();
@@ -969,9 +926,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The corrupt row contributes no tag and breaks nothing.
         assert_eq!(distinct_tags(&pool).await.unwrap(), vec!["eu"]);
-        // The tag filter answers over the healthy rows without failing.
         let rows = list_filtered(
             &pool,
             &SourceListFilter {
@@ -1007,7 +962,7 @@ mod tests {
         .await
         .unwrap();
 
-        // The save carries no error state of its own.
+        // The save carries no error state of its own
         source.name = "Renamed".into();
         source.last_error = None;
         source.error_class = None;
@@ -1040,7 +995,7 @@ mod tests {
         assert_eq!(loaded.url, source.url);
         assert_eq!(loaded.name, source.name);
 
-        // A vanished row is reported, not written.
+        // A vanished row is reported, not written
         assert!(!set_enabled(&pool, "nope", true).await.unwrap());
     }
 
@@ -1066,7 +1021,7 @@ mod tests {
         assert_eq!(loaded.protocols, None);
 
         // A row that still carries an empty list reads back as "no filter"
-        // too.
+        // too
         sqlx::query("UPDATE sources SET protocols = '[]' WHERE id = 'src8hhhhhhhh'")
             .execute(&pool)
             .await
@@ -1110,7 +1065,6 @@ mod tests {
         assert_eq!(loaded["src6ffffffff"], a);
         assert!(!loaded["src7gggggggg"].enabled);
 
-        // Missing ids are absent; duplicates collapse onto one row.
         let loaded = get_many(&pool, &["src6ffffffff", "nope", "src6ffffffff"])
             .await
             .unwrap();
@@ -1140,15 +1094,12 @@ mod tests {
             .await
             .unwrap();
 
-        // The member load answers with the healthy rows only.
         let loaded = get_many(&pool, &["src1aaaaaaaa", "src2bbbbbbbb", "src3cccccccc"])
             .await
             .unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded["src1aaaaaaaa"], healthy);
 
-        // The listing keeps the healthy source in the ingest rotation,
-        // enabled and disabled filters alike.
         for enabled_only in [false, true] {
             let listed = list(&pool, enabled_only).await.unwrap();
             assert_eq!(
@@ -1180,7 +1131,7 @@ mod tests {
         create(&pool, &b).await.unwrap();
         create(&pool, &c).await.unwrap();
 
-        // A proxy linked to `a` exercises the proxies_count subquery.
+        // A proxy linked to `a` exercises the proxies_count subquery
         let (pid,): (i64,) = sqlx::query_as(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
              VALUES ('fp-src', 'vless', 'fp-src', 'fp-src.example.com', 443, 'u', 'alive', 1, 1)
@@ -1195,7 +1146,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Unfiltered: every source, newest created first.
         let rows = list_filtered(&pool, &SourceListFilter::default())
             .await
             .unwrap();
@@ -1205,7 +1155,6 @@ mod tests {
         );
         assert_eq!(rows[2].proxies_count, 1, "the linked proxy counts on a");
 
-        // Enabled / disabled toggles.
         let filter = SourceListFilter {
             enabled: Some(true),
             ..Default::default()
@@ -1233,7 +1182,6 @@ mod tests {
             vec!["src2bbbbbbbb"]
         );
 
-        // Error filter.
         let filter = SourceListFilter {
             with_errors: true,
             ..Default::default()
@@ -1248,7 +1196,6 @@ mod tests {
             vec!["src3cccccccc"]
         );
 
-        // Tag membership and substring query.
         let filter = SourceListFilter {
             tag: "eu".into(),
             ..Default::default()
@@ -1289,7 +1236,6 @@ mod tests {
             vec!["src3cccccccc"]
         );
 
-        // Tag dropdown: every stored tag once, ascending.
         assert_eq!(distinct_tags(&pool).await.unwrap(), vec!["eu", "paid"]);
     }
 }

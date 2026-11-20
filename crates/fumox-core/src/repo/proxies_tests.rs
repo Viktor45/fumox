@@ -96,7 +96,7 @@ async fn set_status_columns_by_fingerprint(
     }
     sql.push_str(" WHERE fingerprint = ?");
     // sqlx 0.9 SqlSafeStr: the column names are call-site literals,
-    // every value flows through .bind().
+    // every value flows through .bind()
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(status);
     for (_, value) in columns {
         query = query.bind(*value);
@@ -119,7 +119,6 @@ async fn set_status_columns_by_id(pool: &DbPool, id: i64, status: &str, columns:
     query.bind(id).execute(pool).await.unwrap();
 }
 
-/// Insert a probe attempt row for the proxy of `entry`.
 async fn probe_attempt(pool: &DbPool, entry: &ProxyEntry, kind: &str) {
     let row = get_by_fingerprint(pool, &entry.fingerprint())
         .await
@@ -140,8 +139,7 @@ async fn probe_attempt(pool: &DbPool, entry: &ProxyEntry, kind: &str) {
 async fn coverage_buckets_partition_the_population() {
     let (_dir, pool) = temp_pool().await;
 
-    // An empty database still yields every bucket, zero-filled and in
-    // the fixed panel order.
+    // Empty database: every bucket, zero-filled, fixed panel order
     assert_eq!(
         count_by_check_coverage(&pool)
             .await
@@ -152,7 +150,7 @@ async fn coverage_buckets_partition_the_population() {
         vec![("none", 0), ("t1_only", 0), ("t2_only", 0), ("both", 0)]
     );
 
-    // One proxy per bucket: untouched, tcp-only, t2-only, tcp + t2.
+    // One proxy per bucket: untouched, tcp-only, t2-only, tcp + t2
     make_source(&pool, "srcA0000000").await;
     let untouched = vless_entry("untouched", "h0.example.com", 443);
     let tcp_only = vless_entry("tcp-only", "h1.example.com", 443);
@@ -186,7 +184,7 @@ async fn coverage_buckets_partition_the_population() {
     );
 
     // A second T1 kind on a tcp-only proxy must not move it anywhere:
-    // the buckets count presence, not attempts.
+    // the buckets count presence, not attempts
     probe_attempt(&pool, &tcp_only, "tls").await;
     assert_eq!(
         count_by_check_coverage(&pool)
@@ -201,8 +199,7 @@ async fn coverage_buckets_partition_the_population() {
 
 /// An attempt the tunnel engine never verified is still a T2 attempt:
 /// the row exists, so the coverage buckets and the admin browser count
-/// it, and the recency queue moves past the proxy instead of serving it
-/// again and again.
+/// it, and the recency queue moves past the proxy.
 #[tokio::test]
 async fn an_unverified_t2_attempt_counts_as_a_t2_attempt() {
     let (_dir, pool) = temp_pool().await;
@@ -219,10 +216,9 @@ async fn an_unverified_t2_attempt_counts_as_a_t2_attempt() {
     .await
     .unwrap();
 
-    // No attempt at all: the proxy is in the `none` bucket.
+    // No attempt at all: the proxy is in the `none` bucket
     assert_eq!(coverage_of(&pool).await, ("none".to_string(), 1));
 
-    // An attempt the engine never verified: still a T2 attempt.
     let row = get_by_fingerprint(&pool, &unverified.fingerprint())
         .await
         .unwrap()
@@ -237,7 +233,6 @@ async fn an_unverified_t2_attempt_counts_as_a_t2_attempt() {
     .await;
     assert_eq!(coverage_of(&pool).await, ("t2_only".to_string(), 1));
 
-    // The admin browser flags the proxy as T2-checked as well.
     let (t2_checked,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM probe_results r
          WHERE r.proxy_id = ? AND r.probe_kind IN ('t2', 't2_unverified')",
@@ -260,8 +255,7 @@ async fn coverage_of(pool: &DbPool) -> (String, i64) {
 }
 
 /// The recency queue must move past a proxy whose T2 attempt never ran:
-/// an unverified attempt is still an attempt, so the proxy is not
-/// served again in the very next cycle.
+/// an unverified attempt is still an attempt.
 #[tokio::test]
 async fn an_unverified_attempt_advances_the_t2_recency_queue() {
     let (_dir, pool) = temp_pool().await;
@@ -272,15 +266,13 @@ async fn an_unverified_attempt_advances_the_t2_recency_queue() {
         .await
         .unwrap();
 
-    // Without any attempt the queue is served by id.
+    // Without any attempt the queue is served by id
     let rows = select_t2_candidates(&pool, 10).await.unwrap();
     assert_eq!(
         rows.iter().map(|row| row.id).collect::<Vec<_>>(),
         vec![a, b]
     );
 
-    // An unverified attempt is an attempt: the proxy moves to the back
-    // of the queue.
     journal_result(
         &pool,
         a,
@@ -328,7 +320,7 @@ async fn inserts_new_proxies_as_unknown() {
         );
     }
 
-    // A refetch updates instead of inserting, no new ids are reported.
+    // A refetch updates instead of inserting, no new ids are reported
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -343,10 +335,10 @@ async fn inserts_new_proxies_as_unknown() {
     assert!(stats.inserted_ids.is_empty());
 }
 
-/// The schema itself refuses port 0 (migration 0018). The parse layer is
-/// the first gate, the CHECK constraint is the last one: a path that
-/// bypasses the parsers (a manual import, a future parser defect) still
-/// cannot persist a proxy no client could dial.
+/// The schema itself refuses port 0 (migration 0018): the parse layer is
+/// the first gate, the CHECK constraint the last one, so a path that
+/// bypasses the parsers still cannot persist a proxy no client could
+/// dial.
 #[tokio::test]
 async fn a_zero_port_proxy_is_rejected_by_the_schema_check() {
     let (_dir, pool) = temp_pool().await;
@@ -370,7 +362,7 @@ async fn a_zero_port_proxy_is_rejected_by_the_schema_check() {
         err.to_string().contains("proxies_port_range"),
         "expected the port range CHECK to fire, got: {err}"
     );
-    // The boundaries the CHECK allows are exactly the dialable ports.
+    // The boundaries the CHECK allows are exactly the dialable ports
     insert("fp-min", 1).await.unwrap();
     insert("fp-max", 65535).await.unwrap();
     let ports: Vec<i64> = sqlx::query_scalar("SELECT port FROM proxies ORDER BY port")
@@ -381,31 +373,28 @@ async fn a_zero_port_proxy_is_rejected_by_the_schema_check() {
 }
 
 /// A feed larger than one upsert chunk drives the batched multi-row
-/// statements end to end: the chunk boundaries must not lose or
-/// duplicate rows, and duplicate fingerprints must still collapse onto
-/// one row whether the repeat lands inside its own chunk (the
-/// second values-row conflicts with the first row of the same
-/// statement) or in a later one (it conflicts with a row this
-/// transaction wrote earlier). The per-row loop this replaced could
-/// not fail these assertions by construction; the batched form can
-/// (bad placeholder count, mis-sized RETURNING map, conflated ids).
+/// statements end to end: chunk boundaries must not lose or duplicate
+/// rows, and duplicate fingerprints must still collapse onto one row
+/// whether the repeat lands inside its own chunk or in a later one. The
+/// per-row loop could not fail these assertions by construction; the
+/// batched form can (bad placeholder count, mis-sized RETURNING map,
+/// conflated ids).
 #[tokio::test]
 async fn reconcile_batches_large_feeds_with_duplicate_fingerprints() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     // Sized from the statement chunk itself: two full chunks plus a
-    // partial third, whatever `UPSERT_CHUNK` is.
+    // partial third, whatever `UPSERT_CHUNK` is
     let chunk = UPSERT_CHUNK;
     let unique = chunk * 2 + 50;
     let mut entries: Vec<ProxyEntry> = (0..unique)
         .map(|i| vless_entry(&format!("p{i}"), &format!("h{i}.example.com"), 443))
         .collect();
-    // Same-chunk duplicate: right next to the original, inside the
-    // second chunk, so the repeat conflicts with a values-row of the
-    // same statement.
+    // Same-chunk duplicate: inside the second chunk, so the repeat
+    // conflicts with a values-row of the same statement
     entries.insert(chunk + 1, entries[chunk].clone());
     // Cross-chunk duplicate: the push lands in the partial third chunk,
-    // the original sits in the first.
+    // the original sits in the first
     entries.push(entries[0].clone());
     assert!(
         entries.len() > chunk * 2,
@@ -432,15 +421,13 @@ async fn reconcile_batches_large_feeds_with_duplicate_fingerprints() {
         .unwrap();
     assert_eq!(rows, unique as i64);
     // Every unique proxy carries a link even though two fingerprints
-    // were stamped twice: the ON CONFLICT branch folds the repeats.
+    // were stamped twice: the ON CONFLICT branch folds the repeats
     let (links,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxy_source_links")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(links, unique as i64);
 
-    // A refetch updates every entry (repeats included) and the sweep
-    // finds nothing to retire.
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -458,9 +445,9 @@ async fn reconcile_batches_large_feeds_with_duplicate_fingerprints() {
 }
 
 /// A stamp slice longer than the entry list means the caller filtered
-/// the entries and handed back the unfiltered stamps: pairing them by
-/// index would stamp each proxy with a neighbouring host's country and
-/// ASN. Reconcile must refuse and write nothing.
+/// the entries and handed back the unfiltered stamps: pairing by index
+/// would stamp each proxy with a neighbouring host's facts. Reconcile
+/// must refuse and write nothing.
 #[tokio::test]
 async fn reconcile_refuses_more_geo_stamps_than_entries() {
     let (_dir, pool) = temp_pool().await;
@@ -490,7 +477,7 @@ async fn reconcile_refuses_more_geo_stamps_than_entries() {
         err.to_string().contains("stamp count"),
         "unexpected error: {err}"
     );
-    // Nothing was written: a refused reconcile leaves no half-stamped row.
+    // Nothing was written: a refused reconcile leaves no half-stamped row
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
         .fetch_one(&pool)
         .await
@@ -499,8 +486,8 @@ async fn reconcile_refuses_more_geo_stamps_than_entries() {
 }
 
 /// The paired happy path: entries and stamps of equal length each land
-/// on their own row, which is the invariant the drop-filtered ingest
-/// path depends on.
+/// on their own row, the invariant the drop-filtered ingest path
+/// depends on.
 #[tokio::test]
 async fn reconcile_stamps_each_entry_with_its_own_geo() {
     let (_dir, pool) = temp_pool().await;
@@ -544,9 +531,8 @@ async fn reconcile_stamps_each_entry_with_its_own_geo() {
 }
 
 /// The path segment of a parsed URI survives the round trip through the
-/// database: a node served from the store keeps the path it was parsed
-/// with, so a client that reads the path from the URI segment connects to
-/// the endpoint the feed named.
+/// database, so a client that reads the path from the URI segment
+/// connects to the endpoint the feed named.
 #[tokio::test]
 async fn reconcile_keeps_the_raw_path_of_an_entry() {
     let (_dir, pool) = temp_pool().await;
@@ -574,8 +560,8 @@ async fn reconcile_keeps_the_raw_path_of_an_entry() {
 
 /// Two feeds advertising the same server under different names share
 /// one row, and the row keeps the name of the feed that got there
-/// first: the panel and the exported subscription show a stable name
-/// instead of one that flips on every refresh.
+/// first, so the panel and the exported subscription show a stable
+/// name.
 #[tokio::test]
 async fn reconcile_keeps_the_first_source_values_of_a_shared_proxy() {
     let (_dir, pool) = temp_pool().await;
@@ -615,7 +601,7 @@ async fn reconcile_keeps_the_first_source_values_of_a_shared_proxy() {
     assert_eq!(row.name, "name-from-a");
     assert_eq!(row.raw_line.as_deref(), Some(from_a.raw_line.as_str()));
 
-    // Both sources are linked: the second one does not take the row over.
+    // Both sources are linked: the second one does not take the row over
     let links: Vec<(String,)> = sqlx::query_as(
         "SELECT source_id FROM proxy_source_links WHERE proxy_id = ? ORDER BY source_id",
     )
@@ -735,7 +721,7 @@ async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
     )
     .await;
 
-    // Reconciliation itself never touches the terminal state.
+    // Reconciliation itself never touches the terminal state
     reconcile_source(
         &pool,
         "srcA0000000",
@@ -754,7 +740,7 @@ async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
         }
     );
 
-    // The opt-in revival resets the pristine state and returns the id.
+    // The opt-in revival resets the pristine state and returns the id
     let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = ?")
         .bind(&fp)
         .fetch_one(&pool)
@@ -790,7 +776,7 @@ async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
     );
 
     // Idempotent: a second pass is a no-op for the now-`unknown` row,
-    // and a fingerprint with no `removed` row never matches.
+    // and a fingerprint with no `removed` row never matches
     let ids = revive_removed(&pool, &[fp, "no-such-fingerprint0000000".to_string()], 4000)
         .await
         .unwrap();
@@ -813,7 +799,7 @@ async fn refetch_updates_name_and_keeps_probe_state() {
     .await
     .unwrap();
 
-    // Simulate probe state accumulated since the first fetch.
+    // Simulate probe state accumulated since the first fetch
     let fp = original.fingerprint();
     set_status_columns_by_fingerprint(
         &pool,
@@ -839,7 +825,7 @@ async fn refetch_updates_name_and_keeps_probe_state() {
 
     let row = get_by_fingerprint(&pool, &fp).await.unwrap().unwrap();
     assert_eq!(row.name, "new-name");
-    assert_eq!(row.status, "alive"); // probe state preserved
+    assert_eq!(row.status, "alive");
     assert_eq!(row.last_alive_at, Some(1500));
 }
 
@@ -883,8 +869,6 @@ async fn disappearance_removes_proxy() {
 
 #[tokio::test]
 async fn alive_linger_keeps_link_and_serves_while_alive() {
-    //: a probe-verified proxy that vanished from the feed
-    // keeps its link, the probe alone decides when it leaves.
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let e = vless_entry("linger", "h1.example.com", 443);
@@ -898,10 +882,8 @@ async fn alive_linger_keeps_link_and_serves_while_alive() {
     )
     .await
     .unwrap();
-    // Probe confirms it alive.
     set_status_columns_by_fingerprint(&pool, &e.fingerprint(), "alive", &[("fail_count", 0)]).await;
 
-    // The feed no longer carries it; linger keeps the link.
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -916,13 +898,12 @@ async fn alive_linger_keeps_link_and_serves_while_alive() {
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &e).await.status, "alive");
 
-    // Still served: the link survives, so list_with_source finds it.
+    // Still served: the link survives, so list_with_source finds it
     let rows = list_with_source(&pool, &["srcA0000000".to_string()])
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
 
-    // Reappearance: the link is re-stamped, status kept.
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -939,11 +920,9 @@ async fn alive_linger_keeps_link_and_serves_while_alive() {
 
 #[tokio::test]
 async fn quarantined_linger_survives_the_next_refresh() {
-    // `drop_gate = false` means the probe alone retires a proxy. A node
+    // `drop_gate = false` means the probe alone retires a proxy: a node
     // that merely dropped out of the feed has failed nothing, so
-    // reconcile neither unlinks it nor moves it to `removed`; the
-    // recheck ladder keeps working on it through its own link
-    // predicate and the next refresh that sees it re-stamps the link.
+    // reconcile neither unlinks it nor moves it to `removed`
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let e = vless_entry("dying", "h1.example.com", 443);
@@ -990,13 +969,11 @@ async fn quarantined_linger_survives_the_next_refresh() {
 }
 
 /// The gate itself still works: with `keep_alive_linger = false`
-/// (`drop_gate = true` on a source with drop rules) the sweep is not
-/// skipped, so a proxy that vanished from the feed is unlinked and
-/// retired as before. The retire is a "move to removed" transition like
-/// any other: the fixture row sits in `quarantine` on a live recheck
-/// ladder when the feed drops it, and the ladder bookkeeping has to go
-/// with the retirement (a stale `ladder_at` on a `removed` row describes
-/// a schedule nobody walks any more).
+/// (`drop_gate = true` on a source with drop rules) a proxy that vanished
+/// from the feed is unlinked and retired. The fixture row sits in
+/// `quarantine` on a live recheck ladder when the feed drops it, and the
+/// ladder bookkeeping has to go with the retirement (a stale `ladder_at`
+/// on a `removed` row describes a schedule nobody walks any more).
 #[tokio::test]
 async fn drop_gate_still_retires_proxies_that_left_the_feed() {
     let (_dir, pool) = temp_pool().await;
@@ -1058,11 +1035,9 @@ async fn drop_gate_still_retires_proxies_that_left_the_feed() {
 
 #[tokio::test]
 async fn unknown_lingers_until_next_seen_or_quarantined() {
-    // The probe queue gets the `unknown` row before the next refresh
-    // can drop it: with linger protection, a one-cycle miss in the
-    // feed must not retire a row the probe never had time to check.
-    // The link survives, the row stays `unknown`, and a later refresh
-    // that re-lists the proxy re-stamps the link cleanly.
+    // The probe queue gets the `unknown` row before the next refresh can
+    // drop it: with linger protection a one-cycle miss in the feed must
+    // not retire a row the probe never had time to check
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let e = vless_entry("transient", "h1.example.com", 443);
@@ -1078,7 +1053,6 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
     .unwrap();
     assert_eq!(status_of(&pool, &e).await.status, "unknown");
 
-    // Source drops the proxy on the next refresh (entry omitted).
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -1093,7 +1067,6 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &e).await.status, "unknown");
 
-    // The reappearance stamps the link back; status is preserved.
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -1107,10 +1080,9 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
     assert_eq!(stats.updated, 1);
     assert_eq!(status_of(&pool, &e).await.status, "unknown");
 
-    // And the quarantine transition keeps the linger: under
-    // `drop_gate = false` the probe owns the lifecycle end to end, the
-    // ladder is what retires the row, not a feed that stopped
-    // mentioning it.
+    // The quarantine transition keeps the linger: under `drop_gate = false`
+    // the probe owns the lifecycle end to end, the ladder is what retires
+    // the row, not a feed that stopped mentioning it
     set_status_by_fingerprint(&pool, &e.fingerprint(), "quarantine").await;
     let stats = reconcile_source(
         &pool,
@@ -1129,10 +1101,8 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
 
 #[tokio::test]
 async fn linger_is_per_proxy_not_per_batch() {
-    // One alive, one already-removed row vanish together: only the
-    // live one keeps its link in the same reconcile pass. The filter
-    // is evaluated per row, so a dead neighbour cannot drag a live
-    // proxy out with it.
+    // One alive, one already-removed row vanish together: only the live
+    // one keeps its link, the filter is evaluated per row
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let alive = vless_entry("alive", "h1.example.com", 443);
@@ -1169,9 +1139,8 @@ async fn linger_is_per_proxy_not_per_batch() {
 
 #[tokio::test]
 async fn multi_source_linger_stays_linked_to_the_other_source() {
-    // A lingering proxy is per-source: it stays while linked anywhere.
-    // (Both sources linger here; the point is removal needs ALL links
-    // gone, dropping one source's link must not remove the row.)
+    // A lingering proxy is per-source: removal needs ALL links gone,
+    // dropping one source's link must not remove the row
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     make_source(&pool, "srcB0000000").await;
@@ -1198,8 +1167,8 @@ async fn multi_source_linger_stays_linked_to_the_other_source() {
     .unwrap();
     set_status_by_fingerprint(&pool, &e.fingerprint(), "alive").await;
 
-    // Source B drops it, source B does not linger (drop-rules gate):
-    // the row stays alive thanks to A's link.
+    // Source B drops it under the drop-rules gate: the row stays alive
+    // thanks to A's link
     reconcile_source(
         &pool,
         "srcB0000000",
@@ -1240,9 +1209,8 @@ async fn reappearing_removed_proxy_stays_removed() {
     .unwrap();
     assert_eq!(status_of(&pool, &e).await.status, "removed");
 
-    // Reappearing in a live source does NOT reset the lifecycle
-    //: `removed` is terminal for
-    // reconciliation; only mutable fields refresh.
+    // Reappearing does not reset the lifecycle: `removed` is terminal for
+    // reconciliation, only mutable fields refresh
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -1296,7 +1264,7 @@ async fn reappearing_quarantined_proxy_keeps_ladder() {
     .await;
 
     // Reappearance must not touch the state machine: the quarantine
-    // ladder keeps running on its stored schedule.
+    // ladder keeps running on its stored schedule
     reconcile_source(
         &pool,
         "srcA0000000",
@@ -1342,7 +1310,7 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
     )
     .await
     .unwrap();
-    // One proxy row, two links.
+    // One proxy row, two links
     let row = get_by_fingerprint(&pool, &shared.fingerprint())
         .await
         .unwrap()
@@ -1355,7 +1323,6 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
             .unwrap();
     assert_eq!(links.len(), 2);
 
-    // Dropping from source A only: still linked via B.
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -1370,7 +1337,6 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &shared).await.status, "unknown");
 
-    // Dropping from B as well: now it is removed.
     let stats = reconcile_source(
         &pool,
         "srcB0000000",
@@ -1385,14 +1351,13 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
     assert_eq!(status_of(&pool, &shared).await.status, "removed");
 }
 
-/// The end-of-pass sweep answers one question: which proxies does
-/// *this* pass leave without a link? A row that was already
-/// link-less before the pass started is none of this source's
-/// business, and that is exactly the residue the admin source
+/// The end-of-pass sweep answers one question: which proxies does *this*
+/// pass leave without a link? A row already link-less before the pass is
+/// none of this source's business — exactly the residue the admin source
 /// delete leaves behind under `drop_gate = false`, where
-/// `mark_source_orphans_removed` protects `ready` and `unknown` rows on
-/// purpose. Reconciling an unrelated source afterwards must not
-/// retire them.
+/// [`mark_source_orphans_removed`] protects `ready` and `unknown` rows on
+/// purpose. Reconciling an unrelated source afterwards must not retire
+/// them.
 #[tokio::test]
 async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
     let (_dir, pool) = temp_pool().await;
@@ -1411,17 +1376,14 @@ async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
     .unwrap();
     set_status_by_fingerprint(&pool, &doomed_ready.fingerprint(), "ready").await;
 
-    // The source is deleted: the click protects the verified and the
-    // not-yet-checked row, both stay behind without a link. The sweep
-    // runs while the links still name the source.
+    // The sweep runs while the links still name the source, then the
+    // delete cascades them away
     let sweep = mark_source_orphans_removed(&pool, "srcD0000000", &["ready", "unknown"])
         .await
         .unwrap();
     assert_eq!(sweep.retired, 0);
     assert!(sources_repo::delete(&pool, "srcD0000000").await.unwrap());
 
-    // An unrelated source is reconciled. Its own pass must not touch
-    // the two rows the delete left behind.
     make_source(&pool, "srcD0000001").await;
     let survivor = vless_entry("survivor", "sv.example.com", 443);
     let stats = reconcile_source(
@@ -1446,7 +1408,7 @@ async fn duplicate_entries_in_one_batch_collapse() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let a = vless_entry("name-A", "h1.example.com", 443);
-    let b = vless_entry("name-B", "h1.example.com", 443); // same fingerprint
+    let b = vless_entry("name-B", "h1.example.com", 443);
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -1492,7 +1454,7 @@ async fn row_converts_back_to_entry() {
     assert_eq!(back.port, e.port);
     assert_eq!(back.credential, e.credential);
     assert_eq!(back.param("security"), Some("reality"));
-    // Same fingerprint even after the DB round trip.
+    // Same fingerprint even after the DB round trip
     assert_eq!(back.fingerprint(), e.fingerprint());
 }
 
@@ -1537,7 +1499,7 @@ async fn list_alive_and_count_cover_linked_alive_only() {
     assert_eq!(hosts, vec!["h1.example.com".to_string()]);
 
     // Losing the last source link takes even an alive row out of the
-    // export, exactly like every other serving path.
+    // export, exactly like every other serving path
     sqlx::query("DELETE FROM proxy_source_links")
         .execute(&pool)
         .await
@@ -1546,13 +1508,12 @@ async fn list_alive_and_count_cover_linked_alive_only() {
     assert!(list_alive(&pool, 1_000).await.unwrap().is_empty());
 }
 
-/// The export backing query is bounded in SQL: it is the public
-/// «all alive» link, and it serializes and ships every row it
-/// returns, so an unbounded `fetch_all` there is an unbounded render
-/// and an unbounded response body. The cap truncates the stable
-/// id-ascending order, so it is deterministic, and the badge count
-/// (`count_alive`) deliberately stays the full tier: the operator
-/// must be able to see that the export is smaller than the tier.
+/// The export backing query is bounded in SQL: it serializes and ships
+/// every row it returns, so an unbounded `fetch_all` there is an
+/// unbounded response body. The cap truncates the stable id-ascending
+/// order, so it is deterministic, and the badge count (`count_alive`)
+/// deliberately stays the full tier: the operator must be able to see
+/// that the export is smaller than the tier.
 #[tokio::test]
 async fn list_alive_and_list_ready_apply_the_sql_cap() {
     let (_dir, pool) = temp_pool().await;
@@ -1577,12 +1538,11 @@ async fn list_alive_and_list_ready_apply_the_sql_cap() {
     assert_eq!(count_alive(&pool).await.unwrap(), 3);
     assert_eq!(count_ready(&pool).await.unwrap(), 3);
 
-    // Under the cap the tier comes back whole.
+    // Under the cap the tier comes back whole
     assert_eq!(list_alive(&pool, 10).await.unwrap().len(), 3);
     assert_eq!(list_ready(&pool, 10).await.unwrap().len(), 3);
 
     // At the cap it is truncated to the lowest ids, deterministically
-    // across two reads.
     let capped: Vec<i64> = list_alive(&pool, 2)
         .await
         .unwrap()
@@ -1603,14 +1563,13 @@ async fn list_alive_and_list_ready_apply_the_sql_cap() {
     );
 
     // A cap of 0 must not become "no limit" (SQLite reads a negative
-    // LIMIT as unbounded); it clamps up to one row.
+    // LIMIT as unbounded); it clamps up to one row
     assert_eq!(list_alive(&pool, 0).await.unwrap().len(), 1);
-    // An absurd cap does not overflow the bind.
+    // An absurd cap does not overflow the bind
     assert_eq!(list_alive(&pool, u32::MAX).await.unwrap().len(), 3);
 
     // The ready tier is capped the same way: the export link and the
-    // badge share the tier, so the truncation must not differ between
-    // them.
+    // badge share the tier
     let ready_capped: Vec<i64> = list_ready(&pool, 2)
         .await
         .unwrap()
@@ -1626,19 +1585,15 @@ async fn list_alive_and_list_ready_apply_the_sql_cap() {
     assert_eq!(ready_capped, ready_all[..2].to_vec());
     assert_eq!(list_ready(&pool, 0).await.unwrap().len(), 1);
     assert_eq!(list_ready(&pool, u32::MAX).await.unwrap().len(), 3);
-    // The badge stays the full tier: the operator must be able to see
-    // that the export is smaller than the tier.
     assert_eq!(count_ready(&pool).await.unwrap(), 3);
 }
 
-/// Admin *Reset status* is "check this proxy again from scratch", and
-/// a from-scratch row carries no T2 block: both T1 lanes (the random
-/// sample and the priority queue) filter on
+/// Admin *Reset status* is "check this proxy again from scratch", and a
+/// from-scratch row carries no T2 block: both T1 lanes filter on
 /// `last_t2_failed_at IS NULL` and the T2 sample only offers
-/// `alive`/`ready` rows, so a reset row that kept the stamp would
-/// belong to no probe lane at all. The id is also queued for
-/// priority checking, the handoff the bulk revival paths give their
-/// callers (this function's caller only learns that the row exists).
+/// `alive`/`ready` rows, so a reset row that kept the stamp would belong
+/// to no probe lane at all. The id is also queued for priority checking,
+/// the handoff the bulk revival paths give their callers.
 #[tokio::test]
 async fn reset_status_clears_the_t2_block_and_queues_a_check() {
     let (_dir, pool) = temp_pool().await;
@@ -1668,7 +1623,6 @@ async fn reset_status_clears_the_t2_block_and_queues_a_check() {
         "a reset row must not stay behind a stale T2 block"
     );
 
-    // The row is reachable by the probe again: both T1 lanes see it.
     let queued: Vec<i64> = crate::repo::probe::select_queued_checks(&pool, 10)
         .await
         .unwrap()
@@ -1684,7 +1638,6 @@ async fn reset_status_clears_the_t2_block_and_queues_a_check() {
         .collect();
     assert!(sampled.contains(&id));
 
-    // A missing id changes nothing and queues nothing.
     assert!(!reset_status(&pool, id + 1_000).await.unwrap());
     let (pending,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
         .fetch_one(&pool)
@@ -1694,18 +1647,17 @@ async fn reset_status_clears_the_t2_block_and_queues_a_check() {
 }
 
 /// A reset that no probe lane can pick up must not report success and
-/// must not half-apply. Two shapes reach the operator's button: a
-/// reconcile-retired row (retired and unlinked in one transaction) and
-/// a row whose scheme no lane judges (`tuic`, `mieru`; hysteria2 is
-/// T1-excluded but T2 offers it while `unknown`). Before the guard such
-/// a reset wrote the whole lifecycle and then enqueued nothing, so the
-/// operator got a success toast and a row in no lane at all.
+/// must not half-apply: a reconcile-retired row (retired and unlinked in
+/// one transaction) and a row whose scheme no lane judges (`tuic`,
+/// `mieru`; hysteria2 is T1-excluded but T2 offers it while `unknown`).
+/// Unguarded, such a reset wrote the whole lifecycle and enqueued
+/// nothing: a success toast and a row in no lane at all.
 #[tokio::test]
 async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
     let (_dir, pool) = temp_pool().await;
 
-    // Retired and unlinked, the normal shape of a reconcile-retired
-    // row, carrying the T2 block the previous fix clears.
+    // Retired and unlinked, the normal shape of a reconcile-retired row,
+    // carrying the T2 block
     let unlinked = seed_proxy(&pool, "vless", "retired.example.com").await;
     sqlx::query("DELETE FROM proxy_source_links WHERE proxy_id = ?")
         .bind(unlinked)
@@ -1723,7 +1675,7 @@ async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
         ],
     )
     .await;
-    // Linked, but a scheme neither T1 nor T2 will ever check.
+    // Linked, but a scheme neither T1 nor T2 will ever check
     let tuic = seed_proxy(&pool, "tuic", "tuic.example.com").await;
     set_status_columns_by_id(
         &pool,
@@ -1737,10 +1689,8 @@ async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
     )
     .await;
 
-    // The same schemes while still `unknown` (the usual shape of a
-    // freshly ingested unprobeable row): the lanes do not open up with
-    // the status, so the reset refuses these too, lifecycle fields and
-    // T2 block included.
+    // The same schemes while still `unknown`, the usual shape of a
+    // freshly ingested unprobeable row: the reset refuses these too
     let tuic_unknown = seed_proxy(&pool, "tuic", "tuic-u.example.com").await;
     set_status_columns_by_id(
         &pool,
@@ -1767,7 +1717,7 @@ async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
     .await;
 
     // Every refused row keeps the exact lifecycle the fixture staged:
-    // the reset neither half-applies nor re-stamps.
+    // the reset neither half-applies nor re-stamps
     for (id, status, fail_count, removed_at, t2_failed_at) in [
         (unlinked, "removed", 3, Some(900), Some(700)),
         (tuic, "removed", 4, Some(901), Some(701)),
@@ -1788,7 +1738,7 @@ async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
         );
     }
 
-    // Nothing was queued, so no lane offers any of the refused rows.
+    // Nothing was queued, so no lane offers any of the refused rows
     let (pending,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
         .fetch_one(&pool)
         .await
@@ -1814,12 +1764,10 @@ async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
     }
 }
 
-/// A linked `hysteria2` row is reachable, so a reset of it must
-/// succeed: hysteria2 is excluded from the T1 sample, but the T2 sample
-/// offers it while it is still `unknown`. A reset that refused it would
-/// leave the row exactly where it was, and a reset that cleared the T2
-/// block but reported failure would send the operator looking for a
-/// failure that did not happen.
+/// A linked `hysteria2` row is reachable, so a reset of it must succeed:
+/// hysteria2 is excluded from the T1 sample, but the T2 sample offers it
+/// while still `unknown`. A reset that refused it would leave the row
+/// exactly where it was.
 #[tokio::test]
 async fn reset_status_accepts_a_linked_hysteria2_row() {
     let (_dir, pool) = temp_pool().await;
@@ -1842,7 +1790,6 @@ async fn reset_status_accepts_a_linked_hysteria2_row() {
         "a reset row must not stay behind a stale T2 block"
     );
 
-    // The row stays in the T2 sample: it is the one lane that judges it.
     let t2_ids: Vec<i64> = select_t2_candidates(&pool, 100)
         .await
         .unwrap()
@@ -1855,12 +1802,12 @@ async fn reset_status_accepts_a_linked_hysteria2_row() {
     );
 }
 
-// Probe state machine.
+// Probe state machine
 
 /// Insert a bare proxy row with the given scheme and link it to a source
 /// so it is eligible for probing.
 async fn seed_proxy(pool: &DbPool, scheme: &str, host: &str) -> i64 {
-    // Idempotent: several seeds share one source.
+    // Idempotent: several seeds share one source
     sqlx::query(
             "INSERT OR IGNORE INTO sources (id, name, url, enabled, encoding, cache_ttl_seconds, created_at, updated_at)
              VALUES ('srcP0000000', 'probe-src', 'https://example.com', 1, 'auto', 3600, 1, 1)",
@@ -1925,11 +1872,11 @@ async fn success_without_reset_keeps_fail_count_and_removed_stays_removed() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    // Failures already accumulated, e.g. two failed tunnel checks.
+    // Failures already accumulated, e.g. two failed tunnel checks
     set_status_columns_by_id(&pool, id, "alive", &[("fail_count", 2)]).await;
 
     // A T1-style success WITHOUT reset keeps the T2-accumulated counter
-    // (strict T2 priority) and keeps the proxy alive.
+    // (strict T2 priority) and keeps the proxy alive
     let transition = check_succeeded(&pool, id, 2000, Some(30), false, ProxyStatus::Alive)
         .await
         .unwrap();
@@ -1938,14 +1885,13 @@ async fn success_without_reset_keeps_fail_count_and_removed_stays_removed() {
     assert_eq!(row.status, "alive");
     assert_eq!(row.fail_count, 2);
 
-    // With reset the counter is wiped.
     check_succeeded(&pool, id, 3000, Some(31), true, ProxyStatus::Alive)
         .await
         .unwrap();
     let row = get_by_id(&pool, id).await.unwrap().unwrap();
     assert_eq!(row.fail_count, 0);
 
-    // A removed proxy is terminal: a success cannot revive it.
+    // A removed proxy is terminal: a success cannot revive it
     set_status_columns_by_id(&pool, id, "removed", &[("fail_count", 1)]).await;
     let transition = check_succeeded(&pool, id, 4000, Some(32), true, ProxyStatus::Alive)
         .await
@@ -1963,12 +1909,10 @@ async fn ready_tier_lifecycle() {
     let (_dir, pool) = temp_pool().await;
     let id = seed_proxy(&pool, "vless", "h1.example.com").await;
 
-    // T1 success → alive (the plain tier).
     check_succeeded(&pool, id, 1000, Some(20), true, ProxyStatus::Alive)
         .await
         .unwrap();
 
-    // T2 success → ready (the tunnel-verified tier).
     check_succeeded(&pool, id, 2000, Some(42), true, ProxyStatus::Ready)
         .await
         .unwrap();
@@ -1977,7 +1921,7 @@ async fn ready_tier_lifecycle() {
     assert_eq!(row.fail_count, 0);
 
     // A later T1 success must NOT demote the verified row (CASE keeps
-    // ready), only a failed T2 outcome may.
+    // ready), only a failed T2 outcome may
     check_succeeded(&pool, id, 3000, Some(21), true, ProxyStatus::Alive)
         .await
         .unwrap();
@@ -1985,9 +1929,9 @@ async fn ready_tier_lifecycle() {
     assert_eq!(row.status, "ready");
     assert_eq!(row.latency_ms, Some(21), "the T1 latency is stored");
 
-    // A failed T2 (below the limit) demotes to alive. The T2 flag is
-    // set: the failure stamps `last_t2_failed_at`, so T1 stays
-    // suppressed until the next successful T2.
+    // A failed T2 (below the limit) demotes to alive and stamps
+    // `last_t2_failed_at`, so T1 stays suppressed until the next
+    // successful T2
     let transition = check_failed(&pool, id, 4000, 3, 86_400, 0, true)
         .await
         .unwrap();
@@ -2001,16 +1945,15 @@ async fn ready_tier_lifecycle() {
         "the T2 failure stamps last_t2_failed_at"
     );
 
-    // The next T2 success promotes back.
+    // The next T2 success promotes back
     check_succeeded(&pool, id, 5000, Some(45), true, ProxyStatus::Ready)
         .await
         .unwrap();
     let row = get_by_id(&pool, id).await.unwrap().unwrap();
     assert_eq!(row.status, "ready");
 
-    // The verified row is served by the ready export and by no other
-    // one: the two tiers are disjoint, and a `ready` row is not also
-    // counted as `alive`.
+    // The verified row is served by the ready export only: the two tiers
+    // are disjoint, a `ready` row is not also counted as `alive`
     let alive_ids: Vec<i64> = list_alive(&pool, 1_000)
         .await
         .unwrap()
@@ -2036,7 +1979,7 @@ async fn ready_tier_lifecycle() {
         "the alive and ready tiers must not overlap"
     );
 
-    // Reaching the fail limit from ready quarantines like from alive.
+    // Reaching the fail limit from ready quarantines like from alive
     for _ in 0..2 {
         check_failed(&pool, id, 6000, 2, 86_400, 0, false)
             .await
@@ -2046,7 +1989,6 @@ async fn ready_tier_lifecycle() {
     assert_eq!(row.status, "quarantine");
     assert_eq!(row.fail_count, 2);
 
-    // A quarantined row is served by neither tier.
     let alive_rows = list_alive(&pool, 1_000).await.unwrap();
     let ready_rows = list_ready(&pool, 1_000).await.unwrap();
     assert!(alive_rows.iter().all(|r| r.id != id));
@@ -2054,9 +1996,8 @@ async fn ready_tier_lifecycle() {
 }
 
 /// The `Debug` form of the row types is masked: rows land in log lines
-/// and panic messages through `format!("{:?}")`, and neither the
-/// credential nor the stored feed line (which repeats it inside the
-/// URI) may ride along.
+/// and panic messages through `format!("{:?}")`, neither the credential
+/// nor the stored feed line may ride along.
 #[tokio::test]
 async fn debug_output_masks_credential_and_raw_line() {
     let (_dir, pool) = temp_pool().await;
@@ -2090,7 +2031,7 @@ async fn debug_output_masks_credential_and_raw_line() {
     );
     assert!(debug.contains("<redacted>"), "the mask is visible: {debug}");
 
-    // The join wrapper keeps the same masking.
+    // The join wrapper keeps the same masking
     let joined = list_with_source(&pool, &["srcA0000000".to_string()])
         .await
         .unwrap();
@@ -2124,7 +2065,6 @@ async fn linger_protects_ready() {
         .unwrap();
     set_status_by_id(&pool, id, "ready").await;
 
-    // The feed no longer carries it; linger keeps the link.
     let stats = reconcile_source(
         &pool,
         "srcA0000000",
@@ -2159,21 +2099,19 @@ async fn failures_below_limit_only_bump_counter() {
 }
 
 /// `check_failed` reads `fail_count` and writes back `fail_count + 1`:
-/// a read-modify-write, so the read and the write have to be one
-/// atomic step. Two checks of the same row in flight at once (the
-/// probe can pick the same proxy up in two lanes, and the admin
-/// actions write to the same table) must both count: split into a
-/// read statement and a write statement, the second one writes back
-/// the value it read before the first bump landed and the failure is
-/// lost.
+/// a read-modify-write, so the read and the write have to be one atomic
+/// step. Two checks of the same row in flight at once (the probe can
+/// pick the same proxy up in two lanes, and the admin actions write to
+/// the same table) must both count: split into a read statement and a
+/// write statement, the second one writes back the value it read before
+/// the first bump landed and the failure is lost.
 ///
 /// The contention is forced, not hoped for: one connection holds the
-/// write lock inside an open transaction that bumps the counter, and
-/// the second failure is issued while that transaction is still open,
-/// so its statement waits for the lock. A split implementation would
-/// read the pre-transaction value on the waiting connection and write
-/// back 1, losing the first bump; the single atomic statement reads
-/// the committed value and writes 2.
+/// write lock inside an open transaction that bumps the counter, and the
+/// second failure is issued while that transaction is still open. A
+/// split implementation would read the pre-transaction value on the
+/// waiting connection and write back 1, losing the first bump; the
+/// single atomic statement reads the committed value and writes 2.
 #[tokio::test]
 async fn check_failed_counts_every_overlapping_check() {
     let (_dir, pool) = temp_pool().await;
@@ -2194,8 +2132,6 @@ async fn check_failed_counts_every_overlapping_check() {
         .await
         .unwrap();
 
-        // The second failure is issued while the first transaction is
-        // still open: it waits for the write lock.
         let waiting = tokio::spawn({
             let pool = pool.clone();
             async move { check_failed(&pool, id, 1_000, 100, 86_400, 0, false).await }
@@ -2237,7 +2173,7 @@ async fn reaching_fail_limit_quarantines_with_jittered_second_chance() {
     assert_eq!(row.status, "quarantine");
     assert_eq!(row.fail_count, 3);
     assert_eq!(row.quarantined_at, Some(now));
-    // ladder_at ∈ [now + 24h, now + 48h), waiting on step 0.
+    // ladder_at ∈ [now + 24h, now + 48h), waiting on step 0
     let sc = row.ladder_at.unwrap();
     assert!(sc >= now + 86_400, "second chance too early: {sc}");
     assert!(sc < now + 2 * 86_400, "second chance too late: {sc}");
@@ -2246,16 +2182,14 @@ async fn reaching_fail_limit_quarantines_with_jittered_second_chance() {
 }
 
 /// An engine outage (meow-rs down) is a fault of the sidecar, not a
-/// verdict about the proxy: it must stamp the outstanding T2 verdict
-/// and demote a `ready` row, but never touch the fail counter and
-/// never quarantine. Repeated past the shipped `fail_limit` of 2, the
-/// row would otherwise drop out of both T2 selectors and out of
-/// `/export/alive` for an outage it did not cause.
+/// verdict about the proxy: it must stamp the outstanding T2 verdict and
+/// demote a `ready` row, but never touch the fail counter and never
+/// quarantine.
 #[tokio::test]
 async fn engine_outage_stamps_t2_without_charging_the_fail_budget() {
     let (_dir, pool) = temp_pool().await;
     let id = seed_proxy(&pool, "vless", "outage.example.com").await;
-    // Tunnel-verified, one genuine T2 failure already on the counter.
+    // Tunnel-verified, one genuine T2 failure already on the counter
     check_succeeded(&pool, id, 1_000, Some(42), true, ProxyStatus::Ready)
         .await
         .unwrap();
@@ -2269,7 +2203,7 @@ async fn engine_outage_stamps_t2_without_charging_the_fail_budget() {
     assert_eq!(before.status, "ready");
     assert_eq!(before.fail_count, 0);
 
-    // Three outage cycles, i.e. past the shipped fail_limit of 2.
+    // Three outage cycles, at the shipped fail_limit of 3
     for cycle in 1..=3 {
         assert!(
             check_engine_unavailable(&pool, id, 10_000 * cycle)
@@ -2294,7 +2228,7 @@ async fn engine_outage_stamps_t2_without_charging_the_fail_budget() {
     assert_eq!(row.quarantined_at, None);
     assert_eq!(row.ladder_at, None, "no second chance is scheduled");
 
-    // A genuine T2 failure after the outage still counts from zero.
+    // A genuine T2 failure after the outage still counts from zero
     assert_eq!(
         check_failed(&pool, id, 40_000, 2, 86_400, 0, true)
             .await
@@ -2342,8 +2276,8 @@ async fn second_chance_success_revives_with_clean_slate() {
         "quarantine"
     );
 
-    // The revival is a T1-style check → plain alive (the next
-    // successful T2 promotes to ready).
+    // The revival is a T1-style check, plain alive; the next successful
+    // T2 promotes to ready
     let transition = check_succeeded(&pool, id, 90_000, Some(10), true, ProxyStatus::Alive)
         .await
         .unwrap();
@@ -2366,11 +2300,9 @@ async fn failed_ladder_walks_15m_30m_1h_then_removes() {
             .await
             .unwrap();
     }
-    // The default ladder: three rechecks after the second chance.
+    // The default ladder: three rechecks after the second chance
     let delays = [900i64, 1800, 3600];
 
-    // Second chance (step 0) fails → recheck in 15 minutes from the
-    // failure, now on step 1.
     let t = 90_000i64;
     let transition = quarantine_check_failed(&pool, id, t, 0, &delays)
         .await
@@ -2380,7 +2312,6 @@ async fn failed_ladder_walks_15m_30m_1h_then_removes() {
     assert_eq!(row.ladder_at, Some(t + delays[0]));
     assert_eq!(row.ladder_step, 1);
 
-    // First recheck fails → +30m from this failure, step 2.
     let t = t + delays[0];
     quarantine_check_failed(&pool, id, t, 1, &delays)
         .await
@@ -2389,7 +2320,6 @@ async fn failed_ladder_walks_15m_30m_1h_then_removes() {
     assert_eq!(row.ladder_at, Some(t + delays[1]));
     assert_eq!(row.ladder_step, 2);
 
-    // Second recheck fails → +1h from this failure, step 3.
     let t = t + delays[1];
     quarantine_check_failed(&pool, id, t, 2, &delays)
         .await
@@ -2398,7 +2328,6 @@ async fn failed_ladder_walks_15m_30m_1h_then_removes() {
     assert_eq!(row.ladder_at, Some(t + delays[2]));
     assert_eq!(row.ladder_step, 3);
 
-    // Final recheck fails → past the end of the delays: removed.
     let t = t + delays[2];
     let transition = quarantine_check_failed(&pool, id, t, 3, &delays)
         .await
@@ -2417,7 +2346,6 @@ async fn failed_ladder_walks_15m_30m_1h_then_removes() {
 async fn ladder_length_follows_configured_delays() {
     let (_dir, pool) = temp_pool().await;
 
-    // Empty ladder: the failed second chance removes immediately.
     let id = seed_proxy(&pool, "vless", "empty.example.com").await;
     for t in [10, 20, 30] {
         check_failed(&pool, id, t, 3, 86_400, 0, false)
@@ -2433,7 +2361,6 @@ async fn ladder_length_follows_configured_delays() {
         "removed"
     );
 
-    // One recheck: second chance → recheck → removed.
     let id = seed_proxy(&pool, "vless", "one.example.com").await;
     for t in [10, 20, 30] {
         check_failed(&pool, id, t, 3, 86_400, 0, false)
@@ -2455,7 +2382,6 @@ async fn ladder_length_follows_configured_delays() {
         Transition::Removed
     );
 
-    // Four rechecks: the walk goes through step 4 before removal.
     let id = seed_proxy(&pool, "vless", "four.example.com").await;
     for t in [10, 20, 30] {
         check_failed(&pool, id, t, 3, 86_400, 0, false)
@@ -2483,9 +2409,7 @@ async fn ladder_length_follows_configured_delays() {
 
 /// The ladder's writes carry the `status = 'quarantine'` guard, and the
 /// call must report what was actually written: for a row outside
-/// quarantine (the removed row is the shape the removal branch used to
-/// misreport — it claimed `Transition::Removed` for a write that matched
-/// nothing) the answer is Unchanged, and the row keeps its state.
+/// quarantine the answer is Unchanged and the row keeps its state.
 #[tokio::test]
 async fn quarantine_ladder_ignores_rows_outside_quarantine() {
     let (_dir, pool) = temp_pool().await;
@@ -2496,7 +2420,6 @@ async fn quarantine_ladder_ignores_rows_outside_quarantine() {
         let id = seed_proxy(&pool, "vless", host).await;
         set_status_by_id(&pool, id, status).await;
 
-        // A step with a configured delay: nothing to schedule.
         assert_eq!(
             quarantine_check_failed(&pool, id, 100, 0, &[600])
                 .await
@@ -2504,8 +2427,6 @@ async fn quarantine_ladder_ignores_rows_outside_quarantine() {
             Transition::Unchanged,
             "{status}: no delay is scheduled for a row outside quarantine"
         );
-        // Past the end of the delays: the removal branch must not claim
-        // a removal that did not happen.
         assert_eq!(
             quarantine_check_failed(&pool, id, 100, 1, &[])
                 .await
@@ -2535,8 +2456,7 @@ async fn recheck_success_at_any_step_revives() {
         .await
         .unwrap();
 
-    // The first recheck succeeds → alive again (a T1-style revival;
-    // the next successful T2 promotes to ready).
+    // The first recheck succeeds → alive again (a T1-style revival)
     let transition = check_succeeded(&pool, id, 90_000 + 900, None, true, ProxyStatus::Alive)
         .await
         .unwrap();
@@ -2553,7 +2473,7 @@ async fn due_quarantine_selection_respects_schedule_and_step() {
     let late = seed_proxy(&pool, "vless", "late.example.com").await;
     let ladder = seed_proxy(&pool, "vless", "ladder.example.com").await;
 
-    // early: second chance already due; late: still sleeping.
+    // early: second chance already due; late: still sleeping
     set_status_columns_by_id(
         &pool,
         early,
@@ -2576,7 +2496,7 @@ async fn due_quarantine_selection_respects_schedule_and_step() {
         ],
     )
     .await;
-    // ladder: mid-ladder with a due second recheck.
+    // ladder: mid-ladder with a due second recheck
     set_status_columns_by_id(
         &pool,
         ladder,
@@ -2633,14 +2553,14 @@ async fn quarantine_dues_split_by_revival_kind() {
     t1_ids.sort();
     assert_eq!(t1_ids, vec![vless, tuic]);
 
-    // Full rows: the revival check needs credentials and the ladder step.
+    // Full rows: the revival check needs credentials and the ladder step
     let t2_due = select_due_quarantine_t2(&pool, 5_000, 100).await.unwrap();
     let t2_ids: Vec<i64> = t2_due.iter().map(|row| row.id).collect();
     assert_eq!(t2_ids, vec![hysteria2]);
     assert_eq!(t2_due[0].scheme, "hysteria2");
     assert_eq!(t2_due[0].ladder_step, 0);
 
-    // Not yet due: nothing comes back from either lane.
+    // Not yet due: nothing comes back from either lane
     assert!(
         select_due_quarantine(&pool, 50, 100)
             .await
@@ -2702,7 +2622,6 @@ async fn t1_candidates_skip_proxies_with_recent_t2_failure() {
     let clean = seed_proxy(&pool, "vless", "clean.example.com").await;
     let blocked = seed_proxy(&pool, "vless", "blocked.example.com").await;
 
-    // Mark only `blocked` as recently T2-failed.
     sqlx::query("UPDATE proxies SET last_t2_failed_at = 5_000 WHERE id = ?")
         .bind(blocked)
         .execute(&pool)
@@ -2727,7 +2646,7 @@ async fn t1_failure_does_not_set_t2_block() {
     let id = seed_proxy(&pool, "vless", "t1fail.example.com").await;
 
     // fail_limit=100 so a single T1 fail does not move us to quarantine
-    // and the row stays in the T1 candidate set.
+    // and the row stays in the T1 candidate set
     check_failed(&pool, id, 1_000, 100, 86_400, 0, false)
         .await
         .unwrap();
@@ -2740,12 +2659,11 @@ async fn t1_failure_does_not_set_t2_block() {
     );
 }
 
-/// The symmetric side of the suppression flag, as migration 0007
-/// states it: "T1 checks for the proxy are skipped **until the next
-/// successful T2** clears the flag", only a T2 success lifts it. A
-/// plain TCP/TLS success says nothing about the tunnel, so it must
-/// leave `last_t2_failed_at` alone and the row out of the T1 sample;
-/// the T2 recency selector is the only way back.
+/// The symmetric side of the suppression flag, as migration 0007 states
+/// it: T1 checks are skipped until the next successful T2 clears the
+/// flag. A plain TCP/TLS success says nothing about the tunnel, so it
+/// must leave `last_t2_failed_at` alone and the row out of the T1
+/// sample; the T2 recency selector is the only way back.
 #[tokio::test]
 async fn t2_block_clears_on_next_t2_success_only() {
     let (_dir, pool) = temp_pool().await;
@@ -2765,7 +2683,6 @@ async fn t2_block_clears_on_next_t2_success_only() {
         .collect();
     assert!(!blocked_ids.contains(&id));
 
-    // A T1 success: the row is `alive` again, the block stays.
     check_succeeded(&pool, id, 2_000, Some(10), false, ProxyStatus::Alive)
         .await
         .unwrap();
@@ -2788,8 +2705,7 @@ async fn t2_block_clears_on_next_t2_success_only() {
         "a T1-success row under a T2 block stays out of the T1 sample"
     );
 
-    // The T2 success the probe writes for a passing tunnel check
-    // (`status_to = ready`) is what lifts the block.
+    // The T2 success (`status_to = ready`) is what lifts the block
     check_succeeded(&pool, id, 3_000, Some(20), true, ProxyStatus::Ready)
         .await
         .unwrap();
@@ -2805,9 +2721,8 @@ async fn t2_block_clears_on_next_t2_success_only() {
 
 #[tokio::test]
 async fn full_lifecycle_is_restart_safe() {
-    // The whole machine is driven by DB columns only: simulate a daemon
-    // restart by re-reading state between every step, no in-memory
-    // carryover is required to advance the lifecycle.
+    // The whole machine is driven by DB columns only: a restart is
+    // simulated by re-reading state between every step
     let (_dir, pool) = temp_pool().await;
     let id = seed_proxy(&pool, "vless", "h1.example.com").await;
 
@@ -2816,24 +2731,22 @@ async fn full_lifecycle_is_restart_safe() {
             .await
             .unwrap();
     }
-    // "Restart": derive everything from the row itself.
+    // "Restart": derive everything from the row itself
     let row = get_by_id(&pool, id).await.unwrap().unwrap();
     assert_eq!(row.status, "quarantine");
     let sc = row.ladder_at.unwrap();
 
-    // Nothing is due before the scheduled moment.
+    // Nothing is due before the scheduled moment
     assert!(
         select_due_quarantine(&pool, sc - 1, 100)
             .await
             .unwrap()
             .is_empty()
     );
-    // At the moment it becomes due exactly one check fires.
     let due = select_due_quarantine(&pool, sc, 100).await.unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].ladder_step, 0);
 
-    // Fail it, restart again, and the ladder continues from the DB.
     quarantine_check_failed(&pool, id, sc, 0, &[900, 1800, 3600])
         .await
         .unwrap();
@@ -2853,15 +2766,14 @@ async fn t2_sample_offers_only_t1_passed_proxies() {
     let never_checked = vless_entry("never", "h2.example.com", 443);
     let quarantined = vless_entry("quar", "h3.example.com", 443);
     let removed = vless_entry("gone", "h4.example.com", 443);
-    // tuic cannot pass T1 by design, even an "alive" one must not be
-    // offered to T2 (meow-rs cannot tunnel it). naive passes
-    // that old NOT IN guard but has no mihomo counterpart either: the
-    // allowlist must keep it out too, or under the recency order it
-    // would occupy the head of every batch (starvation).
+    // tuic cannot pass T1 by design and meow-rs cannot tunnel it; naive
+    // has no meow counterpart either, so the allowlist must keep both
+    // out or under the recency order they would sit at the head of every
+    // batch (starvation)
     let alive_unprobeable = mk(Scheme::Tuic, "tuic", "h5.example.com", 443);
     let alive_naive = mk(Scheme::Naive, "naive", "h7.example.com", 443);
     // hysteria2 skips T1 entirely (a TCP connect proves nothing on
-    // QUIC): an `unknown` one goes straight to the T2 batch.
+    // QUIC): an `unknown` one goes straight to the T2 batch
     let fresh_hysteria2 = mk(Scheme::Hysteria2, "hy2", "h6.example.com", 443);
     let all = vec![
         alive.clone(),
@@ -2920,16 +2832,16 @@ async fn journal_result(pool: &DbPool, id: i64, at: i64, ok: bool, kind: &str) {
     .unwrap();
 }
 
-/// The T2 batch is recency-prioritized:
-/// never-checked proxies first, then the ones whose last T2 check is
-/// the oldest, a large pool must not keep a proxy tunnel-unverified
-/// for months while its `alive` rests on T1 connectivity alone.
+/// The T2 batch is recency-prioritized: never-checked proxies first,
+/// then the ones whose last T2 check is the oldest, so a large pool must
+/// not keep a proxy tunnel-unverified for months while its `alive` rests
+/// on T1 connectivity alone.
 #[tokio::test]
 async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     // Five alive proxies: two never T2-checked, three checked at
-    // increasing timestamps.
+    // increasing timestamps
     let all = vec![
         vless_entry("fresh-a", "a.example.com", 443),
         vless_entry("fresh-b", "b.example.com", 443),
@@ -2955,7 +2867,7 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
         journal_result(&pool, id, at, true, "t2").await;
     }
     // T1 history must not disturb the T2 recency: `stale` also has a
-    // fresh tcp row, yet its last t2 is still the oldest.
+    // fresh tcp row, yet its last t2 is still the oldest
     journal_result(&pool, stale_id, 9_999, true, "tcp").await;
     sqlx::query("UPDATE proxies SET status = 'alive' WHERE status = 'unknown'")
         .execute(&pool)
@@ -2964,9 +2876,8 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
 
     let candidates = select_t2_candidates(&pool, 100).await.unwrap();
     let hosts: Vec<&str> = candidates.iter().map(|row| row.host.as_str()).collect();
-    // Never-checked first, then the oldest last check upward; ties
-    // between the two never-checked rows break by id, which follows
-    // insertion order here (a, b).
+    // Never-checked first, then the oldest last check upward; ties break
+    // by id, which follows insertion order here (a, b)
     assert_eq!(
         hosts,
         vec![
@@ -2978,8 +2889,7 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
         ]
     );
 
-    // A limit cuts from the tail: the freshest-recently-checked row
-    // waits for a later batch, the head of the order is unchanged.
+    // A limit cuts from the tail, the head of the order is unchanged
     let head = select_t2_candidates(&pool, 3).await.unwrap();
     let hosts: Vec<&str> = head.iter().map(|row| row.host.as_str()).collect();
     assert_eq!(
@@ -2988,10 +2898,9 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
     );
 }
 
-/// The recency stamp lives on the proxy row, not in the journal: the
-/// T2 batch must not walk the history to learn when a proxy was last
-/// tunnel-checked. The stamp is written by the journal write path, only
-/// for the T2 tier, and it never moves backwards.
+/// The recency stamp lives on the proxy row, not in the journal: the T2
+/// batch must not walk the history to learn when a proxy was last
+/// tunnel-checked.
 #[tokio::test]
 async fn the_t2_recency_stamp_follows_the_journal() {
     let (_dir, pool) = temp_pool().await;
@@ -3026,17 +2935,17 @@ async fn the_t2_recency_stamp_follows_the_journal() {
             .unwrap()
     };
 
-    // A T1 attempt says nothing about the tunnel: no stamp.
+    // A T1 attempt says nothing about the tunnel: no stamp
     journal_result(&pool, a, 500, true, "tcp").await;
     assert_eq!(stamp_of(a).await, None, "a T1 attempt stamps nothing");
 
-    // A T2 attempt stamps the moment of the attempt.
+    // A T2 attempt stamps the moment of the attempt
     journal_result(&pool, a, 1000, true, "t2").await;
     assert_eq!(stamp_of(a).await, Some(1000));
     assert_eq!(stamp_of(b).await, None, "the other row is untouched");
 
     // An unverified attempt is an attempt too: the recency queue has to
-    // move past the row.
+    // move past the row
     journal_result(
         &pool,
         b,
@@ -3047,11 +2956,10 @@ async fn the_t2_recency_stamp_follows_the_journal() {
     .await;
     assert_eq!(stamp_of(b).await, Some(1200));
 
-    // A replayed older attempt must not make the row look older.
+    // A replayed older attempt must not make the row look older
     journal_result(&pool, a, 700, true, "t2").await;
     assert_eq!(stamp_of(a).await, Some(1000), "the stamp never goes back");
 
-    // A newer attempt moves it forward.
     journal_result(&pool, a, 2000, true, "t2").await;
     assert_eq!(stamp_of(a).await, Some(2000));
 }
@@ -3059,7 +2967,7 @@ async fn the_t2_recency_stamp_follows_the_journal() {
 /// The stamp is a permanent fact about the proxy, not about the journal
 /// it was derived from: the retention sweep trims `probe_results`, and a
 /// proxy whose history was trimmed must not fall back into the
-/// never-checked tier and be served as a first-timer forever.
+/// never-checked tier.
 #[tokio::test]
 async fn the_t2_recency_stamp_survives_the_history_sweep() {
     let (_dir, pool) = temp_pool().await;
@@ -3088,7 +2996,7 @@ async fn the_t2_recency_stamp_survives_the_history_sweep() {
 
     journal_result(&pool, a, 1000, true, "t2").await;
 
-    // The journal is swept: the row that was checked has no history left.
+    // The journal is swept: the row that was checked has no history left
     let purged = crate::repo::probe::purge_before(&pool, 2_000)
         .await
         .unwrap();
@@ -3099,8 +3007,7 @@ async fn the_t2_recency_stamp_survives_the_history_sweep() {
         .unwrap();
     assert_eq!(left, 0, "the history is gone");
 
-    // The checked row stays behind the never-checked one: its stamp
-    // outlived the journal it came from.
+    // Its stamp outlived the journal it came from
     let candidates = select_t2_candidates(&pool, 10).await.unwrap();
     assert_eq!(
         candidates.iter().map(|row| row.id).collect::<Vec<_>>(),
@@ -3110,19 +3017,16 @@ async fn the_t2_recency_stamp_survives_the_history_sweep() {
 }
 
 /// The SQL allowlist must mirror what meow-rs can actually tunnel
-/// (`fumox_core::formats::clash::is_supported`, the mapping the probe
-/// builds its T2 batch with). A
-/// divergence would either drop rows the SQL offered, under the
-/// recency order a perpetually uncheckable row (e.g. naive) would
-/// starve the whole batch, or skip schemes meow-rs handles fine.
+/// (`fumox_core::formats::clash::is_supported`): a divergence would skip
+/// schemes meow-rs handles fine or, under the recency order, let a
+/// perpetually uncheckable row starve the batch.
 #[tokio::test]
 async fn t2_scheme_allowlist_mirrors_meow_support() {
     use crate::formats::clash::is_supported;
     use crate::models::Scheme;
-    // The mapping lives in fumox-core::formats::clash and is what the
-    // probe builds its T2 batch with, so the allowlist is compared against
-    // `is_supported` itself: a scheme entering or leaving the mapping must
-    // be followed by T2_SCHEMES in the same change.
+    // The allowlist is compared against `is_supported` itself: a scheme
+    // entering or leaving the mapping must be followed by T2_SCHEMES in
+    // the same change
     let meow_supported: Vec<&str> = Scheme::all()
         .iter()
         .filter(|scheme| is_supported(**scheme))
@@ -3130,10 +3034,8 @@ async fn t2_scheme_allowlist_mirrors_meow_support() {
         .collect();
     assert_eq!(T2_SCHEMES, meow_supported.as_slice());
 
-    // And the selector must actually offer that set: the IN-list was
-    // once a hardcoded six-scheme literal that omitted snell/anytls,
-    // so those rows could never receive a T2 verdict and never leave
-    // `alive` for `ready`.
+    // The selector must actually offer that set: the IN-list was once a
+    // hardcoded literal that omitted snell/anytls
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let mk = |scheme: Scheme, host: &str| ProxyEntry {
@@ -3175,17 +3077,15 @@ async fn t2_scheme_allowlist_mirrors_meow_support() {
 
 /// The median latency of the live pool: the middle element for an odd
 /// count, the mean of the two middle ones for an even count, NULL for an
-/// empty set — and only `alive`/`ready` rows are measured, so a
-/// quarantined row with a stale latency does not drag the number.
+/// empty set; only `alive`/`ready` rows are measured.
 #[tokio::test]
 async fn latency_median_takes_the_live_rows_middle_element() {
     let (_dir, pool) = temp_pool().await;
 
-    // No measured row at all: no median.
     assert_eq!(latency_median(&pool).await.unwrap(), None);
 
-    // Three live rows and one quarantined one carrying a stale latency:
-    // the quarantined row is outside the population.
+    // One quarantined row with a stale latency sits outside the
+    // population
     for (i, latency) in [10i64, 20, 30].into_iter().enumerate() {
         let id = seed_proxy(&pool, "vless", &format!("m{i}.example.com")).await;
         set_status_columns_by_id(&pool, id, "alive", &[("latency_ms", latency)]).await;
@@ -3194,18 +3094,16 @@ async fn latency_median_takes_the_live_rows_middle_element() {
     set_status_columns_by_id(&pool, stale, "quarantine", &[("latency_ms", 999)]).await;
     assert_eq!(latency_median(&pool).await.unwrap(), Some(20));
 
-    // An even population: the two middle elements average.
     let id = seed_proxy(&pool, "vless", "m3.example.com").await;
     set_status_columns_by_id(&pool, id, "ready", &[("latency_ms", 40)]).await;
     assert_eq!(latency_median(&pool).await.unwrap(), Some(25));
 }
 
-/// The bounded-window T1 draw must keep the old full-pool shuffle's
-/// contract: the quota is filled every cycle with distinct rows, and the
-/// random anchor sweep gives every row of the pool the same marginal
-/// per-cycle chance (`limit / pool`), so the whole population is covered
-/// over time. The pool here sits well above the draw window
-/// (`SAMPLE_WINDOW_FACTOR * limit`), so every call takes the bounded path.
+/// The bounded-window T1 draw must keep the full-pool shuffle's contract:
+/// the quota is filled every cycle with distinct rows, and every row of
+/// the pool gets the same marginal per-cycle chance (`limit / pool`), so
+/// the whole population is covered over time. The pool here sits well
+/// above the draw window (`SAMPLE_WINDOW_FACTOR * limit`).
 #[tokio::test]
 async fn t1_windowed_sample_fills_quota_and_covers_the_pool() {
     let (_dir, pool) = temp_pool().await;
@@ -3234,11 +3132,11 @@ async fn t1_windowed_sample_fills_quota_and_covers_the_pool() {
     );
 }
 
-/// Below the window size the bounded draw fetches the whole eligible pool,
-/// which is exactly the full-pool `ORDER BY RANDOM()` it replaced, so
-/// eligibility semantics must match it exactly: only `unknown`/`alive`,
-/// linked, T1-probeable rows come back, however many ineligible rows
-/// surround them.
+/// Below the window size the bounded draw fetches the whole eligible
+/// pool, which is exactly the full-pool `ORDER BY RANDOM()` it replaced,
+/// so eligibility semantics must match: only `unknown`/`alive`, linked,
+/// T1-probeable rows come back, however many ineligible rows surround
+/// them.
 #[tokio::test]
 async fn t1_windowed_sample_matches_full_pool_eligibility_below_the_window() {
     let (_dir, pool) = temp_pool().await;
@@ -3255,7 +3153,7 @@ async fn t1_windowed_sample_matches_full_pool_eligibility_below_the_window() {
         set_status_by_id(&pool, id, "quarantine").await;
     }
     for i in 0..5 {
-        // Ineligible by scheme alone (T1 cannot judge a QUIC port).
+        // Ineligible by scheme alone (T1 cannot judge a QUIC port)
         seed_proxy(&pool, "tuic", &format!("tuic{i}.example.com")).await;
     }
     let unlinked = seed_proxy(&pool, "ss", "unlinked.example.com").await;
@@ -3265,7 +3163,7 @@ async fn t1_windowed_sample_matches_full_pool_eligibility_below_the_window() {
         .await
         .unwrap();
 
-    // limit 10 → window 40, above the whole row count: full-pool draw.
+    // limit 10 → window 40, above the whole row count: full-pool draw
     let mut drawn: Vec<i64> = select_t1_candidates(&pool, 10)
         .await
         .unwrap()
@@ -3304,7 +3202,7 @@ async fn quarantine_windowed_sample_fills_quota_and_covers_the_pool() {
         )
         .await;
     }
-    // Sleeping past the horizon: never due, never drawn.
+    // Sleeping past the horizon: never due, never drawn
     let sleeping = seed_proxy(&pool, "vless", "sleeping.example.com").await;
     set_status_columns_by_id(
         &pool,
@@ -3334,15 +3232,13 @@ async fn quarantine_windowed_sample_fills_quota_and_covers_the_pool() {
     );
 }
 
-/// The window draw is built from two core helpers, and both are pinned
-/// by a seeded RNG: the anchor is drawn inside the eligible rows' own id
+/// The window draw is built from two core helpers, both pinned by a
+/// seeded RNG: the anchor is drawn inside the eligible rows' own id
 /// range, and the shuffle that cuts the window must never lose or
-/// duplicate a row, whatever the seed, and it must actually reorder (two
-/// seeds agreeing on a 32-row permutation is a 1-in-32! coincidence).
-///
-/// The test drives the helpers themselves, not the `rand` crate: a
-/// shuffle of the standard library says nothing about the sampler that
-/// uses it.
+/// duplicate a row and must actually reorder (two seeds agreeing on a
+/// 32-row permutation is a 1-in-32! coincidence). The test drives the
+/// helpers themselves, not the `rand` crate: a shuffle of the standard
+/// library says nothing about the sampler that uses it.
 #[test]
 fn the_window_draw_helpers_are_pinned_by_the_seed() {
     use rand::SeedableRng;
@@ -3352,8 +3248,7 @@ fn the_window_draw_helpers_are_pinned_by_the_seed() {
     for seed in 0..16u64 {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-        // The anchor stays inside the eligible range, the only range
-        // the draw is allowed to spend its luck on.
+        // The anchor stays inside the eligible range
         let anchor = choose_anchor(10, 20, &mut rng);
         assert!(
             (10..=20).contains(&anchor),
@@ -3405,7 +3300,7 @@ async fn reconcile_stores_geo_and_keeps_it_when_fresh_lookup_empty() {
     assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
 
     // Refetch with an inactive resolver (all-None stamps): stored facts
-    // are preserved, never wiped by a missing lookup.
+    // are preserved, never wiped by a missing lookup
     reconcile_source(
         &pool,
         "srcA0000000",
@@ -3469,7 +3364,7 @@ async fn missing_geo_listing_and_update() {
     assert_eq!(row.geo_country.as_deref(), Some("US"));
     assert_eq!(row.geo_city, None);
 
-    // The country landed, the ASN did not: the row stays in the listing.
+    // The country landed, the ASN did not: the row stays in the listing
     let missing = list_missing_geo(&pool, 0, 500, both, now).await.unwrap();
     assert!(
         missing.iter().any(|(walked, _)| walked == &id),
@@ -3477,7 +3372,7 @@ async fn missing_geo_listing_and_update() {
     );
     assert_eq!(count_missing_geo(&pool, both).await.unwrap(), 1);
 
-    // A City-only install cannot answer the ASN and must not chase it.
+    // A City-only install cannot answer the ASN and must not chase it
     let city_only = GeoFactMask {
         country: true,
         asn: false,
@@ -3492,7 +3387,7 @@ async fn missing_geo_listing_and_update() {
     );
     assert_eq!(count_missing_geo(&pool, city_only).await.unwrap(), 0);
 
-    // The ASN arrives later and the partial stamp leaves the country be.
+    // The ASN arrives later and the partial stamp leaves the country be
     update_geo(
         &pool,
         id,
@@ -3565,10 +3460,10 @@ async fn a_recently_attempted_row_is_not_walked_again() {
             .is_empty(),
         "a row that was just tried must not be walked again"
     );
-    // The backlog is still real, the count does not hide it.
+    // The backlog is still real, the count does not hide it
     assert_eq!(count_missing_geo(&pool, both).await.unwrap(), 1);
 
-    // Once the retry window passed the row is walked again.
+    // Once the retry window passed the row is walked again
     let later = now + GEO_RETRY_WINDOW_SECS + 1;
     assert_eq!(
         list_missing_geo(&pool, 0, 500, both, later)
@@ -3578,7 +3473,7 @@ async fn a_recently_attempted_row_is_not_walked_again() {
         1
     );
 
-    // A successful lookup clears the marker.
+    // A successful lookup clears the marker
     update_geo(
         &pool,
         id,
@@ -3632,11 +3527,10 @@ async fn an_empty_fact_mask_walks_nothing() {
 
 /// The admin card refresh resolves a host and writes the whole stamp
 /// back. The resolver merges the databases with an `any`-hit, so one
-/// stamp can be partial where the others are silent. An ASN-only hit
+/// stamp can be partial where the others are silent: an ASN-only hit
 /// (the City record decodes with an empty country, as it does for the
 /// Cloudflare `104.16.0.0/12` block) must not erase the country the
-/// ingest path already resolved, same invariant the reconcile upsert
-/// keeps.
+/// ingest path already resolved.
 #[tokio::test]
 async fn update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace() {
     let (_dir, pool) = temp_pool().await;
@@ -3684,7 +3578,7 @@ async fn update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace() {
     assert_eq!(row.geo_asn.as_deref(), Some("AS13335"));
     assert_eq!(row.resolved_ip.as_deref(), Some("104.16.0.1"));
 
-    // A stamp that does carry the fields still overwrites them.
+    // A stamp that does carry the fields still overwrites them
     update_geo_full(
         &pool,
         id,
@@ -3710,8 +3604,7 @@ async fn update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace() {
 
 /// The columns the bulk fixtures vary, named: the bulk helpers filter on
 /// columns the reconciliation path never populates (geo_asn, unprobeable
-/// schemes), so tests seed rows directly, and the two optional geo
-/// columns read as fields instead of positions.
+/// schemes), so tests seed rows directly.
 struct BulkRow<'a> {
     fingerprint: &'a str,
     scheme: &'a str,
@@ -3753,9 +3646,8 @@ async fn bulk_test_row(pool: &DbPool, row: BulkRow<'_>) -> i64 {
     id
 }
 
-/// Link a bulk fixture row to a source. The revival paths require a
-/// live link (a row without one is in no probe lane), so revival
-/// tests have to give their targets one.
+/// Link a bulk fixture row to a source: the revival paths require a
+/// live link (a row without one is in no probe lane).
 async fn link_row(pool: &DbPool, proxy_id: i64, source_id: &str) {
     sqlx::query("INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, ?, 1)")
         .bind(proxy_id)
@@ -3765,10 +3657,9 @@ async fn link_row(pool: &DbPool, proxy_id: i64, source_id: &str) {
         .unwrap();
 }
 
-/// The sampled state of a bulk fixture row: the status, the three
-/// lifecycle timestamps and the two lifecycle counters. The counters are
-/// part of the sample because a transition that retires a row has to
-/// clear the whole ladder, not only its timestamps.
+/// The sampled state of a bulk fixture row: status, the three lifecycle
+/// timestamps and the two counters. A transition that retires a row has
+/// to clear the whole ladder, not only its timestamps.
 async fn bulk_status_of(
     pool: &DbPool,
     id: i64,
@@ -3810,7 +3701,7 @@ async fn quarantine_to_removed_moves_only_quarantined() {
     .await;
 
     // The stamp is "now", and "now" moves: the call is bracketed
-    // instead of compared against a second reading of the clock.
+    // instead of compared against a second reading of the clock
     let before = crate::models::now_ts();
     assert_eq!(quarantine_to_removed(&pool).await.unwrap(), 1);
     let after = crate::models::now_ts();
@@ -3934,8 +3825,7 @@ async fn remove_alive_without_country_targets_only_alive_without_geo() {
 async fn remove_alive_by_asn_matches_canonical_as_prefix() {
     let (_dir, pool) = temp_pool().await;
     // The ASN is accepted in both spellings, each round on its own
-    // fixtures: the operator types "AS24940" or "24940" and both must
-    // hit the same rows.
+    // fixtures: both must hit the same rows
     for (round, spelling) in ["24940", "AS24940"].into_iter().enumerate() {
         let target = bulk_test_row(
             &pool,
@@ -4136,13 +4026,13 @@ async fn mark_source_orphans_removed_retires_every_status_by_default() {
     )
     .await;
     // The rows start linked to the source that goes away: the sweep
-    // only acts on rows with no remaining link.
+    // only acts on rows with no remaining link
     for id in [ready, alive, unknown, quarantined] {
         link_row(&pool, id, "srcO0000000").await;
     }
 
     // The fixtures carry a live ladder: a retired row must not keep a
-    // recheck schedule that describes a ladder nobody walks any more.
+    // recheck schedule that describes a ladder nobody walks any more
     let now = crate::models::now_ts();
     for id in [ready, alive, unknown, quarantined] {
         sqlx::query(
@@ -4195,11 +4085,9 @@ async fn mark_source_orphans_removed_retires_every_status_by_default() {
 }
 
 /// When the caller protects statuses (admin source-delete path with
-/// `drop_gate = false` passes `["ready", "unknown"]`), link-less rows
-/// in those statuses are left untouched, the probe remains the only
-/// authority on their lifecycle, and the priority queue the only
-/// authority on a not-yet-verified row. Already-`removed` rows stay
-/// untouched regardless of the protected list (idempotency).
+/// `drop_gate = false` passes `["ready", "unknown"]`), link-less rows in
+/// those statuses are left untouched; already-`removed` rows stay
+/// untouched regardless of the protected list.
 #[tokio::test]
 async fn mark_source_orphans_removed_protects_listed_statuses() {
     let (_dir, pool) = temp_pool().await;
@@ -4238,8 +4126,7 @@ async fn mark_source_orphans_removed_protects_listed_statuses() {
         },
     )
     .await;
-    // Already-removed row: keeps its removed_at untouched, the
-    // protected list does not revive it.
+    // Already-removed row: the protected list does not revive it
     let already = bulk_test_row(
         &pool,
         BulkRow {
@@ -4252,7 +4139,7 @@ async fn mark_source_orphans_removed_protects_listed_statuses() {
     )
     .await;
     // The rows start linked and lose the link, exactly what happens
-    // after a source delete.
+    // after a source delete
     for id in [ready, alive, unknown, already] {
         link_row(&pool, id, "srcO0000001").await;
     }
@@ -4262,10 +4149,9 @@ async fn mark_source_orphans_removed_protects_listed_statuses() {
         .await
         .unwrap();
 
-    // The admin source-delete conservative mode passes both
-    // `ready` (tunnel-verified, the probe is its only authority) and
-    // `unknown` (not yet checked, the priority queue is its only
-    // authority). Both must survive the click.
+    // The admin source-delete conservative mode passes both `ready`
+    // (tunnel-verified, the probe is its only authority) and `unknown`
+    // (not yet checked, the priority queue is its only authority)
     let sweep = mark_source_orphans_removed(&pool, "srcO0000001", &["ready", "unknown"])
         .await
         .unwrap();
@@ -4338,7 +4224,7 @@ async fn mark_source_orphans_removed_accepts_multiple_protected_statuses() {
     )
     .await;
     // The rows start linked and lose the link, exactly what happens
-    // after a source delete.
+    // after a source delete
     for id in [ready, alive, unknown] {
         link_row(&pool, id, "srcO0000002").await;
     }
@@ -4453,8 +4339,8 @@ async fn revive_removed_by_country_returns_unknown_and_clears_lifecycle() {
     link_row(&pool, de, "srcR0000000").await;
     link_row(&pool, us, "srcR0000000").await;
     let now = crate::models::now_ts();
-    // Stamp a non-zero ladder / quarantine / fail_count on DE to
-    // confirm the revival clears them.
+    // Stamp a non-zero ladder / quarantine / fail_count on DE to confirm
+    // the revival clears them
     sqlx::query(
         "UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 2,
                   fail_count = 5, removed_at = 300 WHERE id = ?",
@@ -4543,7 +4429,7 @@ async fn revive_removed_by_asn_matches_canonical_prefix() {
     make_source(&pool, "srcR0000002").await;
     // One fixture per spelling: both spellings canonicalise to the
     // stored `AS…` form, and each call has to hit its own row and
-    // nothing else.
+    // nothing else
     let bare = bulk_test_row(
         &pool,
         BulkRow {
@@ -4597,13 +4483,11 @@ async fn revive_removed_by_asn_matches_canonical_prefix() {
         .unwrap();
     let now = crate::models::now_ts();
 
-    // The bare number works.
     let outcome = revive_removed_by_asn(&pool, "24940", now).await.unwrap();
     assert_eq!(outcome.ids, vec![bare], "the bare number canonicalises");
     assert_eq!(outcome.revived, 1);
     assert_eq!(bulk_status_of(&pool, bare).await.0, "unknown");
 
-    // The AS-prefix works as well.
     let outcome = revive_removed_by_asn(&pool, "AS13335", now).await.unwrap();
     assert_eq!(outcome.ids, vec![prefixed], "the AS-prefix works as well");
     assert_eq!(outcome.revived, 1);
@@ -4612,13 +4496,11 @@ async fn revive_removed_by_asn_matches_canonical_prefix() {
 }
 
 /// `revive_removed_never_checked` only revives `removed` rows the probe
-/// never reached, a row that was checked once (even if the check failed)
-/// stays removed.
-///
-/// The marker is the row's own `last_checked_at`, not a journal entry:
-/// the journal rotates, so a proxy checked long ago and dropped from the
-/// preserved history would look "never checked" and be revived on every
-/// pass.
+/// never reached; a row that was checked once (even if the check failed)
+/// stays removed. The marker is the row's own `last_checked_at`, not a
+/// journal entry: the journal rotates, so a proxy checked long ago and
+/// dropped from the preserved history would look "never checked" and be
+/// revived on every pass.
 #[tokio::test]
 async fn revive_removed_never_checked_targets_only_never_checked_rows() {
     let (_dir, pool) = temp_pool().await;
@@ -4648,7 +4530,7 @@ async fn revive_removed_never_checked_targets_only_never_checked_rows() {
     link_row(&pool, lonely, "srcR0000003").await;
     link_row(&pool, tried, "srcR0000003").await;
     // The probe reached the row once; its journal entry is long gone
-    // (the retention pass removed it), the row still knows.
+    // (the retention pass removed it), the row still knows
     sqlx::query("UPDATE proxies SET last_checked_at = 1 WHERE id = ?")
         .bind(tried)
         .execute(&pool)
@@ -4664,11 +4546,10 @@ async fn revive_removed_never_checked_targets_only_never_checked_rows() {
 }
 
 /// The same button must also release `unknown` rows frozen by the T2
-/// block. With `last_t2_failed_at` set they satisfy no probe lane at
-/// all (queue drain and T1 sample require it NULL, the T2 selector
-/// only offers `alive`/`ready`), so they are never checked and never
-/// can clear the flag on their own. A row that *was* checked is left
-/// alone: the panel is for rows that never got a verdict.
+/// block: with `last_t2_failed_at` set they satisfy no probe lane at all,
+/// so they are never checked and can never clear the flag on their own.
+/// A row that *was* checked is left alone: the panel is for rows that
+/// never got a verdict.
 #[tokio::test]
 async fn revive_never_checked_releases_t2_frozen_unknown_rows() {
     let (_dir, pool) = temp_pool().await;
@@ -4720,10 +4601,9 @@ async fn revive_never_checked_releases_t2_frozen_unknown_rows() {
     for id in [frozen, clear, frozen_with_history] {
         link_row(&pool, id, "srcR0000003").await;
     }
-    // frozen + frozen_with_history + unlinked carry the T2 block; clear
-    // does not. The unlinked row differs from the frozen one in the
-    // source link and in nothing else, so the assertion below really
-    // tests the link and not the block.
+    // frozen, frozen_with_history and unlinked carry the T2 block, clear
+    // does not. The unlinked row differs from the frozen one only in the
+    // source link, so the assertions really test the link, not the block
     for id in [frozen, frozen_with_history, unlinked] {
         sqlx::query("UPDATE proxies SET last_t2_failed_at = 1700, fail_count = 3 WHERE id = ?")
             .bind(id)
@@ -4761,11 +4641,10 @@ async fn revive_never_checked_releases_t2_frozen_unknown_rows() {
     );
 }
 
-/// `revive_quarantine` moves every quarantined row back to `unknown`
-/// and clears `quarantined_at` / `ladder_at` / `ladder_step` /
-/// `fail_count`. The recheck-ladder schedule is dropped, the probe
-/// picks the row up via the priority queue (the caller enqueues
-/// the returned ids) and runs T1 from scratch.
+/// `revive_quarantine` moves every quarantined row back to `unknown` and
+/// clears `quarantined_at` / `ladder_at` / `ladder_step` / `fail_count`;
+/// the probe picks the row up via the priority queue and runs T1 from
+/// scratch.
 #[tokio::test]
 async fn revive_quarantine_returns_unknown_and_clears_ladder_fields() {
     let (_dir, pool) = temp_pool().await;
@@ -4857,14 +4736,13 @@ async fn revive_quarantine_leaves_alive_and_removed_alone() {
     assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
 }
 
-/// The T1 lanes (random sample and priority queue) and the T2 sample
-/// all require a live `proxy_source_links` row. A revival that
-/// ignored that would hand the panel a "revived N rows" toast for
-/// rows no probe can reach: the request is queued, skipped at
-/// drain, and the next reconcile retires the row again. All five
-/// revival statements therefore require the link, including
-/// `revive_quarantine`, where the ladder is the only lane that ever
-/// saw a link-less row and reviving drops it.
+/// The T1 lanes (random sample and priority queue) and the T2 sample all
+/// require a live `proxy_source_links` row. A revival that ignored that
+/// would hand the panel a "revived N rows" toast for rows no probe can
+/// reach: the request is queued, skipped at drain, and the next
+/// reconcile retires the row again. All five revival statements require
+/// the link, including `revive_quarantine`, where the ladder is the only
+/// lane that ever saw a link-less row and reviving drops it.
 #[tokio::test]
 async fn bulk_revival_skips_rows_without_a_source_link() {
     let (_dir, pool) = temp_pool().await;
@@ -4873,7 +4751,7 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
 
     // One target per panel, all linked, each the only row its own
     // filter matches (the country, the AS and the "no probe history"
-    // filters overlap otherwise).
+    // filters overlap otherwise)
     let by_country = bulk_test_row(
         &pool,
         BulkRow {
@@ -4922,7 +4800,7 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
         link_row(&pool, id, "srcR0000006").await;
     }
     // All four carry a stale T2 block, a revived row must not keep it:
-    // the T1 lanes filter on `last_t2_failed_at IS NULL`.
+    // the T1 lanes filter on `last_t2_failed_at IS NULL`
     sqlx::query("UPDATE proxies SET last_t2_failed_at = 1_000 WHERE id IN (?, ?, ?, ?)")
         .bind(by_country)
         .bind(by_asn)
@@ -4933,7 +4811,7 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
         .unwrap();
 
     // The same population without a link to any source: in range of
-    // every filter above, reachable by no probe lane.
+    // every filter above, reachable by no probe lane
     let orphan_removed = bulk_test_row(
         &pool,
         BulkRow {
@@ -5000,7 +4878,7 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
     );
 
     // The revived rows are back on a T1 lane, the untouched ones keep
-    // the block they had.
+    // the block they had
     for id in [by_country, by_asn, by_history, from_quarantine] {
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "unknown");
@@ -5015,7 +4893,6 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
     assert_eq!(blocked, Some(1_000));
 }
 
-/// Empty quarantine → no due rows.
 #[tokio::test]
 async fn count_due_quarantine_returns_zero_when_empty() {
     let (_dir, pool) = temp_pool().await;
@@ -5090,7 +4967,6 @@ async fn count_due_quarantine_counts_only_due() {
         .execute(&pool)
         .await
         .unwrap();
-    // future: ladder_at is in the future
     sqlx::query("UPDATE proxies SET quarantined_at = ?, ladder_at = ? WHERE id = ?")
         .bind(now - 3600)
         .bind(now + 3600)
@@ -5098,9 +4974,8 @@ async fn count_due_quarantine_counts_only_due() {
         .execute(&pool)
         .await
         .unwrap();
-    // null_ladder: the fixture pins its ladder_at to NULL — a
-    // quarantined row with no recheck scheduled, so the row is excluded
-    // from the count.
+    // null_ladder: pins `ladder_at` to NULL, the in-flight shape the
+    // count excludes
     sqlx::query("UPDATE proxies SET ladder_at = NULL WHERE id = ?")
         .bind(null_ladder)
         .execute(&pool)
@@ -5159,7 +5034,7 @@ async fn oldest_quarantined_at_returns_min() {
         },
     )
     .await;
-    // q1 oldest, q2 newer, alive with even older quarantined_at must be ignored.
+    // q1 oldest, q2 newer, alive with even older quarantined_at must be ignored
     sqlx::query("UPDATE proxies SET quarantined_at = ? WHERE id = ?")
         .bind(now - 30 * 86_400)
         .bind(q1)
@@ -5224,7 +5099,7 @@ async fn purge_removed_deletes_a_tier_bigger_than_one_batch() {
         .await
         .unwrap();
     assert_eq!(left, 0);
-    // The purge touches the removed tier only.
+    // The purge touches the removed tier only
     assert!(
         sqlx::query("SELECT 1 FROM proxies WHERE id = ?")
             .bind(alive)
@@ -5267,9 +5142,8 @@ async fn purge_removed_before_takes_only_the_rows_stamped_past_the_cutoff() {
     )
     .await;
     // The unstamped row keeps the NULL `removed_at` the fixture gave it:
-    // the ordinary removal paths always write the stamp, so an unstamped
-    // removed row is a hand-broken one, and the contract says only the
-    // admin's unfiltered purge reaches it.
+    // the ordinary removal paths always write the stamp, so only the
+    // admin's unfiltered purge reaches an unstamped removed row
     let unstamped = bulk_test_row(
         &pool,
         BulkRow {
@@ -5343,8 +5217,6 @@ async fn purge_removed_before_takes_only_the_rows_stamped_past_the_cutoff() {
     );
 }
 
-// Admin proxy browser
-
 /// Fixture for the admin proxy browser: four proxies with distinct
 /// schemes, countries, statuses, links and probe history. Returns
 /// `(id, letter)` in insertion order.
@@ -5371,7 +5243,7 @@ async fn admin_list_fixture(pool: &DbPool) -> Vec<(i64, &'static str)> {
         .await;
         ids.push((id, letter));
     }
-    // Links: a+b on srcA, c on srcB, d unlinked.
+    // Links: a+b on srcA, c on srcB, d unlinked
     for (id, letter) in &ids {
         match *letter {
             "a" | "b" => link_row(pool, *id, "srcA0000000").await,
@@ -5379,7 +5251,7 @@ async fn admin_list_fixture(pool: &DbPool) -> Vec<(i64, &'static str)> {
             _ => {}
         }
     }
-    // Preserved history: a = T1+T2, b = T1 only, c = none, d = T2 only.
+    // Preserved history: a = T1+T2, b = T1 only, c = none, d = T2 only
     let by_letter: std::collections::HashMap<&str, i64> =
         ids.iter().map(|(id, letter)| (*letter, *id)).collect();
     for (letter, kinds) in [
@@ -5434,13 +5306,11 @@ async fn admin_list_filter_count_and_rows_match() {
         out
     };
 
-    // Unfiltered: everything, and count and rows agree.
     let filter = ProxyListFilter::default();
     let (total, rows) = filtered_ids(&pool, &filter).await;
     assert_eq!(total, 4);
     assert_eq!(rows, expected(&["a", "b", "c", "d"]));
 
-    // Status whitelist.
     let filter = ProxyListFilter {
         statuses: vec!["alive".into()],
         ..Default::default()
@@ -5449,7 +5319,6 @@ async fn admin_list_filter_count_and_rows_match() {
     assert_eq!(total, 1);
     assert_eq!(rows, expected(&["b"]));
 
-    // Exact scheme and exact country.
     let filter = ProxyListFilter {
         scheme: "vless".into(),
         country: "US".into(),
@@ -5459,7 +5328,6 @@ async fn admin_list_filter_count_and_rows_match() {
     assert_eq!(total, 2, "a and d are vless in the US");
     assert_eq!(rows, expected(&["a", "d"]));
 
-    // Source filter through the link table.
     let filter = ProxyListFilter {
         source_id: "srcA0000000".into(),
         ..Default::default()
@@ -5468,11 +5336,10 @@ async fn admin_list_filter_count_and_rows_match() {
     assert_eq!(total, 2, "a and b are linked to srcA");
     assert_eq!(rows, expected(&["a", "b"]));
 
-    // Substring over host and name, split into two independent cases:
-    // a needle only the host carries (the name is shorter than it), and
-    // a needle only the name carries (`a` is renamed away from its
-    // fingerprint-shaped host), so neither column can answer for the
-    // other.
+    // Substring over host and name, split into two independent cases: a
+    // needle only the host carries, and a needle only the name carries
+    // (`a` is renamed away from its fingerprint-shaped host), so neither
+    // column can answer for the other
     sqlx::query("UPDATE proxies SET name = 'label-a' WHERE id = ?")
         .bind(id_of("a"))
         .execute(&pool)
@@ -5493,7 +5360,7 @@ async fn admin_list_filter_count_and_rows_match() {
     assert_eq!(total, 1, "only a's name carries the needle");
     assert_eq!(rows, expected(&["a"]));
 
-    // Coverage buckets.
+    // Coverage buckets
     for (bucket, expected_letter) in [
         (CheckCoverage::T1Only, "b"),
         (CheckCoverage::T2Only, "d"),
@@ -5514,7 +5381,7 @@ async fn admin_list_filter_count_and_rows_match() {
         );
     }
 
-    // The rows carry the coverage flags the "Checks" cell renders.
+    // The rows carry the coverage flags the "Checks" cell renders
     let rows = list_filtered(
         &pool,
         &ProxyListFilter::default(),
@@ -5533,17 +5400,15 @@ async fn admin_list_filter_count_and_rows_match() {
     assert_eq!(flags[&id_of("c")], (false, false));
     assert_eq!(flags[&id_of("d")], (false, true));
 
-    // Purge-dialog count: unfiltered terminal rows.
+    // Purge-dialog count: unfiltered terminal rows
     assert_eq!(count_removed(&pool).await.unwrap(), 1);
-    // Country dropdown: distinct stored codes, ascending.
     assert_eq!(distinct_countries(&pool).await.unwrap(), vec!["DE", "US"]);
 }
 
 /// The admin browser's search box is a literal substring match: `%`, `_`
 /// and the escape character in the query mean themselves (escaped into
 /// the needle, `LIKE ... ESCAPE '\'`), so a `100%` host is found by
-/// `100%` and a `%` query answers only rows that carry a literal `%` —
-/// not the whole table.
+/// `100%` and a `%` query answers only rows that carry a literal `%`.
 #[tokio::test]
 async fn admin_list_search_matches_wildcards_literally() {
     let (_dir, pool) = temp_pool().await;
@@ -5596,12 +5461,10 @@ async fn admin_list_search_matches_wildcards_literally() {
         .await
     }
 
-    // Literally matched rows only, whatever the wildcard content.
     assert_eq!(matches(&pool, "100%").await, (1, vec![percent]));
     assert_eq!(matches(&pool, "%").await, (1, vec![percent]));
     assert_eq!(matches(&pool, "_").await, (1, vec![under]));
     assert_eq!(matches(&pool, "plainrow").await, (1, vec![plain]));
-    // A query with no literal match answers nothing.
     assert_eq!(matches(&pool, "zzz").await, (0, vec![]));
 }
 
@@ -5612,9 +5475,9 @@ async fn admin_list_orders_and_pages() {
     let (_dir, pool) = temp_pool().await;
     let ids = admin_list_fixture(&pool).await;
     let id_of = |letter: &str| ids.iter().find(|(_, l)| *l == letter).unwrap().0;
-    // Distinct recency and latency so both orders are deterministic.
-    // b and c share their timestamp: the tie must break by id DESC, and
-    // a page boundary must not cut a tied pair in half.
+    // Distinct recency and latency so both orders are deterministic; b
+    // and c share their timestamp, so the tie must break by id DESC and
+    // a page boundary must not cut a tied pair in half
     let recency = [("a", 100), ("b", 300), ("c", 300), ("d", 400)];
     let latency = [
         ("a", Some(100)),
@@ -5638,8 +5501,7 @@ async fn admin_list_orders_and_pages() {
             .await
             .unwrap();
     }
-    // Mixed-case names, so the name order has to fold the case to
-    // order them the way an operator reads them.
+    // Mixed-case names, so the name order has to fold the case
     for (letter, name) in [
         ("a", "Alpha"),
         ("b", "beta"),
@@ -5654,7 +5516,6 @@ async fn admin_list_orders_and_pages() {
             .unwrap();
     }
 
-    // Updated: newest first, ties by id DESC (c before b).
     let rows = list_filtered(
         &pool,
         &ProxyListFilter::default(),
@@ -5668,7 +5529,6 @@ async fn admin_list_orders_and_pages() {
         rows.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![id_of("d"), id_of("c"), id_of("b"), id_of("a")]
     );
-    // Latency: measured ascending, unmeasured last.
     let rows = list_filtered(
         &pool,
         &ProxyListFilter::default(),
@@ -5682,9 +5542,6 @@ async fn admin_list_orders_and_pages() {
         rows.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![id_of("b"), id_of("d"), id_of("a"), id_of("c")]
     );
-    // Name: case-insensitive ascending (the fixture names are mixed
-    // case, so a plain byte order would put "Gamma" and "Alpha" in the
-    // wrong places).
     let rows = list_filtered(
         &pool,
         &ProxyListFilter::default(),
@@ -5700,7 +5557,7 @@ async fn admin_list_orders_and_pages() {
     );
 
     // Keyset pagination: the second page resumes after the last row of
-    // the first one, so the two pages cover every row exactly once.
+    // the first one
     let first_page = list_page(&pool, ProxyListOrder::Updated, 2, None).await;
     let first_ids: Vec<i64> = first_page.iter().map(|r| r.id).collect();
     assert_eq!(first_ids, vec![id_of("d"), id_of("c")]);
@@ -5713,8 +5570,8 @@ async fn admin_list_orders_and_pages() {
     .await;
     let second_ids: Vec<i64> = second_page.iter().map(|r| r.id).collect();
     assert_eq!(second_ids, vec![id_of("b"), id_of("a")]);
-    // The two pages cover every row exactly once: a tied pair must not
-    // show up on both pages and must not be skipped between them.
+    // A tied pair must not show up on both pages or be skipped between
+    // them
     assert!(
         !first_ids.iter().any(|id| second_ids.contains(id)),
         "the pages overlap"
@@ -5725,8 +5582,6 @@ async fn admin_list_orders_and_pages() {
     every.sort_unstable();
     assert_eq!(all, every, "the pages leave a gap");
 
-    // The page before the first one is empty: past the end of the order
-    // there is nothing to walk back to.
     let rows = list_page_backward(
         &pool,
         ProxyListOrder::Updated,
@@ -5736,8 +5591,8 @@ async fn admin_list_orders_and_pages() {
     .await;
     assert!(rows.is_empty());
 
-    // The page before the second one is the first one again, and it comes
-    // out in the reading order even though it is fetched backwards.
+    // The page before the second one is the first one again, in reading
+    // order despite being fetched backwards
     let rows = list_page_backward(
         &pool,
         ProxyListOrder::Updated,
@@ -5814,11 +5669,10 @@ fn admin_list_param_parsing_refuses_garbage() {
     assert_eq!(ProxyListOrder::from_param("bogus"), ProxyListOrder::Updated);
 }
 
-/// The "unprobeable (tuic/mieru)" sub-line is rendered under the
-/// "Never checked yet" headline, which counts `status != 'removed'`.
-/// The cleanup button moves exactly these rows to `removed`, so
-/// counting them anyway made the sub-line outgrow the number it
-/// annotates: 0 never checked, 300 unprobeable.
+/// The "unprobeable (tuic/mieru)" sub-line is rendered under the "Never
+/// checked yet" headline, which counts `status != 'removed'`. The
+/// cleanup button moves exactly these rows to `removed`, so counting
+/// them anyway made the sub-line outgrow the number it annotates.
 #[tokio::test]
 async fn count_unprobeable_excludes_rows_the_cleanup_button_retired() {
     let (_dir, pool) = temp_pool().await;
@@ -5835,7 +5689,7 @@ async fn count_unprobeable_excludes_rows_the_cleanup_button_retired() {
         )
         .await;
     }
-    // A probeable scheme is never part of the sub-line.
+    // A probeable scheme is never part of the sub-line
     bulk_test_row(
         &pool,
         BulkRow {
@@ -5852,9 +5706,8 @@ async fn count_unprobeable_excludes_rows_the_cleanup_button_retired() {
 
     let retired = remove_unprobeable_unknown(&pool).await.unwrap();
     assert_eq!(retired, 5);
-    // The headline the sub-line sits under is read from the dashboard
-    // aggregate the panel renders, and the two counts are compared: the
-    // sub-line can no longer outgrow the number it annotates.
+    // The headline the sub-line sits under is compared against the
+    // dashboard aggregate the panel renders
     let never_checked = status_aggregates(&pool).await.unwrap().never_checked;
     assert_eq!(never_checked, 1, "only the vless row is left unchecked");
     assert_eq!(count_unprobeable(&pool).await.unwrap(), 0);
@@ -5910,7 +5763,7 @@ async fn quarantine_queue_orders_by_nearest_check() {
         },
     )
     .await;
-    // q2 is due first, then q3, then q1.
+    // q2 is due first, then q3, then q1
     sqlx::query("UPDATE proxies SET ladder_at = ? WHERE id = ?")
         .bind(now + 300)
         .bind(q1)
@@ -5938,15 +5791,14 @@ async fn quarantine_queue_orders_by_nearest_check() {
     assert!(!rows.iter().any(|r| r.id == alive));
 }
 
-/// The proxy card resolves source display names through the link
-/// table, newest seen first. (A link row itself cannot outlive its
-/// source (the FK cascades) but the LEFT JOIN keeps the card robust
-/// to a dangling name regardless.)
+/// The proxy card resolves source display names through the link table,
+/// newest seen first; the LEFT JOIN keeps the card robust to a dangling
+/// name even though a link row cannot outlive its source.
 #[tokio::test]
 async fn proxy_card_links_resolve_source_names() {
     let (_dir, pool) = temp_pool().await;
-    // Display names deliberately unlike the ids: a name assertion that
-    // cannot pass on the id alone.
+    // Display names deliberately unlike the ids, a name assertion that
+    // cannot pass on the id alone
     make_source_named(&pool, "srcA0000000", "Source A").await;
     make_source_named(&pool, "srcB0000000", "Source B").await;
     let id = bulk_test_row(
@@ -5969,8 +5821,6 @@ async fn proxy_card_links_resolve_source_names() {
 
     let rows = links_with_source_name(&pool, id).await.unwrap();
     assert_eq!(rows.len(), 2);
-    // Newest seen first, each carrying the display name of its source,
-    // with the id checked on its own.
     assert_eq!(rows[0].source_id, "srcB0000000");
     assert_eq!(rows[0].name.as_deref(), Some("Source B"));
     assert_eq!(rows[0].seen_at, 2);
@@ -6041,7 +5891,7 @@ async fn two_rows_that_describe_the_same_node_are_merged() {
     make_source(&pool, "srcMergeB").await;
 
     // Two keys under the old canonical form, one node under the new one:
-    // the Clash spelling `servername` and the URI spelling `sni`.
+    // the Clash spelling `servername` and the URI spelling `sni`
     let alive = insert_legacy_row(
         &pool,
         "old-alive",
@@ -6063,7 +5913,6 @@ async fn two_rows_that_describe_the_same_node_are_merged() {
     assert_eq!(stats.merged, 1);
     assert_eq!(stats.rewritten, 1);
 
-    // One row is left, and it is the one the probe had verified.
     let rows: Vec<ProxyRow> = sqlx::query_as("SELECT * FROM proxies")
         .fetch_all(&pool)
         .await
@@ -6073,7 +5922,6 @@ async fn two_rows_that_describe_the_same_node_are_merged() {
     assert_eq!(rows[0].status, "alive");
     assert_eq!(rows[0].fingerprint, canonical_key_of("a.example.com"));
 
-    // Both sources are still linked to the surviving row.
     let links: Vec<(String,)> = sqlx::query_as(
         "SELECT source_id FROM proxy_source_links WHERE proxy_id = ? ORDER BY source_id",
     )
@@ -6126,25 +5974,23 @@ async fn the_recompute_is_idempotent() {
 
     let first = refingerprint(&pool).await.unwrap();
     assert_eq!(first.rewritten, 1);
-    // A second pass finds every key already computed and changes nothing.
     let second = refingerprint(&pool).await.unwrap();
     assert_eq!(second.rewritten, 0);
     assert_eq!(second.merged, 0);
 }
 
-/// The state and the history of a node belong to the node, not to the row
-/// that happened to store them. A merge used to delete the journal of the
-/// dropped row with the row itself, so a node that was probed for months
-/// lost its history when the ingest created a second row for it — and a
-/// node the probe had retired lost its verdict with it.
+/// The state and the history of a node belong to the node, not to the
+/// row that happened to store them. A merge used to delete the journal
+/// of the dropped row with the row itself, so a probed node lost its
+/// history and a retired node lost its verdict.
 #[tokio::test]
 async fn a_merge_moves_the_state_and_the_history_of_the_node() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcMergeState").await;
     make_source(&pool, "srcMergeStateB").await;
 
-    // The old row: the node the probe had judged, with a latency, a
-    // failure count and a journal.
+    // The old row: the node the probe had judged, with latency, fail
+    // count and a journal
     let old = insert_legacy_row(
         &pool,
         "old-row",
@@ -6172,7 +6018,7 @@ async fn a_merge_moves_the_state_and_the_history_of_the_node() {
     .unwrap();
 
     // The row the ingest created after the upgrade: the same node under
-    // the new key, never checked.
+    // the new key, never checked
     let fresh = insert_legacy_row(
         &pool,
         &canonical_key_of("a.example.com"),
@@ -6191,15 +6037,15 @@ async fn a_merge_moves_the_state_and_the_history_of_the_node() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     let survivor = rows[0].id;
-    // The judged row survives: a fresh row that never got a verdict does
-    // not overrule the state the probe recorded.
+    // The judged row survives; a fresh row with no verdict does not
+    // overrule it
     assert_eq!(survivor, old);
     assert_ne!(survivor, fresh);
     assert_eq!(rows[0].status, "quarantine");
     assert_eq!(rows[0].latency_ms, Some(120));
     assert_eq!(rows[0].fail_count, 3);
 
-    // The journal moved with the node instead of being deleted.
+    // The journal moved with the node instead of being deleted
     let history: Vec<(i64, i64)> =
         sqlx::query_as("SELECT proxy_id, checked_at FROM probe_results ORDER BY checked_at")
             .fetch_all(&pool)
@@ -6207,7 +6053,6 @@ async fn a_merge_moves_the_state_and_the_history_of_the_node() {
             .unwrap();
     assert_eq!(history, vec![(survivor, 100)]);
 
-    // Both sources are linked to the surviving row.
     let links: Vec<(String,)> = sqlx::query_as(
         "SELECT source_id FROM proxy_source_links WHERE proxy_id = ? ORDER BY source_id",
     )
@@ -6224,11 +6069,10 @@ async fn a_merge_moves_the_state_and_the_history_of_the_node() {
     );
 }
 
-/// Two rows of one node carry one journal: the history of the node is the
-/// union of the two, and the state the surviving row lacks comes from the
-/// row that goes away. The two rows here are the two spellings of one
-/// node (the Clash `servername` and the URI `sni`), both written before
-/// the canonical form changed.
+/// Two rows of one node carry one journal: the history of the node is
+/// the union of the two, and the state the surviving row lacks comes
+/// from the row that goes away. The two rows here are the two spellings
+/// of one node (Clash `servername` and URI `sni`).
 #[tokio::test]
 async fn a_merge_fills_the_gaps_of_the_surviving_row() {
     let (_dir, pool) = temp_pool().await;
@@ -6257,7 +6101,7 @@ async fn a_merge_fills_the_gaps_of_the_surviving_row() {
     .unwrap();
 
     // The same node under the other spelling: no verdict, no latency, but
-    // a geo fact and a journal of its own.
+    // a geo fact and a journal of its own
     let other = insert_legacy_row(
         &pool,
         "old-other",
@@ -6290,12 +6134,11 @@ async fn a_merge_fills_the_gaps_of_the_surviving_row() {
     assert_eq!(rows.len(), 1);
     let survivor = rows[0].id;
     assert_eq!(survivor, alive);
-    // The latency of the survivor is its own, the geo fact of the dropped
-    // row fills the gap it left.
+    // The survivor keeps its own latency, the dropped row's geo fact
+    // fills the gap
     assert_eq!(rows[0].latency_ms, Some(120));
     assert_eq!(rows[0].geo_country.as_deref(), Some("DE"));
 
-    // Both journals belong to the node and end up on the survivor.
     let history: Vec<(i64, i64)> =
         sqlx::query_as("SELECT proxy_id, checked_at FROM probe_results ORDER BY checked_at")
             .fetch_all(&pool)
@@ -6308,7 +6151,6 @@ async fn a_merge_fills_the_gaps_of_the_surviving_row() {
 async fn a_row_the_ingest_already_recomputed_is_not_duplicated() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcIngest").await;
-    // The old row, still under its old key.
     let legacy = insert_legacy_row(
         &pool,
         "old-row",
@@ -6317,8 +6159,8 @@ async fn a_row_the_ingest_already_recomputed_is_not_duplicated() {
         "srcIngest",
     )
     .await;
-    // The row the ingest created after the upgrade, already under the new
-    // key: the same node, twice.
+    // The ingest-created row, already under the new key: the same node,
+    // twice
     let fresh = insert_legacy_row(
         &pool,
         &canonical_key_of("a.example.com"),
@@ -6335,7 +6177,7 @@ async fn a_row_the_ingest_already_recomputed_is_not_duplicated() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    // The verified row survives: the old row had no verdict of its own.
+    // The verified row survives: the old row had no verdict of its own
     assert_eq!(rows[0].id, fresh);
     assert_ne!(rows[0].id, legacy);
     assert_eq!(rows[0].status, "alive");
@@ -6354,8 +6196,7 @@ async fn the_version_marker_gates_the_recompute() {
     )
     .await;
 
-    // The rows carry no version yet: the recompute runs and the marker
-    // names the version they now carry.
+    // No version yet: the recompute runs and stamps the marker
     let stats = ensure_fingerprint_version(&pool).await.unwrap().unwrap();
     assert_eq!(stats.rewritten, 1);
     assert_eq!(
@@ -6366,10 +6207,8 @@ async fn the_version_marker_gates_the_recompute() {
         Some(crate::fingerprint::FINGERPRINT_VERSION)
     );
 
-    // The rows carry the current version now: the next start does no work.
     assert!(ensure_fingerprint_version(&pool).await.unwrap().is_none());
 
-    // Another version: the recompute runs again.
     crate::repo::meta_set(&pool, FINGERPRINT_VERSION_KEY, "fp1")
         .await
         .unwrap();

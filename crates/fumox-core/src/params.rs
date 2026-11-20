@@ -1,19 +1,14 @@
 //! Parameter semantics shared by the fingerprint, the output encoders and
-//! the pipeline filters.
+//! the pipeline filters. One node is spelled in several ways (URI `sni`/`fp`/
+//! `pbk`, Clash YAML `servername`/`client-fingerprint`/`reality-opts`,
+//! sing-box JSON its own names again), and every consumer must agree on which
+//! spelling wins and what the value means; where they did not, the
+//! deduplication key and the emitted document described different nodes
+//! (review WP-21).
 //!
-//! One node is spelled in several ways: the URI families use `sni`, `fp`
-//! and `pbk`, Clash YAML uses `servername`, `client-fingerprint` and a
-//! `reality-opts` block, sing-box JSON its own names again. Every consumer
-//! that reads a parameter has to agree on which spelling wins and what the
-//! value means; where they did not, the deduplication key and the emitted
-//! document described different nodes (review WP-21).
-//!
-//! [`canonical`] is the one reduction of an entry to a single form: the
-//! structured blocks expanded into the scalars they carry, the spellings
-//! folded onto one canonical key, the cosmetic names dropped and the
-//! values decoded. The fingerprint hashes that form and the encoders read
-//! the same spellings it folds, so the key describes the node the way the
-//! document is built.
+//! [`canonical`] is the one reduction of an entry to a single form: structured
+//! blocks expanded into scalars, spellings folded onto one canonical key,
+//! cosmetic names dropped, values decoded.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
@@ -22,20 +17,16 @@ use serde_norway::Mapping;
 
 use crate::models::{ProxyEntry, Scheme, is_falsy_toggle, is_truthy_toggle};
 
-/// Parameter value by case-insensitive key, empty values dropped.
-///
-/// URI feeds keep values percent-encoded, so the result is leniently
-/// decoded (valid `%XX` escapes resolve, garbage passes through); entries
-/// from vmess JSON / Clash YAML carry plain values that decode unchanged.
+/// Parameter value by case-insensitive key, empty values dropped, leniently
+/// percent-decoded (valid `%XX` escapes resolve, garbage passes through).
 pub fn value(entry: &ProxyEntry, key: &str) -> Option<String> {
     let value = entry.param_ignore_case(key)?.trim();
     (!value.is_empty()).then(|| crate::parsers::uri::percent_decode(value))
 }
 
 /// Whether the parameter is present with a truthy value (`1`/`true`/`yes`/
-/// `on`, case-insensitive), how Clash YAML booleans land in params. The
-/// vocabulary is the shared [`crate::models::is_truthy_toggle`], so the
-/// writers agree with the fingerprint and the forbid-insecure filter.
+/// `on`, case-insensitive), how Clash YAML booleans land in params; the
+/// shared vocabulary is [`crate::models::is_truthy_toggle`].
 pub fn truthy(entry: &ProxyEntry, key: &str) -> bool {
     entry.param_ignore_case(key).is_some_and(is_truthy_toggle)
 }
@@ -47,14 +38,11 @@ pub fn list(entry: &ProxyEntry, key: &str) -> Option<Vec<String>> {
     if raw.trim().is_empty() {
         return None;
     }
-    // Stored parameter values are feed-controlled and are re-parsed as YAML
-    // at serve time; refuse alias references first (quadratic memory
-    // amplification, see `parsers::reject_yaml_aliases`). A refused value
-    // falls through to the plain comma-split path, nothing else regresses.
-    //
-    // Only a value that starts with `[` can be a YAML sequence, so only
-    // that one is handed to the YAML parser: a plain scalar is split on
-    // commas instead of being parsed as YAML first.
+    // Stored parameter values are feed-controlled and re-parsed as YAML at
+    // serve time; refuse alias references first (quadratic memory
+    // amplification, see `parsers::reject_yaml_aliases`). Only a value that
+    // starts with `[` can be a YAML sequence, so only that one is handed to
+    // the YAML parser; a refused value falls through to the comma-split
     if raw.trim_start().starts_with('[')
         && crate::parsers::reject_yaml_aliases(&raw).is_ok()
         && let Ok(serde_norway::Value::Sequence(seq)) = serde_norway::from_str(&raw)
@@ -96,7 +84,7 @@ fn strings_of_scalar(raw: &str) -> Option<Vec<String>> {
 pub fn map(entry: &ProxyEntry, key: &str) -> Option<Mapping> {
     let raw = entry.param_ignore_case(key)?;
     // Same alias guard as `list`: the value is feed-controlled and
-    // re-parsed as YAML; on refusal the parameter keeps no mapping.
+    // re-parsed as YAML; on refusal the parameter keeps no mapping
     if crate::parsers::reject_yaml_aliases(raw.trim()).is_err() {
         return None;
     }
@@ -136,10 +124,8 @@ pub fn map_list(map: &Option<Mapping>, key: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The first string of a mapping field that is either a scalar or a
-/// sequence of strings.
-///
-/// The structured blocks spell a path as a scalar (`ws-opts.path`) or as a
+/// The first string of a mapping field that is either a scalar or a sequence
+/// of strings: the blocks spell a path as a scalar (`ws-opts.path`) or as a
 /// list (`http-opts.path`), and the writers have to read both.
 pub fn map_first(map: &Option<Mapping>, key: &str) -> Option<String> {
     let map = map.as_ref()?;
@@ -204,8 +190,8 @@ pub fn security_is(entry: &ProxyEntry, want: &str) -> bool {
 }
 
 /// The SNI under either spelling: the URI family's `sni` and the mihomo
-/// `servername` that Clash YAML carries. Reading only the first dropped
-/// the SNI of every Clash-sourced proxy.
+/// `servername` of Clash YAML (reading only the first dropped the SNI of
+/// every Clash-sourced proxy).
 pub fn sni(entry: &ProxyEntry) -> Option<String> {
     value(entry, "sni").or_else(|| value(entry, "servername"))
 }
@@ -216,22 +202,18 @@ pub fn fingerprint_hint(entry: &ProxyEntry) -> Option<String> {
     value(entry, "fp").or_else(|| value(entry, "client-fingerprint"))
 }
 
-/// Whether the entry's transport is wrapped in TLS.
-///
-/// One decision for every consumer: the Clash writer, the sing-box writer
-/// and the URI serializer all ask this question, and they used to answer
-/// it differently — a node carrying only an SNI got a TLS block from the
-/// sing-box writer and none from the Clash writer, and the two documents
-/// disagreed about the very same proxy.
+/// Whether the entry's transport is wrapped in TLS. One decision for every
+/// consumer (the Clash writer, the sing-box writer, the URI serializer); they
+/// used to answer it differently, and the two documents described the very
+/// same proxy differently.
 ///
 /// The rules, in order:
 ///
-/// 1. an explicit `tls` toggle is authoritative wherever it appears: the
-///    mihomo boolean (`tls: false`), the vmess string (`tls=tls`) and the
-///    URI spelling (`tls=1`) all mean "this proxy is/is not wrapped";
+/// 1. an explicit `tls` toggle is authoritative wherever it appears (the
+///    mihomo boolean, the vmess string `tls=tls`, the URI spelling `tls=1`);
 /// 2. `security=none` states that there is no TLS layer and outranks the
-///    heuristics below — an SNI or an insecure toggle left in the link
-///    must not turn a plaintext proxy into a TLS one;
+///    heuristics below: an SNI or an insecure toggle left in the link must
+///    not turn a plaintext proxy into a TLS one;
 /// 3. `security=tls`, `security=reality` and `security=xtls` state a TLS
 ///    layer;
 /// 4. an unknown, non-empty `security` on a vless/vmess node is a broken
@@ -291,14 +273,11 @@ pub struct Reality {
 }
 
 impl Reality {
-    /// Whether neither key is present.
     pub fn is_empty(&self) -> bool {
         self.public_key.is_none() && self.short_id.is_none()
     }
 }
 
-/// The REALITY keys of an entry, read from the URI parameters or from the
-/// structured block. The block is parsed once for the whole entry.
 pub fn reality(entry: &ProxyEntry, blocks: &Blocks) -> Reality {
     Reality {
         public_key: value(entry, "pbk")
@@ -307,12 +286,9 @@ pub fn reality(entry: &ProxyEntry, blocks: &Blocks) -> Reality {
     }
 }
 
-/// The structured blocks of one entry, parsed once.
-///
-/// The blocks are YAML text inside a parameter value, and every consumer
-/// that read one re-parsed it: the same `ws-opts` was parsed once per
-/// encoder and once per fingerprint, on feed-controlled text (review
-/// WP-21, L-041).
+/// The structured blocks of one entry, parsed once. The blocks are YAML text
+/// inside a parameter value, and every consumer that read one re-parsed it,
+/// on feed-controlled text (review WP-21, L-041).
 #[derive(Debug, Default, Clone)]
 pub struct Blocks {
     pub reality: Option<Mapping>,
@@ -325,7 +301,6 @@ pub struct Blocks {
 }
 
 impl Blocks {
-    /// Parse the structured blocks of an entry.
     pub fn of(entry: &ProxyEntry) -> Self {
         Self {
             reality: map(entry, "reality-opts"),
@@ -338,7 +313,6 @@ impl Blocks {
         }
     }
 
-    /// The parsed mapping of a block, by its parameter name.
     fn get(&self, name: &str) -> Option<&Mapping> {
         match name {
             "reality-opts" => self.reality.as_ref(),
@@ -353,12 +327,11 @@ impl Blocks {
     }
 }
 
-/// The structured blocks and the canonical key their fields map onto.
-///
-/// A field with a flat spelling is folded onto it, so the same node
-/// published as Clash YAML and as a URI shares one key. A field without
-/// one keeps its block-qualified name (`ws-opts.max-early-data`), so two
-/// nodes that differ in it do not collapse onto one another.
+/// The structured blocks and the canonical key their fields map onto. A field
+/// with a flat spelling is folded onto it, so the same node published as
+/// Clash YAML and as a URI shares one key; a field without one keeps its
+/// block-qualified name (`ws-opts.max-early-data`), so two nodes that differ
+/// in it do not collapse onto one another.
 const BLOCK_FIELDS: &[(&str, &[(&str, &str)])] = &[
     (
         "reality-opts",
@@ -378,17 +351,13 @@ const BLOCK_FIELDS: &[(&str, &[(&str, &str)])] = &[
     ("obfs-opts", &[("mode", "obfs"), ("host", "obfs-host")]),
 ];
 
-/// Parameters that carry no connection semantics: display names,
-/// advertising tags, bandwidth caps and timestamps.
-///
-/// The rule is a deny-list on purpose. An allow-list has to name every
-/// transport parameter a feed may use, and every one it missed merged two
-/// different nodes onto one deduplication key (review WP-21, M-052/M-053):
-/// two nodes differing only in their `grpc-mode` shared one row and the
-/// upsert silently overwrote one with the other.
+/// Parameters that carry no connection semantics: display names, advertising
+/// tags, bandwidth caps and timestamps. A deny-list on purpose: an allow-list
+/// has to name every transport parameter a feed may use, and every one it
+/// missed merged two different nodes onto one deduplication key (review
+/// WP-21, M-052/M-053).
 static COSMETIC_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
-        // display name and description
         "name",
         "remark",
         "remarks",
@@ -399,7 +368,6 @@ static COSMETIC_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "description",
         "title",
         "ps",
-        // grouping and advertising tags
         "group",
         "group-name",
         "provider",
@@ -412,7 +380,6 @@ static COSMETIC_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "channel",
         "telegram",
         "discord",
-        // bandwidth and traffic accounting
         "up",
         "down",
         "upmbps",
@@ -427,7 +394,6 @@ static COSMETIC_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "download",
         "used-traffic",
         "total-traffic",
-        // timestamps and expiry
         "t",
         "time",
         "timestamp",
@@ -443,23 +409,16 @@ static COSMETIC_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     ])
 });
 
-/// Whether a canonical key names a cosmetic parameter: one hash lookup on
-/// the key, no allocation.
 fn is_cosmetic(key: &str) -> bool {
     COSMETIC_PARAMS.contains(key)
 }
 
-/// Map a parameter key onto the spelling the canonical form is keyed by.
+/// Map a parameter key onto the spelling the canonical form is keyed by, so
+/// the same node advertised as Clash YAML and as a URI gets one fingerprint.
 ///
-/// Clash carries its own field names for fields every URI format spells the
-/// same way. Left alone, the same node advertised as Clash YAML and as a URI
-/// would get two different fingerprints and land in two rows, so the Clash
-/// spelling is rewritten to the URI one before the filter runs.
-///
-/// The transport is spelled per scheme: the vmess JSON and the sing-box native
-/// form both call it `net`, while vless, trojan and the rest call it `type`.
-/// Folding it onto one spelling for every scheme would split the vmess forms
-/// from each other, so the target key depends on the scheme.
+/// The transport is spelled per scheme: the vmess JSON and the sing-box
+/// native form call it `net`, the rest `type`, and folding it onto one
+/// spelling for every scheme would split the vmess forms from each other.
 pub fn canonical_key(scheme: Scheme, key: &str) -> &str {
     match key {
         "servername" => "sni",
@@ -469,14 +428,13 @@ pub fn canonical_key(scheme: Scheme, key: &str) -> &str {
         "client-fingerprint" => "fp",
         "grpc-service-name" => "servicename",
         // Clash's `fingerprint` is the certificate pin (`pinSHA256` in the
-        // URI), not the uTLS client hello: that one is `client-fingerprint`.
+        // URI), not the uTLS client hello: that one is `client-fingerprint`
         "fingerprint" => "pinsha256",
         // vmess JSON spells the cipher `scy` and the alter id `aid`; Clash
         // YAML calls them `cipher` and `alterId`. Without the folding the
-        // same node advertised as Clash YAML and as a vmess:// link lands
-        // in two rows, while two nodes differing only in the cipher
-        // collapse onto one. (Same aliasing as the URI translation in
-        // `parsers::translate_uri_param`.)
+        // same node advertised in both formats lands in two rows, while two
+        // nodes differing only in the cipher collapse onto one. (Same
+        // aliasing as `parsers::translate_uri_param`.)
         "cipher" if scheme == Scheme::Vmess => "scy",
         "alterid" if scheme == Scheme::Vmess => "aid",
         other => other,
@@ -494,12 +452,8 @@ fn transport_key(scheme: Scheme) -> &'static str {
 }
 
 /// The spellings that fold onto one canonical key, in the order the output
-/// encoders read them.
-///
-/// The first spelling present wins, so the canonical form describes the
-/// node the way the emitted document is built: a `sni` beats a
-/// `servername`, a `pbk` beats the `public-key` of a `reality-opts`
-/// block.
+/// encoders read them: the first spelling present wins, so the canonical
+/// form describes the node the way the emitted document is built.
 fn source_rank(key: &str, source: &str) -> u32 {
     let order: &[&str] = match key {
         "sni" => &["sni", "servername"],
@@ -526,18 +480,15 @@ fn source_rank(key: &str, source: &str) -> u32 {
     };
     match order.iter().position(|candidate| *candidate == source) {
         Some(index) => index as u32,
-        // A key without a table of its own is spelled by itself.
+        // A key without a table of its own is spelled by itself
         None if order.is_empty() => u32::from(source != key),
         None => u32::MAX,
     }
 }
 
-/// The canonical connection parameters of an entry: one value per
-/// canonical key, decoded, with the structured blocks expanded into the
-/// scalars they carry and the cosmetic names dropped.
-///
-/// The order of the result is the sorted key order, so it does not depend
-/// on the order the parameters were parsed in.
+/// The canonical connection parameters of an entry: one value per canonical
+/// key, decoded, structured blocks expanded into scalars, cosmetic names
+/// dropped. Sorted key order, independent of parse order.
 pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
     let blocks = Blocks::of(entry);
     let mut candidates: Vec<(String, String, String)> = Vec::new();
@@ -545,16 +496,15 @@ pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
     let transport = transport_key(entry.scheme);
     for param in &entry.params {
         let source = param.key.to_ascii_lowercase();
-        // A structured block that parsed is represented by its expansion;
-        // the raw YAML text would only add the block's own spelling to the
-        // key. A block that did not parse stays in the pre-image as it
-        // is, so two nodes differing in it do not collapse.
+        // A structured block that parsed is represented by its expansion; one
+        // that did not parse stays in the pre-image as it is, so two nodes
+        // differing in it do not collapse
         if BLOCK_FIELDS.iter().any(|(block, _)| *block == source) && blocks.get(&source).is_some() {
             continue;
         }
         let key = canonical_key(entry.scheme, &source);
         // The transport parameter is replaced by its canonical name below:
-        // the network it names depends on the other transport parameters.
+        // the network it names depends on the other transport parameters
         if key == transport {
             continue;
         }
@@ -563,12 +513,10 @@ pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
         }
     }
 
-    // The structured blocks carry the same settings as the flat
-    // parameters; expanding them lets a node published as Clash YAML and
-    // the same node published as a URI share one key.
+    // Expanding the blocks lets a node published as Clash YAML and the same
+    // node published as a URI share one key
     expand_blocks(&blocks, &mut candidates);
 
-    // The transport: the network name every format agrees on.
     if let Some(network) = raw_network(entry, entry.scheme)
         && let Some((canonical_network, extra)) = canonical_transport(entry, &network)
     {
@@ -584,7 +532,7 @@ pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
 
     // One value per canonical key: the spelling the encoders read first
     // wins, and a spelling repeated with different values keeps the first
-    // occurrence, the way the stored parameters keep it.
+    // occurrence, the way the stored parameters keep it
     let mut chosen: BTreeMap<String, (u32, String, usize, String)> = BTreeMap::new();
     for (order, (key, source, value)) in candidates.iter().enumerate() {
         let rank = source_rank(key, source);
@@ -605,12 +553,10 @@ pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The canonical value of a scalar parameter, or `None` when the parameter
-/// is cosmetic or carries no value.
-///
-/// The certificate-verification toggles collapse onto one flag: a falsy
-/// toggle is the same as no toggle at all, and the truthy ones spell the
-/// same thing. The same holds for the `tls` switch.
+/// The canonical value of a scalar parameter, or `None` when the parameter is
+/// cosmetic or carries no value. The certificate-verification toggles
+/// collapse onto one flag: a falsy toggle is the same as no toggle at all.
+/// The same holds for the `tls` switch.
 fn scalar_value(scheme: Scheme, key: &str, raw: &str) -> Option<(String, String)> {
     let lower = key.to_ascii_lowercase();
     if crate::models::INSECURE_ALIASES.contains(&lower.as_str()) {
@@ -625,9 +571,8 @@ fn scalar_value(scheme: Scheme, key: &str, raw: &str) -> Option<(String, String)
             return None;
         }
     }
-    // The vmess dialect marker: the format version, not a connection
-    // setting. It is the same in every feed, and it would split the
-    // vmess JSON form of a node from its Clash form.
+    // The vmess dialect marker: the format version, not a connection setting
+    // It would split the vmess JSON form of a node from its Clash form
     if scheme == Scheme::Vmess && lower == "v" {
         return None;
     }
@@ -653,12 +598,10 @@ fn raw_network(entry: &ProxyEntry, scheme: Scheme) -> Option<String> {
 }
 
 /// The canonical transport of an entry: the network name the Clash writer
-/// emits, plus the httpupgrade flag it carries.
-///
-/// The mapping follows the Clash writer, because it is the one that tells
-/// the two Xray transports apart: `type=http` is HTTP/2 while
-/// `type=tcp&headerType=http` is the plain-HTTP header obfuscation, and
-/// both are spelled `http` in the URI family.
+/// emits, plus the httpupgrade flag it carries. The mapping follows the
+/// Clash writer, the one that tells the two Xray transports apart:
+/// `type=http` is HTTP/2 while `type=tcp&headerType=http` is the plain-HTTP
+/// header obfuscation, and both are spelled `http` in the URI family.
 fn canonical_transport(
     entry: &ProxyEntry,
     network: &str,
@@ -668,8 +611,7 @@ fn canonical_transport(
             && value(entry, "type").is_some_and(|v| v.eq_ignore_ascii_case("http")));
     let canonical = match network {
         // `httpupgrade` is a WebSocket with the HTTP upgrade header: the
-        // Clash writer emits it as `network: ws` plus the flag, so the
-        // canonical form is the same pair.
+        // Clash writer emits it as `network: ws` plus the flag
         "httpupgrade" => {
             return Some((
                 "ws".to_string(),
@@ -684,7 +626,6 @@ fn canonical_transport(
     Some((canonical.to_string(), None))
 }
 
-/// Expand the structured blocks into the scalars they carry.
 fn expand_blocks(blocks: &Blocks, candidates: &mut Vec<(String, String, String)>) {
     for (block, fields) in BLOCK_FIELDS {
         let Some(mapping) = blocks.get(block) else {
@@ -704,11 +645,8 @@ fn expand_blocks(blocks: &Blocks, candidates: &mut Vec<(String, String, String)>
     }
 }
 
-/// Expand one field of a structured block into canonical candidates.
-///
-/// `canonical` is the flat key the field maps onto, `source` names where
-/// the value came from (`ws-opts.headers.host`) and `value` is the raw
-/// YAML value.
+/// `canonical` is the flat key the field maps onto, `source` names where the
+/// value came from (`ws-opts.headers.host`), `value` is the raw YAML value.
 fn expand_field(
     canonical: Option<&str>,
     source: &str,
@@ -724,7 +662,7 @@ fn expand_field(
                 };
                 let child_source = format!("{source}.{key}");
                 // The `Host` header of a transport block is the canonical
-                // `host`; every other header keeps its qualified name.
+                // `host`; every other header keeps its qualified name
                 let child_canonical =
                     if source.ends_with(".headers") && key.eq_ignore_ascii_case("host") {
                         Some("host")
@@ -758,7 +696,6 @@ fn expand_field(
     }
 }
 
-/// The text of a YAML scalar.
 fn scalar_text(value: &serde_norway::Value) -> String {
     match value {
         serde_norway::Value::String(s) => s.trim().to_string(),
@@ -793,13 +730,13 @@ mod tests {
 
     #[test]
     fn an_explicit_tls_toggle_outranks_the_heuristics() {
-        // The mihomo boolean.
+        // The mihomo boolean
         let off = entry(Scheme::Vless, &[("tls", "false"), ("sni", "s.example.com")]);
         assert!(!wants_tls(&off, &Blocks::of(&off)));
-        // The vmess string spelling.
+        // The vmess string spelling
         let on = entry(Scheme::Vmess, &[("tls", "tls")]);
         assert!(wants_tls(&on, &Blocks::of(&on)));
-        // `security=none` states that there is no TLS layer.
+        // `security=none` states that there is no TLS layer
         let none = entry(
             Scheme::Vless,
             &[
@@ -809,7 +746,7 @@ mod tests {
             ],
         );
         assert!(!wants_tls(&none, &Blocks::of(&none)));
-        // An SNI on its own implies TLS.
+        // An SNI on its own implies TLS
         let sni = entry(Scheme::Vless, &[("sni", "s.example.com")]);
         assert!(wants_tls(&sni, &Blocks::of(&sni)));
     }
@@ -825,7 +762,6 @@ mod tests {
         );
         assert!(wants_tls(&blocked, &Blocks::of(&blocked)));
         assert!(is_reality(&blocked, &Blocks::of(&blocked)));
-        // A plain node is neither.
         let plain = entry(Scheme::Vless, &[]);
         assert!(!wants_tls(&plain, &Blocks::of(&plain)));
         assert!(!is_reality(&plain, &Blocks::of(&plain)));
@@ -878,19 +814,19 @@ mod tests {
 
     #[test]
     fn the_transport_is_spelled_the_way_the_writers_emit_it() {
-        // Xray's HTTP/2 spelling.
+        // Xray's HTTP/2 spelling
         let h2 = entry(Scheme::Vless, &[("type", "http")]);
         assert_eq!(
             canonical_map(&h2).get("type").map(String::as_str),
             Some("h2")
         );
-        // The plain-HTTP header obfuscation.
+        // The plain-HTTP header obfuscation
         let http = entry(Scheme::Vless, &[("type", "tcp"), ("headertype", "http")]);
         assert_eq!(
             canonical_map(&http).get("type").map(String::as_str),
             Some("http")
         );
-        // The mihomo spelling of the same HTTP/2 transport.
+        // The mihomo spelling of the same HTTP/2 transport
         let clash = entry(Scheme::Vless, &[("network", "h2")]);
         assert_eq!(canonical_map(&h2), canonical_map(&clash));
     }
@@ -907,9 +843,6 @@ mod tests {
         );
     }
 
-    /// The Clash spelling `ws-path` folds onto the URI `path`
-    /// ([`canonical_key`]), so the same node advertised once as Clash YAML
-    /// and once as a URI deduplicates together.
     #[test]
     fn a_clash_ws_path_and_a_uri_path_share_one_fingerprint() {
         let yaml = concat!(
@@ -931,8 +864,6 @@ mod tests {
         );
     }
 
-    /// The Clash spelling `grpc-service-name` folds onto the URI
-    /// `servicename` ([`canonical_key`]) the same way.
     #[test]
     fn a_clash_grpc_service_name_and_a_uri_servicename_share_one_fingerprint() {
         let yaml = concat!(
@@ -955,9 +886,7 @@ mod tests {
     }
 
     /// The fold must not erase the value: two nodes differing only in a
-    /// Clash-spelled field are different nodes, and the upsert would
-    /// silently overwrite one with the other if they collapsed onto one
-    /// key.
+    /// Clash-spelled field are different nodes.
     #[test]
     fn two_clash_nodes_differing_only_in_a_folded_field_do_not_collapse() {
         let yaml = concat!(

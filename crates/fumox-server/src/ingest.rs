@@ -1,19 +1,14 @@
 //! Source ingestion: fetch → decode → parse → reconcile → journal.
 //!
-//! One [`ingest_source`] call refreshes a single source end to end and
-//! records the outcome in `fetch_log` and on the source row itself
-//! (`last_fetched_at` / `last_error` / `error_class`).
-//!
-//! Parse failures are soft: HTTP 200 with unrecognizable content is
-//! classified `parse_error`, including the "zero recognized
-//! lines" case, and never panics.
+//! One [`ingest_source`] call refreshes one source end to end and journals
+//! the outcome in `fetch_log` and on the source row. Parse failures are
+//! soft: HTTP 200 with unrecognizable content is a soft `parse_error`
+//! (including zero recognized lines), never a panic.
 //!
 //! Reconciliation keeps alive-linger links for sources without `drop`
-//! rules: a probe-verified proxy missing from the feed stays
-//! linked until the probe itself retires it. A source that *does* carry
-//! drop rules behaves differently: with `[ingest].drop_gate` on (the
-//! default) its rules detach the proxies they would have discarded, so a
-//! rule added later cannot be held off by still-alive rows.
+//! rules: only the probe retires a proxy. With `[ingest].drop_gate` on
+//! (the default) a source's own drop rules detach the proxies they would
+//! discard, so a rule added later cannot be held off by still-alive rows.
 
 use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
 use crate::pipeline::{CompiledPipeline, PipelineIssue, asn_number};
@@ -27,19 +22,15 @@ use fumox_core::repo::{fetch_log, probe, proxies, sources};
 pub enum IngestOutcome {
     /// Fetched and reconciled successfully.
     Ok {
-        /// The proxies stored from this payload: what the journal and the
-        /// admin panel report as `proxies_found`.
+        /// Proxies stored from this payload; what the journal and admin
+        /// panel report as `proxies_found`.
         proxies_found: usize,
-        /// The proxies the source's own filters discarded (protocol
-        /// allowlist and pipeline `drop` rules). Together with
-        /// `proxies_found` this is the recognized count: found = dropped +
-        /// kept.
+        /// Proxies the source's own filters discarded (protocol allowlist
+        /// and pipeline `drop` rules): found = dropped + kept.
         dropped: usize,
         stats: proxies::ReconciliationStats,
-        /// Wall-clock duration of the fetch attempt in milliseconds,
-        /// retries and their backoff included; `None` when no fetch
-        /// happened at all (the freshness short-circuit answered from the
-        /// source row).
+        /// Fetch duration in ms, retries and backoff included; `None` when
+        /// the freshness short-circuit answered from the source row.
         duration_ms: Option<i64>,
     },
     /// The fetch failed with a classified error (already journaled).
@@ -76,32 +67,30 @@ pub struct IngestSettings {
     /// rules would discard a proxy must not keep it linked.
     pub drop_gate: bool,
     /// `[ingest].removed_as_unknown`: whether a `removed` proxy the feed
-    /// still carries is revived to `unknown` (via `proxies::revive_removed`)
+    /// still carries is revived to `unknown` via `proxies::revive_removed`
     /// and re-enters the probe cycle.
     pub removed_as_unknown: bool,
 }
 
 /// Fetch, parse and reconcile one source; journal the result.
 ///
-/// With `force = false` a `last_fetched_at` on the source row younger than
-/// the source TTL short-circuits the HTTP fetch: the database is already
-/// reconciled from that payload, so the row itself is the freshness marker.
-/// Forced refreshes (the admin *Refresh now* button) always hit the network.
+/// With `force = false` a `last_fetched_at` younger than the source TTL
+/// short-circuits the HTTP fetch: the database is already reconciled from
+/// that payload, so the row itself is the freshness marker. Forced
+/// refreshes (the admin *Refresh now* button) always hit the network.
 ///
-/// Geo facts are resolved per proxy host while the raw payload is already
-/// parsed (the resolver caches both DNS and lookups) and persisted onto the
-/// `proxies.geo_*` columns during reconciliation, so the admin panel's
-/// country filter and geo card work without waiting for a subscription
-/// render.
+/// Geo facts are resolved per proxy host while the payload is parsed (the
+/// resolver caches DNS and lookups) and persisted onto `proxies.geo_*`
+/// during reconciliation, so the admin country filter works without
+/// waiting for a subscription render.
 ///
 /// Freshly inserted proxies are enqueued for priority probing (up to
-/// `settings.refresh_check_limit`): the probe drains the queue
-/// at the start of its next cycle, newest first, so new servers get
-/// verified instead of waiting out the random sample.
+/// `settings.refresh_check_limit`): the probe drains the queue at the
+/// start of its next cycle, newest first.
 ///
 /// Rendered outputs are invalidated by the *callers* (the scheduler drops
-/// the processed entries whose sources changed, see the outcome's
-/// `stats`), so this function takes no cache handle.
+/// the processed entries whose sources changed), so this function takes
+/// no cache handle.
 pub async fn ingest_source(
     pool: &DbPool,
     fetcher: &Fetcher,
@@ -112,13 +101,9 @@ pub async fn ingest_source(
 ) -> IngestOutcome {
     let now = fumox_core::models::now_ts();
 
-    // The freshness check reads the source row the caller loaded (the
-    // scheduler re-reads every sweep, the admin *Refresh now* passes
-    // `force`): no in-memory marker of our own to keep in step with the DB
-    // stamp that `journal_success` writes. An unset or expired stamp means
-    // the payload must be fetched; the comparison is the same
-    // [`source_is_fresh`] predicate the scheduler's due check asks, this
-    // being the second, row-fresh guard.
+    // Freshness is judged on the caller-loaded row (the scheduler re-reads
+    // every sweep; the admin *Refresh now* passes `force`), via the same
+    // [`source_is_fresh`] predicate the scheduler's due check asks
     if !force && source_is_fresh(now, source.last_fetched_at, source.cache_ttl_seconds) {
         tracing::debug!(source = %source.id, "raw snapshot still fresh; skipping fetch");
         return IngestOutcome::Ok {
@@ -129,10 +114,8 @@ pub async fn ingest_source(
         };
     }
 
-    // The two halves of the pass journal their own verdicts where they
-    // happen: a failed fetch (the `Err` below) is already the final
-    // outcome, the stored payload is reconciled and journaled in the
-    // second half.
+    // Each half journals its own verdict; a failed fetch is already the
+    // final outcome
     let (fetched, duration_ms) = match fetch_and_journal(pool, fetcher, geo, source, now).await {
         Ok(fetched) => fetched,
         Err(outcome) => return outcome,
@@ -140,19 +123,15 @@ pub async fn ingest_source(
     reconcile_and_journal(pool, fetched, settings, source, now, duration_ms).await
 }
 
-/// The fetch half of [`ingest_source`]: the measured fetch → decode →
-/// parse pass ([`fetch_and_filter`]) with its failure verdicts already
-/// journaled to `fetch_log` and the source row. `Ok` carries the payload
-/// and its measured duration to the reconcile half; `Err` is the final
-/// [`IngestOutcome`], there is nothing left to do.
+/// The fetch half of [`ingest_source`]: failure verdicts are already
+/// journaled to `fetch_log` and the source row; `Ok` carries the payload
+/// and duration to the reconcile half, `Err` is the final
+/// [`IngestOutcome`].
 ///
-/// The fetch clock starts at the request and stops at the verdict,
-/// retries and their backoff included: one `fetch` call can legitimately
-/// stretch far past a minute ([fetch].max_retries × capped backoff),
-/// holds a concurrency permit the whole time, and without a measurement a
-/// slow upstream is indistinguishable from a fast one. Journaled into
-/// `fetch_log.duration_ms` and carried on the outcome for the caller's
-/// logs and events.
+/// The clock covers retries and backoff: one `fetch` call can stretch far
+/// past a minute ([fetch].max_retries × capped backoff) while holding a
+/// concurrency permit, and without the measurement a slow upstream is
+/// indistinguishable from a fast one.
 async fn fetch_and_journal(
     pool: &DbPool,
     fetcher: &Fetcher,
@@ -184,8 +163,8 @@ async fn fetch_and_journal(
 }
 
 /// The reconcile half of [`ingest_source`]: store the payload's proxies,
-/// journal the verdict and hand the pass's inserts (and, with
-/// `[ingest].removed_as_unknown`, the revived rows) to the priority probe
+/// journal the verdict, hand inserts (and, with
+/// `[ingest].removed_as_unknown`, revived rows) to the priority probe
 /// queue.
 async fn reconcile_and_journal(
     pool: &DbPool,
@@ -195,18 +174,15 @@ async fn reconcile_and_journal(
     now: i64,
     duration_ms: i64,
 ) -> IngestOutcome {
-    // `last_fetched_at` is a *freshness* stamp, not a download log: it
-    // stands for "the database is already reconciled from this payload"
-    // (the TTL short-circuit in [`ingest_source`] reads it). It is
-    // therefore written only once the payload has parsed and reconciled
-    // (`journal_success` runs after the reconcile): stamping it before
-    // that made a single parse or DB failure suppress every non-forced
-    // re-fetch for a whole TTL while the scheduler kept reporting
-    // successful ingests.
+    // `last_fetched_at` is a freshness stamp ("the database is already
+    // reconciled from this payload"), read by the TTL short-circuit, so it
+    // is written only after the payload parsed and reconciled: stamping it
+    // earlier let one parse or DB failure suppress every non-forced
+    // re-fetch for a whole TTL
     let payload = &fetched.payload;
     let found = fetched.kept.len();
-    // Alive-linger. `[ingest].drop_gate` decides whether a source's drop
-    // rules disable it, see [`fumox_core::ingest::IngestPolicy`].
+    // `[ingest].drop_gate` decides whether a source's drop rules disable
+    // alive-linger, see [`fumox_core::ingest::IngestPolicy`]
     let policy =
         fumox_core::ingest::IngestPolicy::refresh(settings.drop_gate, fetched.has_drop_rules);
     match proxies::reconcile_source(
@@ -220,10 +196,6 @@ async fn reconcile_and_journal(
     .await
     {
         Ok(stats) => {
-            // The database is now the content of this payload, so
-            // `journal_success` stamps `last_fetched_at`, the freshness
-            // marker the TTL short-circuit checks before the next
-            // re-fetch.
             journal_success(pool, source, payload, found, now, duration_ms).await;
             if fetched.dropped > 0 {
                 tracing::info!(
@@ -252,12 +224,9 @@ async fn reconcile_and_journal(
             }
         }
         Err(err) => {
-            // The payload was fetched and parsed, but this
-            // process could not store it. That is not an upstream
-            // failure: the feed answered with HTTP 200, and
-            // reporting it as a fetch error would send the
-            // operator looking at the wrong side. It gets its own
-            // error class and the real status of the response.
+            // Not an upstream failure: the feed answered HTTP 200, so a
+            // fetch error would send the operator to the wrong side. Own
+            // error class, real response status
             let message = err.to_string();
             tracing::error!(error = %err, source = %source.id, "reconciliation failed");
             journal_storage_failure(pool, source, payload, &message, now, duration_ms).await;
@@ -269,11 +238,9 @@ async fn reconcile_and_journal(
     }
 }
 
-/// The ids one reconciled pass hands to the priority probe queue: the
-/// fresh inserts plus — with `[ingest].removed_as_unknown` on — the
-/// `removed` rows the feed carries again, revived first so they re-enter
-/// the probe cycle like a fresh insert. A revival failure is logged and
-/// never fails the ingest, the next refresh simply retries.
+/// Ids one reconciled pass hands to the priority probe queue: fresh
+/// inserts plus, with `[ingest].removed_as_unknown` on, revived `removed`
+/// rows. A revival failure is logged and never fails the ingest.
 async fn collect_queue_ids(
     pool: &DbPool,
     fetched: &FetchedAndFiltered,
@@ -306,9 +273,9 @@ fn elapsed_ms(started: std::time::Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
-/// Result of an admin dry-run fetch: everything a real
-/// ingestion does up to parsing, same SSRF vetting, same decode/parse ,
-/// but nothing is reconciled or journaled.
+/// Result of an admin dry-run fetch: everything a real ingestion does up
+/// to parsing (same SSRF vetting, same decode/parse), nothing reconciled
+/// or journaled.
 #[derive(Debug)]
 pub enum DryRunOutcome {
     /// Fetched and parsed successfully.
@@ -316,7 +283,7 @@ pub enum DryRunOutcome {
         http_status: u16,
         bytes: u64,
         proxies_found: usize,
-        /// How many recognized proxies the source's own filters threw away
+        /// Recognized proxies the source's own filters threw away
         /// (protocol allowlist, pipeline `drop` rules).
         dropped: usize,
         /// First few recognized lines for the preview.
@@ -330,10 +297,9 @@ pub enum DryRunOutcome {
 
 /// Fetch and parse a source without touching the database (dry run).
 ///
-/// The pipeline runs through the same [`fetch_and_filter`] the real ingest
-/// uses, so the preview's counters are the real pass's counters by
-/// construction; the two paths differ only in what happens after —
-/// journaling and reconcile versus a preview sample.
+/// Runs the same [`fetch_and_filter`] as the real ingest, so the preview's
+/// counters are the real pass's counters by construction; the paths differ
+/// only after parse (journaling and reconcile versus a preview sample).
 pub async fn dry_run_source(
     fetcher: &Fetcher,
     geo: &GeoResolver,
@@ -372,39 +338,35 @@ pub async fn dry_run_source(
     }
 }
 
-/// Whether a source row's freshness stamp (`last_fetched_at`) still covers
-/// `now` under the source's TTL. The one freshness question both the
-/// scheduler's due check and the ingest's fetch short-circuit ask, kept in
-/// a single function so the two answers can never drift apart.
+/// Whether the source's freshness stamp (`last_fetched_at`) still covers
+/// `now` under its TTL: the one freshness predicate for both the
+/// scheduler's due check and the ingest's fetch short-circuit, kept in one
+/// function so the answers cannot drift.
 pub(crate) fn source_is_fresh(now: i64, last_fetched_at: Option<i64>, ttl_seconds: i64) -> bool {
     last_fetched_at.is_some_and(|fetched_at| now.saturating_sub(fetched_at) < ttl_seconds)
 }
 
-/// Everything a real ingest and a dry run do identically: the fetch, the
-/// decode/parse, the geo resolution over the whole payload and the drop
-/// rules. Both callers branch on the same outcome and differ only in what
-/// they do next — journaling and reconcile versus a preview sample — so
-/// their kept/dropped counters and recognized counts cannot drift apart.
+/// Everything a real ingest and a dry run do identically, so their kept /
+/// dropped / recognized counters cannot drift apart.
 struct FetchedAndFiltered {
     payload: FetchedPayload,
-    /// Recognised count before any filter (for logging / dry-run totals).
+    /// Recognised count before any filter (logging / dry-run totals).
     recognized: usize,
-    /// Whether the source's pipeline carries drop rules at all: gates the
+    /// Whether the source's pipeline carries drop rules: gates the
     /// alive-linger policy.
     has_drop_rules: bool,
-    /// The entries that survived the protocol allowlist and the drop
-    /// rules, and the stamps that belong to exactly those entries (same
-    /// length, same order — reconcile pairs the two by index).
+    /// Entries that survived allowlist and drop rules, with the stamps
+    /// belonging to exactly those entries (same length and order;
+    /// reconcile pairs the two by index).
     kept: Vec<ProxyEntry>,
     kept_geo: Vec<Option<proxies::GeoStamp>>,
-    /// What the source's own filters discarded (protocol allowlist and
-    /// pipeline drop rules together): recognized = dropped + kept.len().
+    /// What the source's own filters discarded: recognized = dropped +
+    /// kept.len().
     dropped: usize,
 }
 
-/// Why [`fetch_and_filter`] gave up: the fetch failed with a classified
-/// error, or the payload did not parse (the payload comes along so the
-/// caller journals the real status and size of the response).
+/// Why [`fetch_and_filter`] gave up. The payload comes along on a parse
+/// failure so the caller journals the real response status and size.
 enum FetchAndFilterError {
     Fetch(FetchFailure),
     Parse {
@@ -414,10 +376,9 @@ enum FetchAndFilterError {
 }
 
 /// The shared fetch → decode → parse → geo → drop-rules pass behind
-/// [`ingest_source`] and [`dry_run_source`]. Geo resolution covers the
-/// whole payload in both paths: drop rules may target ASNs anywhere in the
-/// feed, so a truncated preview would count differently from the pass it
-/// previews.
+/// [`ingest_source`] and [`dry_run_source`]. Geo covers the whole payload
+/// in both paths: drop rules may target ASNs anywhere in the feed, so a
+/// truncated preview would count differently.
 async fn fetch_and_filter(
     fetcher: &Fetcher,
     geo: &GeoResolver,
@@ -437,8 +398,8 @@ async fn fetch_and_filter(
             message,
         })?;
     // Drop rules (including ASN-targeted ones) run after geo resolution,
-    // see [`apply_drop_rules`]. The resolver is async-and-cached so the
-    // lookups cost at most one round-trip per unseen host.
+    // see [`apply_drop_rules`]; the resolver is cached so lookups cost at
+    // most one round-trip per unseen host
     let geo_stamps = resolve_geo_stamps(geo, &filtered.entries, None).await;
     let has_drop_rules = filtered.has_drop_rules();
     let (kept, kept_geo, _) = apply_drop_rules(
@@ -447,9 +408,8 @@ async fn fetch_and_filter(
         &geo_stamps,
         &source.id,
     );
-    // The protocol allowlist threw away part of the payload before the
-    // drop rules ran, and the rules threw away more. Both belong to the
-    // report: recognized = dropped + kept holds in both paths.
+    // Allowlist and drop rules both discard: recognized = dropped + kept
+    // holds in both paths
     let dropped = filtered.recognized.saturating_sub(kept.len());
     Ok(FetchedAndFiltered {
         payload,
@@ -461,11 +421,11 @@ async fn fetch_and_filter(
     })
 }
 
-/// Priority-check handoff: enqueue up to `limit` of the pass's
-/// newly inserted (and, with `[ingest].removed_as_unknown`, revived)
-/// proxies (repo-side filtering keeps only T1-probeable
-/// `unknown` rows). A failure is logged and never fails the ingest, the
-/// random sample covers those proxies anyway.
+/// Enqueue up to `limit` of the pass's inserted (or, with
+/// `[ingest].removed_as_unknown`, revived) proxies for priority probing;
+/// repo-side filtering keeps only T1-probeable `unknown` rows. A failure
+/// is logged and never fails the ingest (the random sample covers those
+/// proxies anyway).
 async fn enqueue_probe_requests(pool: &DbPool, source_id: &str, ids: &[i64], limit: u32, now: i64) {
     if limit == 0 || ids.is_empty() {
         return;
@@ -493,36 +453,30 @@ async fn enqueue_probe_requests(pool: &DbPool, source_id: &str, ids: &[i64], lim
     }
 }
 
-/// Hard cap on the unique hosts one pass resolves. A feed with thousands
-/// of distinct hosts would otherwise cost thousands of DNS round-trips
-/// per pass; the hosts beyond the cap keep the geo facts already stored.
+/// Hard cap on unique hosts resolved per pass; hosts beyond it keep their
+/// stored geo facts instead of costing thousands of DNS round-trips.
 const GEO_HOST_BUDGET: usize = 256;
 
-/// Wall-clock ceiling for the geo batch of one pass. Every unseen host
-/// can cost up to `[geo].dns_timeout`, so the batch is bounded in time
-/// as well as in size: on expiry the pass continues with "keep what is
-/// stored" instead of blocking the ingest.
+/// Wall-clock ceiling for the geo batch (each unseen host can cost up to
+/// `[geo].dns_timeout`); on expiry the pass continues with the stored
+/// facts instead of blocking the ingest.
 const GEO_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Resolve geo facts for the parsed entries; the returned vector stays
 /// index-aligned with `entries`. With an inactive resolver (geo disabled
 /// or database missing) every stamp is `None`, which the upsert treats as
-/// "keep what is stored". The one [`GeoResolver`] call it makes goes
-/// through the shared [`HostGeo`] seam (implemented once in
+/// "keep what is stored".
+///
+/// Lookups go through the shared [`HostGeo`] seam (implemented once in
 /// `fumox_core::geo`, also used by the serving pipeline), so the lookup
-/// *shape* (concurrent, capped, input-ordered) is observable without a
-/// MaxMind database and a slow DNS server on the test machine: the test
-/// drives [`resolve_geo_stamps`] itself, not a copy of its loop.
+/// *shape* (concurrent, capped, input-ordered) is observable in tests
+/// without a MaxMind database and a slow DNS server. The batch is bounded
+/// in size (unique hosts only, at most [`GEO_HOST_BUDGET`]) and in time
+/// ([`GEO_PASS_TIMEOUT`]); both bounds end the same way, entries without
+/// facts keeping what the database already stores.
 ///
-/// The pass is bounded twice over: only the unique hosts are looked up
-/// (a feed repeats the same host many times over) and at most
-/// [`GEO_HOST_BUDGET`] of them, and the whole batch is wrapped in
-/// [`GEO_PASS_TIMEOUT`]. Both bounds end the same way — the entries
-/// without facts keep what the database already stores — so a feed full
-/// of dead hosts slows the pass down but never breaks it.
-///
-/// `limit` restricts the lookup to the first records of the pass (the
-/// dry run passes one); the records beyond it keep "no facts".
+/// `limit` restricts the lookup to the first records of the pass (the dry
+/// run passes one).
 async fn resolve_geo_stamps<G: HostGeo>(
     geo: &G,
     entries: &[ProxyEntry],
@@ -552,7 +506,7 @@ async fn resolve_geo_stamps<G: HostGeo>(
     use futures_util::StreamExt;
     // `buffered` (not `buffer_unordered`) keeps the input order, which the
     // drop rules and the reconcile upsert both rely on, while holding at
-    // most `GEO_LOOKUP_CONCURRENCY` lookups in flight.
+    // most `GEO_LOOKUP_CONCURRENCY` lookups in flight
     let lookups = hosts
         .iter()
         .map(|host| geo.resolve_host(host))
@@ -587,30 +541,26 @@ async fn resolve_geo_stamps<G: HostGeo>(
         .collect()
 }
 
-/// What [`parse_payload`] produced: the entries that survived the
-/// protocol allowlist, the total recognised before any filtering and the
-/// source's compiled pipeline.
-///
-/// Drop rules do not run inside `parse_payload`, they need a resolved
-/// ASN stamp per entry, which only exists after [`resolve_geo_stamps`].
-/// The caller runs the drop step explicitly once the geo stamps are
-/// ready; this struct carries the pre-drop entries plus the pipeline,
-/// compiled once here and reused for the drop step (a second compile
-/// would re-run every regex build for nothing).
+/// What [`parse_payload`] produced: pre-drop entries, the total
+/// recognised before any filter and the source's compiled pipeline. Drop
+/// rules do not run inside `parse_payload` (they need resolved ASN
+/// stamps from [`resolve_geo_stamps`]), so the caller runs the drop step
+/// once the stamps are ready; the pipeline is compiled once here and
+/// reused there.
 #[derive(Debug)]
 struct FilteredPayload {
     entries: Vec<ProxyEntry>,
-    /// Recognised count before any filter (for logging / dry-run totals).
+    /// Recognised count before any filter (logging / dry-run totals).
     recognized: usize,
-    /// The source's compiled pipeline, `None` when it has none. Gates the
+    /// The source's compiled pipeline, `None` when it has none: gates the
     /// alive-linger policy (a source with drop rules must not keep links
     /// its rules would have discarded) and carries the drop rules.
     pipeline: Option<CompiledPipeline>,
 }
 
 impl FilteredPayload {
-    /// Whether the source's pipeline carries drop rules at all: gates the
-    /// alive-linger policy.
+    /// Whether the source's pipeline carries drop rules (gates the
+    /// alive-linger policy).
     fn has_drop_rules(&self) -> bool {
         self.pipeline
             .as_ref()
@@ -618,11 +568,10 @@ impl FilteredPayload {
     }
 }
 
-/// Decode + parse the raw payload according to the source settings.
-/// Returns the recognised entries that survived the protocol allowlist
-/// (and pipeline compile-validation, which fails closed), or an error
-/// message for `parse_error`. Drop rules are NOT evaluated here, see
-/// [`apply_drop_rules`] for that step.
+/// Decode + parse the raw payload per the source settings; returns the
+/// recognised entries that survived the protocol allowlist (pipeline
+/// compile-validation fails closed) or a `parse_error` message. Drop
+/// rules are not evaluated here, see [`apply_drop_rules`].
 fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPayload, String> {
     let text = std::str::from_utf8(&payload.body)
         .map_err(|e| format!("payload is not valid UTF-8: {e}"))?;
@@ -630,11 +579,8 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     let parsed = fumox_core::parsers::parse_subscription(text, encoding, source.input_format)
         .map_err(|e| e.to_string())?;
     if parsed.entries.is_empty() {
-        // HTTP 200 with zero recognized lines is parse_error. The message
-        // spells the parser's counts out in the operator's terms — how
-        // many lines matched nothing, how many recognized entries were
-        // dropped, how many structured entries were skipped — instead of
-        // internal field names.
+        // HTTP 200 with zero recognized lines is parse_error; the message
+        // uses the operator's terms, not internal field names
         return Err(format!(
             "no proxies recognized: {} lines matched no supported format, \
              {} duplicates discarded, {} clash entries skipped — check the \
@@ -643,7 +589,6 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
         ));
     }
     let recognized = parsed.entries.len();
-    // Optional per-source protocol allowlist.
     let entries = match &source.protocols {
         Some(allowed) => parsed
             .entries
@@ -652,11 +597,10 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
             .collect(),
         None => parsed.entries,
     };
-    // The pipeline is compiled exactly once, here: the compiled value
-    // rides along in [`FilteredPayload`] for the drop step. Only the
-    // source's own pipeline participates in ingestion, profiles may
-    // override the section on serving, but they never take part here
-    // (one source feeds many profiles).
+    // Compiled once here and carried in [`FilteredPayload`] for the drop
+    // step. Only the source's own pipeline participates in ingestion;
+    // profiles may override it on serving but never here (one source
+    // feeds many profiles)
     let pipeline = match &source.pipeline {
         None => None,
         Some(value) => match CompiledPipeline::from_json(Some(value)) {
@@ -679,11 +623,10 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     })
 }
 
-/// Render pipeline validation issues in their technical debug form for the
-/// ingest error message. Not localized (unlike the admin form, which maps
-/// the same catalog keys through `Lang::t_args`), but naming every issue
-/// the compiler found: `last_error` is the only trace a hand-edited row
-/// leaves.
+/// Pipeline validation issues in technical debug form for the ingest
+/// error message; not localized (the admin form maps the same catalog
+/// keys through `Lang::t_args`). `last_error` is the only trace a
+/// hand-edited row leaves.
 fn pipeline_issues_text(issues: &[PipelineIssue]) -> String {
     issues
         .iter()
@@ -698,19 +641,16 @@ fn pipeline_issues_text(issues: &[PipelineIssue]) -> String {
         .join("; ")
 }
 
-/// What a drop-rule pass hands back: the surviving entries, the stamps that
-/// belong to exactly those entries (same length, same order, reconcile
-/// pairs the two by index), and how many entries were discarded.
+/// A drop-rule pass's result: surviving entries, their index-aligned
+/// stamps (reconcile pairs the two by index), and how many were
+/// discarded.
 type DropOutcome = (Vec<ProxyEntry>, Vec<Option<proxies::GeoStamp>>, usize);
 
-/// Run the source's compiled drop rules against the entries paired with
-/// their resolved ASN stamps. Returns the surviving entries, the stamps
-/// that belong to exactly those entries, and how many were discarded. The
-/// pipeline arrives already compiled (`parse_payload` validated it and
-/// fails closed there), so this step cannot fail.
-///
-/// The stamp ASNs parse exactly once here — the boundary between the
-/// stored `AS{n}` column and the drop pass, which compares plain numbers.
+/// Run the source's compiled drop rules against entries paired with their
+/// resolved ASN stamps. The pipeline arrives compiled (`parse_payload`
+/// validated it), so this step cannot fail. Stamp ASNs parse exactly once
+/// here, the boundary between the stored `AS{n}` column and the plain
+/// numbers the drop pass compares.
 fn apply_drop_rules(
     pipeline: Option<&CompiledPipeline>,
     entries: Vec<ProxyEntry>,
@@ -812,11 +752,9 @@ async fn journal_failure(
     }
 }
 
-/// Journal a payload that could not be stored.
-///
-/// The response was fine (its real status is written, not a substituted
-/// 500) and the error class says the failure was this process's: an
-/// operator reading `storage` looks at the database, not at the feed.
+/// Journal a payload that could not be stored: the real response status
+/// is written (not a substituted 500) and the `storage` class points the
+/// operator at the database, not at the feed.
 async fn journal_storage_failure(
     pool: &DbPool,
     source: &Source,
@@ -923,12 +861,11 @@ mod tests {
         }
     }
 
-    /// A `Fetcher` pointed at a one-shot local HTTP server, plus the
+    /// A `Fetcher` pointed at a one-shot local HTTP server plus the
     /// database one `ingest_source` call needs. The private-IP policy is
-    /// switched off so the loopback test server is reachable. The counter
-    /// tracks how many requests reached the upstream. The first tuple
-    /// element owns the scratch directory: it removes itself on drop, so
-    /// a test cannot leave its database behind.
+    /// off so the loopback server is reachable; the counter tracks
+    /// upstream requests; the first tuple element owns the scratch
+    /// directory and removes itself on drop.
     async fn ingest_env(
         body: &'static str,
     ) -> (
@@ -941,11 +878,9 @@ mod tests {
         ingest_env_with_bodies(vec![body]).await
     }
 
-    /// The same, but the upstream answers with a different body per
-    /// request: the first request gets `bodies[0]`, the second `bodies[1]`,
-    /// and a request beyond the list gets the last body again. A second
-    /// ingest of the same source needs a second, different feed. The
-    /// upstream itself is the shared `test_support::one_shot_upstream`.
+    /// The same, but each request gets the next body in `bodies` (the
+    /// last one repeats): a second ingest of the same source needs a
+    /// second, different feed.
     async fn ingest_env_with_bodies(
         bodies: Vec<&'static str>,
     ) -> (
@@ -985,7 +920,6 @@ mod tests {
         }
     }
 
-    /// The same settings with the alive-linger gate at the given position.
     fn settings_with_drop_gate(drop_gate: bool) -> IngestSettings {
         IngestSettings {
             drop_gate,
@@ -1000,10 +934,9 @@ mod tests {
         }))
     }
 
-    /// The freshness stamp (`last_fetched_at`) is the marker for the *next*
-    /// pass, so it may only be written once the payload has been parsed and
-    /// reconciled. Stamping it before that let one parse error suppress
-    /// every non-forced re-fetch for a whole TTL.
+    /// The freshness stamp is the marker for the next pass, so a failed
+    /// parse must not write it (that once suppressed every non-forced
+    /// re-fetch for a whole TTL).
     #[tokio::test]
     async fn a_parse_failure_leaves_no_freshness_stamp() {
         let (_dir, pool, fetcher, source, _requests) =
@@ -1019,10 +952,9 @@ mod tests {
         );
     }
 
-    /// The converse: a reconciled payload is what the DB now holds, so its
-    /// `last_fetched_at` stamp is exactly what the freshness short-circuit
-    /// may trust: the next non-forced pass skips the HTTP fetch entirely,
-    /// while a forced one always hits the network.
+    /// The converse: a reconciled payload stamps `last_fetched_at`, the
+    /// next non-forced pass skips the fetch, a forced one always hits the
+    /// network.
     #[tokio::test]
     async fn a_reconciled_payload_stamps_freshness_and_skips_the_next_fetch() {
         let (_dir, pool, fetcher, source, requests) =
@@ -1039,8 +971,7 @@ mod tests {
         );
 
         // The next pass reads the stamp from a freshly loaded row, as the
-        // scheduler does every sweep: still younger than the TTL, so no
-        // fetch goes out and nothing is reconciled.
+        // scheduler does every sweep
         let outcome = ingest_source(
             &pool,
             &fetcher,
@@ -1066,8 +997,6 @@ mod tests {
             "a fresh stamp must skip the HTTP fetch"
         );
 
-        // A forced refresh (the admin *Refresh now* button) bypasses the
-        // stamp and hits the network.
         let outcome =
             ingest_source(&pool, &fetcher, &inactive_geo(), settings(), &stamped, true).await;
         assert!(matches!(outcome, IngestOutcome::Ok { .. }));
@@ -1078,12 +1007,10 @@ mod tests {
         );
     }
 
-    /// The measured fetch duration is journaled and carried on the
-    /// outcome: a real fetch records `Some(ms)` in `fetch_log.duration_ms`
-    /// and on the `Ok` outcome, the freshness short-circuit measures
-    /// nothing (`None`) and writes no journal row at all. Without the
-    /// measurement a slow upstream (or a long retry-backoff chain) is
-    /// indistinguishable from a fast one.
+    /// A real fetch records `Some(ms)` on the outcome and in
+    /// `fetch_log.duration_ms`; the freshness short-circuit measures
+    /// nothing and writes no journal row. Without the measurement a slow
+    /// upstream is indistinguishable from a fast one.
     #[tokio::test]
     async fn fetch_duration_is_journaled_and_carried_in_the_outcome() {
         let (_dir, pool, fetcher, source, requests) =
@@ -1111,7 +1038,6 @@ mod tests {
             "the journaled row carries the measured duration"
         );
 
-        // The short-circuit pass measures nothing and journals nothing.
         let stamped = sources::get(&pool, &source.id).await.unwrap().unwrap();
         let outcome = ingest_source(
             &pool,
@@ -1143,17 +1069,13 @@ mod tests {
         );
     }
 
-    /// Geo lookups run concurrently, capped: a feed of dead hosts must not
-    /// cost one `dns_timeout` per entry, and the results must stay aligned
-    /// with the input order the drop rules and the upsert rely on.
-    ///
-    /// Driven through [`resolve_geo_stamps`] itself: the assertions are
-    /// about how the production function drives the resolver, so reverting
-    /// it to a sequential `for entry in entries { geo.resolve(...).await }`
-    /// loop fails the peak-concurrency assertion.
+    /// Geo lookups run concurrently and capped, and the results stay
+    /// aligned with the input order the drop rules and the upsert rely on.
+    /// Driven through [`resolve_geo_stamps`] itself, so reverting it to a
+    /// sequential loop fails the peak-concurrency assertion.
     #[tokio::test]
     async fn geo_lookups_are_concurrent_capped_and_keep_input_order() {
-        // More entries than the cap, so the cap is genuinely engaged.
+        // More entries than the concurrency cap, so the cap is engaged
         const ENTRIES: usize = 40;
         let entries: Vec<ProxyEntry> = (0..ENTRIES)
             .map(|i| ProxyEntry {
@@ -1177,7 +1099,7 @@ mod tests {
         };
         let stamps = resolve_geo_stamps(&geo, &entries, None).await;
 
-        // Order: the stamp for entry i still carries entry i's host.
+        // Order: the stamp for entry i still carries entry i's host
         assert_eq!(stamps.len(), ENTRIES);
         for (stamp, entry) in stamps.iter().zip(&entries) {
             assert_eq!(
@@ -1199,15 +1121,10 @@ mod tests {
         );
     }
 
-    /// A stand-in resolver that counts how many lookups are in flight at
-    /// once. Each lookup takes long enough for the others to be polled
-    /// meanwhile, and answers with the host it was asked about so the
-    /// ordering assertion has something to read back.
-    ///
-    /// The counter moves inside the returned future, on its first poll:
-    /// building a future starts no work, exactly as `GeoResolver::resolve`
-    /// does, so the count reflects lookups actually running and not the
-    /// ones `resolve_geo_stamps` merely created.
+    /// Counts lookups in flight and answers with the host it was asked
+    /// about, so the ordering assertion can read it back. The counter
+    /// moves on the future's first poll, not at construction, matching
+    /// `GeoResolver::resolve`.
     struct CountingGeo {
         in_flight: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
@@ -1282,8 +1199,8 @@ mod tests {
         }
     }
 
-    /// The per-pass budget starts with the unique hosts: a feed that lists
-    /// the same host over and over costs one lookup, not one per line.
+    /// A feed that repeats the same host costs one lookup, not one per
+    /// line.
     #[tokio::test]
     async fn only_the_unique_hosts_of_a_pass_are_looked_up() {
         let entries: Vec<ProxyEntry> = (0..10)
@@ -1307,9 +1224,9 @@ mod tests {
         }
     }
 
-    /// The budget is hard: a feed with thousands of distinct hosts cannot
-    /// fan out into thousands of DNS round-trips. The hosts beyond the
-    /// budget keep the facts already stored (no stamp).
+    /// Hosts beyond the budget keep their stored facts; a feed with
+    /// thousands of distinct hosts cannot fan out into thousands of DNS
+    /// round-trips.
     #[tokio::test]
     async fn the_host_budget_of_a_pass_is_capped() {
         let entries: Vec<ProxyEntry> = (0..GEO_HOST_BUDGET + 10)
@@ -1371,7 +1288,7 @@ mod tests {
     }
 
     /// A payload that cannot be stored is not an upstream failure: the
-    /// journal keeps the real status of the response and the error class
+    /// journal keeps the real response status and the `storage` class
     /// points the operator at the database, not at the feed.
     #[tokio::test]
     async fn a_storage_failure_is_journaled_as_a_storage_error() {
@@ -1448,7 +1365,7 @@ mod tests {
         let err = parse_payload(&source, &payload("hello world\nno proxies here\n")).unwrap_err();
         assert!(err.contains("no proxies recognized"));
         // The counts are spelled out in the operator's terms, not as
-        // internal field names.
+        // internal field names
         assert!(
             err.contains("2 lines matched no supported format"),
             "the unrecognized count must be explained: {err}"
@@ -1471,7 +1388,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].scheme, fumox_core::models::Scheme::Trojan);
 
-        // Allowlist that matches nothing is also a parse_error.
+        // Allowlist that matches nothing is also a parse_error
         source.protocols = Some(vec![fumox_core::models::Scheme::Ss]);
         assert!(parse_payload(&source, &payload(body)).is_err());
     }
@@ -1490,9 +1407,8 @@ mod tests {
 
     #[test]
     fn pipeline_drop_rules_filter_entries_before_storage() {
-        // Drop rules now run after geo resolution, the parsing stage only
-        // reports `has_drop_rules`. The full path goes through
-        // `apply_drop_rules` with a parallel (all-None) geo stamp slice.
+        // Drop rules run after geo resolution; the full path goes through
+        // `apply_drop_rules` with an all-None geo stamp slice
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -1515,11 +1431,9 @@ mod tests {
 
     #[test]
     fn pipeline_drop_of_everything_is_a_parse_error_not_a_silent_zero() {
-        // A pipeline that matches every entry is reported as
-        // `dropped == recognised` (and zero entries reach the DB), not as
-        // a soft parse error. The dry-run surfaces the count; the real
-        // ingest simply reconciles nothing. This keeps the parser free of
-        // heuristics about what an admin meant by `.*`.
+        // A pipeline matching every entry is `dropped == recognised` with
+        // zero entries stored, not a soft parse error, keeping the parser
+        // free of heuristics about what an admin meant by `.*`
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -1538,13 +1452,10 @@ mod tests {
         assert_eq!(dropped, filtered.recognized);
     }
 
-    /// Regression: a drop rule shortens the entry list, and the geo stamps
-    /// must be shortened with it. Returning the survivors alone made
-    /// `reconcile_source` pair entry *n* with the stamp of entry *n-1* (or
-    /// worse, from the start of the feed), so a proxy was stored carrying
-    /// another host's country and ASN, and one IP could end up stamped
-    /// with several different AS numbers. Every surviving entry must keep
-    /// the stamp its own host resolved to.
+    /// Regression: a drop rule shortens the entry list and the geo stamps
+    /// must shorten with it. Returning the survivors alone made
+    /// `reconcile_source` pair entry *n* with the stamp of entry *n-1*, so
+    /// a proxy was stored carrying another host's country and ASN.
     #[test]
     fn drop_rules_keep_every_surviving_entry_paired_with_its_own_geo_stamp() {
         let mut source = source_with(Encoding::Auto, None);
@@ -1581,7 +1492,7 @@ mod tests {
             "stamps and entries must stay index-aligned for reconcile"
         );
         // keep-a is entry 1 and must keep AS200, not the AS100 of the
-        // dropped entry that preceded it.
+        // dropped entry that preceded it
         assert_eq!(kept[0].host, "2.2.2.2");
         assert_eq!(
             kept_geo[0].as_ref().and_then(|s| s.asn.as_deref()),
@@ -1597,10 +1508,9 @@ mod tests {
 
     #[test]
     fn corrupted_pipeline_config_fails_closed() {
-        // Cannot happen through the admin forms (save-time validation), but
-        // a hand-edited row must not let its proxies slip past the rules.
-        // The message carries the compiler's issues, so `last_error` and
-        // the dry-run response say what exactly failed validation.
+        // Cannot happen through the admin forms (save-time validation),
+        // but a hand-edited row must fail closed; the message carries the
+        // compiler's issues so `last_error` says what failed validation
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({ "version": 2 }));
         let body = "vless://uuid@1.2.3.4:443#A\n";
@@ -1618,7 +1528,6 @@ mod tests {
 
     #[test]
     fn no_pipeline_section_means_no_drop() {
-        // A pipeline without a `drop` section changes nothing at ingestion.
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -1627,17 +1536,14 @@ mod tests {
         let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
         let entries = parse_payload(&source, &payload(body)).unwrap().entries;
         assert_eq!(entries.len(), 2);
-        // Rename is serving-side only, the stored entries keep their names.
+        // Rename is serving-side only, the stored entries keep their names
         assert_eq!(entries[0].name, "A");
     }
 
     #[test]
     fn drop_rules_gate_off_the_alive_linger() {
-        // `[ingest].drop_gate` decides the linger, the drop section of the
-        // source's pipeline decides whether it applies: with the gate on
-        // (the default) a source with drop rules lets them detach live
-        // proxies, with the gate off everyone lingers and only the probe
-        // retires a proxy.
+        // `[ingest].drop_gate` decides the linger; the source's own drop
+        // section decides whether it applies
         use fumox_core::ingest::IngestPolicy;
         assert!(
             !IngestPolicy::refresh(true, true).keep_alive_linger(),
@@ -1656,9 +1562,8 @@ mod tests {
             "no drop rules: linger"
         );
 
-        // The gate follows the source's own drop section: an empty drop
-        // section (it resets a profile override, not the source's own
-        // linger) does not switch it off…
+        // An empty drop section (it resets a profile override) does not
+        // switch the gate off…
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -1670,8 +1575,7 @@ mod tests {
                 .has_drop_rules()
         );
 
-        // …a drop section that matches nothing still does (the rules are
-        // there, they simply did not fire this time)…
+        // …a drop section that matches nothing still does…
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "drop": [{ "match": "^zzz-nonexistent$" }]
@@ -1682,7 +1586,7 @@ mod tests {
                 .has_drop_rules()
         );
 
-        // …and neither a pipeline without drop nor no pipeline at all does.
+        // …and neither a pipeline without drop nor no pipeline at all does
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "rename": [{ "match": "a", "replace": "b" }]
@@ -1701,21 +1605,18 @@ mod tests {
     }
 
     /// The two ingests the alive-linger gate is about: the first feed
-    /// carries the proxy, the second one does not any more. Returns the
-    /// proxy's status and the number of its source links afterwards.
-    ///
-    /// The link of the first pass is aged before the second pass: the
-    /// reconcile judges staleness with `seen_at < now` and both passes run
-    /// inside the same wall-clock second, which would leave the link
-    /// looking fresh.
+    /// carries the proxy, the second does not. Returns the proxy's status
+    /// and source-link count afterwards. The first pass's link is aged in
+    /// between: the reconcile judges staleness with `seen_at < now` and
+    /// both passes run inside the same wall-clock second.
     async fn vanished_proxy_after_two_ingests(drop_gate: bool) -> (String, usize) {
         let (_dir, pool, fetcher, mut source, _requests) = ingest_env_with_bodies(vec![
             "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n",
             "vless://22222222-2222-2222-2222-222222222222@5.6.7.8:443#B\n",
         ])
         .await;
-        // The source carries a drop rule that matches nothing: the rules
-        // are there (the gate applies), they simply do not fire.
+        // A drop rule that matches nothing: the gate applies, the rules
+        // do not fire
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "drop": [{ "match": "^zzz-nonexistent$", "target": "name" }]
@@ -1741,8 +1642,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The second pass is forced: the first one stamped the source row
-        // as fresh, and the admin *Refresh now* bypasses that stamp.
+        // The second pass is forced: the first stamped the source fresh
         let second = ingest_source(&pool, &fetcher, &inactive_geo(), settings, &source, true).await;
         assert!(matches!(second, IngestOutcome::Ok { .. }), "got {second:?}");
 
@@ -1751,9 +1651,9 @@ mod tests {
         (row.status, links)
     }
 
-    /// The gate, end to end through the ingest path: with the gate on and
-    /// a source that carries drop rules, a proxy that left the feed is
-    /// detached from the source and retired by the same pass.
+    /// End to end through the ingest path: with the gate on, a proxy that
+    /// left the feed is detached from the source and retired by the same
+    /// pass.
     #[tokio::test]
     async fn a_vanished_proxy_is_detached_and_retired_with_the_gate_on() {
         let (status, links) = vanished_proxy_after_two_ingests(true).await;
@@ -1768,9 +1668,8 @@ mod tests {
     }
 
     /// The other half of the same gate: with the gate off, only the probe
-    /// retires a proxy. One that vanished from the feed keeps its link and
-    /// its `unknown` status, so the upstream's churn cannot end a node
-    /// that has not failed.
+    /// retires a proxy, so upstream churn cannot end a node that has not
+    /// failed.
     #[tokio::test]
     async fn a_vanished_proxy_lingers_with_the_gate_off() {
         let (status, links) = vanished_proxy_after_two_ingests(false).await;
@@ -1785,9 +1684,9 @@ mod tests {
     }
 
     /// `[ingest].removed_as_unknown`: a proxy the feed dropped (and the
-    /// drop gate retired) comes back to the pristine `unknown` state on
-    /// the refresh whose feed carries it again, and re-enters the priority
-    /// probe queue like a fresh insert.
+    /// drop gate retired) comes back to `unknown` on the refresh whose
+    /// feed carries it again, and re-enters the priority probe queue like
+    /// a fresh insert.
     #[tokio::test]
     async fn a_removed_proxy_the_feed_carries_again_is_revived_and_queued() {
         let (_dir, pool, fetcher, mut source, _requests) = ingest_env_with_bodies(vec![
@@ -1796,8 +1695,8 @@ mod tests {
             "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n",
         ])
         .await;
-        // A drop rule that matches nothing: the rules are there (the gate
-        // applies), they simply do not fire on any feed content.
+        // A drop rule that matches nothing: the gate applies, the rules
+        // do not fire on any feed content
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "drop": [{ "match": "^zzz-nonexistent$", "target": "name" }]
@@ -1805,7 +1704,7 @@ mod tests {
         sources::update_settings(&pool, &source).await.unwrap();
 
         // First pass stores the proxy; the second (a feed without it,
-        // forced past the freshness stamp) detaches and retires it.
+        // forced past the freshness stamp) detaches and retires it
         let gate_on = settings_with_drop_gate(true);
         let first = ingest_source(&pool, &fetcher, &inactive_geo(), gate_on, &source, false).await;
         assert!(matches!(first, IngestOutcome::Ok { .. }), "got {first:?}");
@@ -1826,18 +1725,17 @@ mod tests {
         );
 
         // The feed carries the proxy again: with removed_as_unknown the
-        // same refresh revives it and hands it to the priority queue.
+        // same refresh revives it and hands it to the priority queue
         let reviving = IngestSettings {
             refresh_check_limit: 5,
             removed_as_unknown: true,
             ..settings()
         };
-        // The links are aged before this pass, exactly as
-        // `vanished_proxy_after_two_ingests` does: all three passes run
-        // inside one wall-clock second, and the reconcile's
-        // strictly-increasing link stamp would otherwise sit ahead of
-        // `now`, making this pass's own fresh link look stale to the
-        // linger sweep — and a link-less row cannot be revived.
+        // Links aged before this pass as in
+        // `vanished_proxy_after_two_ingests`: all passes run in one
+        // wall-clock second, so the strictly-increasing link stamp would
+        // sit ahead of `now`, making this pass's fresh link look stale
+        // (and a link-less row cannot be revived)
         sqlx::query("UPDATE proxy_source_links SET seen_at = seen_at - 5")
             .execute(&pool)
             .await
@@ -1862,8 +1760,8 @@ mod tests {
     }
 
     /// `[ingest].refresh_check_limit`: at most that many newly inserted
-    /// unknown proxies per refresh reach the priority probe queue, and the
-    /// ids that do are exactly the pass's inserts.
+    /// unknown proxies reach the priority queue, and only the pass's own
+    /// inserts do.
     #[tokio::test]
     async fn the_priority_queue_takes_at_most_refresh_check_limit_ids() {
         let (_dir, pool, fetcher, source, _requests) = ingest_env(

@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Session cookie name.
 pub const SESSION_COOKIE: &str = "fumox_session";
 
 /// Upper bound for buffered POST bodies (CSRF inspection) and the
@@ -75,20 +74,15 @@ const SESSION_EPOCH_KEY: &str = "admin_session_epoch";
 /// The current session-revocation epoch, persisted in `meta`. Session
 /// cookies are MACed over this value ([`epoch_session_key`]), so bumping
 /// it invalidates every cookie minted before the bump without touching
-/// `[admin].token`. 0 until the first bump (nothing has been revoked yet).
+/// `[admin].token`. 0 until the first bump.
 ///
-/// Read on every session check instead of cached per process: one indexed
-/// SELECT on the tiny `meta` table is noise next to a panel request, and a
-/// per-process cache would go stale against the source of truth the moment
-/// anything but this process writes the row.
-///
-/// A read error is an error, not a zero. Zero is the epoch of a world
-/// before the first bump: a cookie minted back then would verify again,
-/// which is exactly what the epoch exists to prevent. A value that is not
-/// a number is the same case: the row was written by something else and
-/// its meaning is unknown. The caller rejects the request instead — the
-/// panel is unusable with the database down anyway, and a session must not
-/// outlive a revocation.
+/// Read per session check instead of cached: one indexed SELECT on the
+/// tiny `meta` table is noise, and a per-process cache would go stale the
+/// moment anything but this process writes the row. A read error is an
+/// error, not a zero: zero is the pre-bump epoch a cookie minted back then
+/// would verify under, exactly what the epoch exists to prevent. The
+/// caller rejects the request instead; the panel is unusable with the
+/// database down anyway, and a session must not outlive a revocation.
 async fn session_epoch(pool: &fumox_core::db::DbPool) -> Result<u64, fumox_core::Error> {
     match fumox_core::repo::meta_get(pool, SESSION_EPOCH_KEY).await {
         Ok(Some(value)) => value.trim().parse::<u64>().map_err(|err| {
@@ -102,14 +96,12 @@ async fn session_epoch(pool: &fumox_core::db::DbPool) -> Result<u64, fumox_core:
 }
 
 /// Bump the session-revocation epoch in `meta`: every cookie minted before
-/// this call stops verifying. Called on logout and when the settings
-/// screen rotates `[admin].token`. A rotation already changes the
-/// effective key (it is derived from the live token), but the epoch is
-/// what ends the sessions of the other browsers as well, and what a
-/// logout can do without touching the credential. Returns `false` when
-/// the bump could not be persisted (database error); the caller then
-/// still clears the cookie, but a copy of it keeps working until the TTL
-/// or the next successful bump.
+/// this call stops verifying. Called on logout and when the settings screen
+/// rotates `[admin].token` (the rotation already changes the effective key,
+/// but the epoch ends the sessions of the other browsers too, and is what a
+/// logout can do without touching the credential). Returns `false` when the
+/// bump could not be persisted; the caller still clears the cookie, but a
+/// copy of it keeps working until the TTL or the next successful bump.
 pub(crate) async fn revoke_all_sessions(pool: &fumox_core::db::DbPool) -> bool {
     match fumox_core::repo::meta_increment(pool, SESSION_EPOCH_KEY).await {
         Ok(_) => true,
@@ -160,16 +152,14 @@ pub fn issue_session(key: &[u8; 32], ttl: Duration, epoch: u64) -> String {
 /// Two formats are accepted:
 ///
 /// * `v2.{expires}.{mac}` — the current one, issued by this build.
-/// * `{expires}.{mac}` — the previous build's format, accepted during the
-///   transition so the upgrade does not cost the operator a re-login. Its
-///   MAC covers the epoch-mixed key exactly like the current one, so it is
-///   no weaker; only the version tag and the covered message differ.
+/// * `{expires}.{mac}` — the previous build's format, accepted through the
+///   upgrade transition. Its MAC covers the epoch-mixed key exactly like
+///   the current one, so it is no weaker.
 ///
-/// The pre-epoch format (a MAC over the bare session key, before the
-/// revocation epoch existed) is not accepted: it matches no epoch, and
-/// honoring it would hand a copied cookie back the lifetime the epoch
-/// exists to cut short. It never shipped in a published image, so no
-/// upgrade pays for that rejection.
+/// The pre-epoch format (a MAC over the bare session key) is not accepted:
+/// it matches no epoch, and honoring it would hand a copied cookie back
+/// the lifetime the epoch exists to cut short. It never shipped in a
+/// published image, so no upgrade pays for that rejection.
 pub fn verify_session(key: &[u8; 32], value: &str, epoch: u64) -> Option<i64> {
     let epoch_key = epoch_session_key(key, epoch);
     let (version, rest) = match value.strip_prefix(COOKIE_VERSION) {
@@ -239,7 +229,7 @@ fn authority_parts(authority: &str) -> Option<(&str, Option<u16>)> {
     }
     match authority.rsplit_once(':') {
         // host:port; the port side must be digits, else this is a bare
-        // (unbracketed, technically illegal) IPv6 literal.
+        // (unbracketed, technically illegal) IPv6 literal
         Some((host, port))
             if !host.is_empty()
                 && !host.contains(':')
@@ -315,7 +305,7 @@ fn cross_site_context(method: &Method, headers: &HeaderMap) -> bool {
     }
     // Origin is scheme://host[:port] only; scheme is not comparable against
     // the scheme-less Host header and a scheme mismatch alone never makes a
-    // same-host request hostile.
+    // same-host request hostile
     let Some((_, authority)) = origin.split_once("://") else {
         return true;
     };
@@ -379,15 +369,14 @@ fn rate_limited_response(lang: &Lang, retry_after: u64) -> Response {
 }
 
 /// The login-window accounting of the response the handler produced. The
-/// window counts *failed* attempts: a successful login is not a guess, and
-/// it must not cost the operator a slot in the brute-force window — the
-/// slot is given back, the window is not reset, so the failures that filled
-/// it stay counted and a successful login between two wrong guesses does
-/// not hand the attacker a fresh window. A failed login is the panel's
-/// primary brute-force audit signal, attributed here, in the one layer that
-/// holds the per-IP key, so a grep over the event yields exactly one record
-/// per attempt (the success line is the handler's, with the same key; the
-/// 429 warn covers only the exhausted-window case).
+/// window counts *failed* attempts: a successful login refunds its slot
+/// without resetting the window, so the failures that filled it stay
+/// counted and a successful login between two wrong guesses does not hand
+/// the attacker a fresh window. A failed login is the panel's primary
+/// brute-force audit signal, attributed here, in the one layer that holds
+/// the per-IP key, so a grep over the event yields exactly one record per
+/// attempt (the success line is the handler's, with the same key; the 429
+/// warn covers only the exhausted-window case).
 async fn attribute_login_attempt(
     limiter: &RateLimiter,
     ip: &str,
@@ -455,7 +444,7 @@ pub async fn rate_limit(
         return rate_limited_response(&state.locales.lang_from_headers(req.headers()), retry_after);
     }
     // The failed-login attribution runs after `req` is consumed; keep
-    // owned copies of the request identity for it.
+    // owned copies of the request identity for it
     let method = req.method().clone();
     let path = path.to_owned();
     let response = next.run(req).await;
@@ -474,19 +463,19 @@ pub async fn require_auth(State(state): State<AdminState>, req: Request, next: N
     // The epoch read is a database round trip: make it only for a request
     // that carries a session cookie to verify, the same order
     // `login_submit` follows. A request without the cookie has no session
-    // to check and goes straight to the redirect below.
+    // to check and goes straight to the redirect below
     let authenticated = match session_cookie_value(req.headers()) {
         Some(value) => match session_epoch(&state.pool).await {
             Ok(epoch) => verify_session(&state.session_key(), &value, epoch).is_some(),
             Err(err) => {
                 // The epoch is the revocation state: without it a session
-                // could outlive the revocation it was supposed to die in.
+                // could outlive the revocation it was supposed to die in
                 tracing::error!(
                     error = %err,
                     "cannot read the session epoch; rejecting the request"
                 );
                 // A user-facing answer, so from the catalog like every
-                // other panel text.
+                // other panel text
                 let lang = state.locales.lang_from_headers(req.headers());
                 return plain(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -515,7 +504,7 @@ pub async fn csrf_protect(State(state): State<AdminState>, req: Request, next: N
     let lang = state.locales.lang_from_headers(req.headers());
     // The per-IP key for the audit log below, the same key the rate
     // limiter counts (see `rate_limit`): a CSRF failure is a forgery
-    // signal and has to name its source.
+    // signal and has to name its source
     let ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -563,7 +552,7 @@ pub async fn csrf_protect(State(state): State<AdminState>, req: Request, next: N
         // would land inside the already-rendered page and leave the
         // operator stuck. Send the whole page to the login screen — a
         // session that ended (logout, token rotation) is the common cause,
-        // and a fresh page re-mints the CSRF token with it.
+        // and a fresh page re-mints the CSRF token with it
         if req.headers().contains_key("HX-Request") {
             return (StatusCode::FORBIDDEN, [("HX-Redirect", "/admin/login")]).into_response();
         }
@@ -680,7 +669,7 @@ pub async fn login_form(
     // happen: the session the browser held may still work, and the
     // operator has to hear it instead of a silent redirect. `?logout=1`
     // is the regular logout's answer, naming the side effect a
-    // single-session panel has: every other browser was logged out too.
+    // single-session panel has: every other browser was logged out too
     let notice = match params.get("revoked").map(String::as_str) {
         Some("0") => Some(lang.t("login.not_revoked").to_string()),
         _ => params
@@ -701,7 +690,7 @@ pub async fn login_form(
         &template,
         StatusCode::OK,
     );
-    // Both preferences can be chosen at once, so the cookies append.
+    // Both preferences can be chosen at once, so the cookies append
     for cookie in set_cookies {
         if let Ok(value) = cookie.parse() {
             response.headers_mut().append(header::SET_COOKIE, value);
@@ -719,13 +708,13 @@ pub async fn login_submit(
     let lang = state.locales.lang_from_headers(&headers);
     // The failed attempt is attributed by the rate-limit middleware (the
     // only layer that sees the client key); the handler renders the 422
-    // and stays out of the log.
+    // and stays out of the log
     let next = super::admin_next_value(form.next.as_deref());
     // The empty token disables the panel entirely; never match it. The
     // historical "change-me" placeholder is not a credential either: it
     // means "no token configured", so it must never open a session. The
     // token comes from the live config, so a value saved on the settings
-    // screen is enforced on the next login without a restart.
+    // screen is enforced on the next login without a restart
     let admin = state.admin();
     if !admin.token.is_empty()
         && !admin.uses_placeholder_token()
@@ -733,7 +722,7 @@ pub async fn login_submit(
     {
         let ttl = state.session_ttl();
         // Without the epoch there is no key to mint a cookie under: the
-        // cookie would carry no revocation state at all.
+        // cookie would carry no revocation state at all
         let epoch = match session_epoch(&state.pool).await {
             Ok(epoch) => epoch,
             Err(err) => {
@@ -793,7 +782,7 @@ pub async fn logout(
     // Both outcomes are attributed: the regular logout is the audit line
     // for the operator's own action, the failed bump is the case where a
     // cleared-cookie copy may keep working (`revoke_all_sessions` logs the
-    // database error itself, this line ties it to the logout and its key).
+    // database error itself, this line ties it to the logout and its key)
     if revoked {
         tracing::info!(ip = %ip, "admin logged out; all sessions revoked");
     } else {
@@ -804,7 +793,7 @@ pub async fn logout(
     }
     let cookie = session_cookie("", 0, state.admin().secure_cookies);
     // `?logout=1` renders the sign-out notice on the login screen; the
-    // failed revocation adds the not-revoked warning on top of it.
+    // failed revocation adds the not-revoked warning on top of it
     let location = if revoked {
         "/admin/login?logout=1".to_string()
     } else {
@@ -860,7 +849,7 @@ mod tests {
         let value = issue_session(&key, Duration::from_secs(3600), 0);
         assert!(verify_session(&key, &value, 0).is_some());
 
-        // Expired cookie is rejected.
+        // Expired cookie is rejected
         let expired = format!(
             "{}.{}",
             fumox_core::models::now_ts() - 10,
@@ -871,12 +860,12 @@ mod tests {
         );
         assert!(verify_session(&key, &expired, 0).is_none());
 
-        // Tampered signature is rejected.
+        // Tampered signature is rejected
         let mut tampered = value.clone();
         tampered.pop();
         assert!(verify_session(&key, &tampered, 0).is_none());
 
-        // A different key (rotated token) revokes the session.
+        // A different key (rotated token) revokes the session
         let other = derive_key(b"test", "rotated");
         assert!(verify_session(&other, &value, 0).is_none());
     }
@@ -900,7 +889,7 @@ mod tests {
             "an older epoch must not verify either"
         );
 
-        // Pre-epoch cookie shape: HMAC over the bare session key.
+        // Pre-epoch cookie shape: HMAC over the bare session key
         let expires = fumox_core::models::now_ts() + 3600;
         let legacy = format!("{expires}.{}", mac_hex(&key, &expires.to_string()));
         assert!(
@@ -943,7 +932,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let cookie = cookie_from(&response);
 
-        // The session authenticates.
+        // The session authenticates
         let response = app
             .clone()
             .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -951,7 +940,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Logout, carrying the CSRF token the login form ships.
+        // Logout, carrying the CSRF token the login form ships
         let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
         let response = app
             .clone()
@@ -965,7 +954,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-        // The old cookie no longer authenticates.
+        // The old cookie no longer authenticates
         let response = app
             .clone()
             .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -977,14 +966,14 @@ mod tests {
             "/admin/login"
         );
 
-        // The bump is persisted, so it outlives the process that made it.
+        // The bump is persisted, so it outlives the process that made it
         let stored = fumox_core::repo::meta_get(&state.pool, SESSION_EPOCH_KEY)
             .await
             .unwrap();
         assert_eq!(stored.as_deref(), Some("1"));
 
         // The login screen announces the sign-out, naming the side effect
-        // a single-session panel has: the other browsers were ended too.
+        // a single-session panel has: the other browsers were ended too
         use http_body_util::BodyExt;
         let response = app
             .clone()
@@ -999,7 +988,7 @@ mod tests {
             "the login screen must carry the logout notice: {html:.400}"
         );
 
-        // A fresh login under the bumped epoch authenticates again.
+        // A fresh login under the bumped epoch authenticates again
         let response = app
             .clone()
             .oneshot(request(
@@ -1051,7 +1040,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         // The 429 names the wait: the seconds left in the exhausted window,
-        // so a client backs off instead of probing the reset itself.
+        // so a client backs off instead of probing the reset itself
         let retry_after = response
             .headers()
             .get(header::RETRY_AFTER)
@@ -1082,7 +1071,7 @@ mod tests {
         .await;
         let app = crate::admin::router(state);
 
-        // One failure: counted.
+        // One failure: counted
         let response = app
             .clone()
             .oneshot(request("POST", "/admin/login", "token=wrong", None))
@@ -1091,7 +1080,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         // The operator signs in: the attempt is not a guess, so it must
-        // not cost the brute-force budget.
+        // not cost the brute-force budget
         let response = app
             .clone()
             .oneshot(request(
@@ -1105,7 +1094,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
         // The failure before the successful login still counts: the
-        // window holds one slot left, not two.
+        // window holds one slot left, not two
         let response = app
             .clone()
             .oneshot(request("POST", "/admin/login", "token=wrong", None))
@@ -1113,7 +1102,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        // And the window is not reset either: the next attempt is out.
+        // And the window is not reset either: the next attempt is out
         let response = app
             .clone()
             .oneshot(request("POST", "/admin/login", "token=wrong", None))
@@ -1171,7 +1160,7 @@ mod tests {
         );
 
         // The logout clears the cookie on the same path, with the same
-        // attributes and an immediate expiry.
+        // attributes and an immediate expiry
         let cookie = cookie_from(&response);
         let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
         let response = app
@@ -1197,7 +1186,7 @@ mod tests {
         assert!(cleared.contains("SameSite=Lax"), "{cleared}");
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
 
-        // With `secure_cookies` the flag travels with the cookie.
+        // With `secure_cookies` the flag travels with the cookie
         let (_dir, secure_state) = crate::admin::test_admin_state(
             fumox_core::config::AdminConfig {
                 enabled: true,
@@ -1275,7 +1264,7 @@ mod tests {
         )
         .await;
         // The database refuses the epoch bump: every write of that key
-        // aborts, so the revocation cannot be persisted.
+        // aborts, so the revocation cannot be persisted
         for trigger in [
             "CREATE TRIGGER block_epoch_insert BEFORE INSERT ON meta
              WHEN NEW.key = 'admin_session_epoch'
@@ -1321,7 +1310,7 @@ mod tests {
         );
 
         // The login screen turns the flag into a banner the operator
-        // cannot miss.
+        // cannot miss
         let response = app
             .clone()
             .oneshot(request("GET", "/admin/login?revoked=0&lang=en", "", None))
@@ -1345,7 +1334,7 @@ mod tests {
     #[tokio::test]
     async fn token_rotation_through_settings_bumps_the_epoch_and_revokes_the_session() {
         // The settings editor writes back to this scratch file, and the
-        // live config is refreshed from it after every save.
+        // live config is refreshed from it after every save
         let config_dir = fumox_core::tempdir_lite::TempDir::new("settings-rotate");
         let config_path = config_dir.path().join("app.toml");
         std::fs::write(
@@ -1383,7 +1372,7 @@ mod tests {
         let cookie = cookie_from(&response);
 
         // A save that leaves the token unchanged must neither bump the
-        // epoch nor revoke the session performing it.
+        // epoch nor revoke the session performing it
         let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
         let response = app
             .clone()
@@ -1407,7 +1396,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Rotate the token through the settings screen.
+        // Rotate the token through the settings screen
         const ROTATED: &str = "rotated-admin-token";
         let response = app
             .clone()
@@ -1421,7 +1410,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-        // The old cookie no longer authenticates.
+        // The old cookie no longer authenticates
         let response = app
             .clone()
             .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -1433,14 +1422,14 @@ mod tests {
             "/admin/login"
         );
 
-        // The bump is persisted, so it outlives the process that made it.
+        // The bump is persisted, so it outlives the process that made it
         let stored = fumox_core::repo::meta_get(&state.pool, SESSION_EPOCH_KEY)
             .await
             .unwrap();
         assert_eq!(stored.as_deref(), Some("1"));
 
         // The rotation landed in the live config: the old token is dead,
-        // the rotated one logs in and the fresh session authenticates.
+        // the rotated one logs in and the fresh session authenticates
         let response = app
             .clone()
             .oneshot(request(
@@ -1471,19 +1460,18 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// f19: the cross-site verdict per header shape. Every "false" keeps
-    /// the old count-and-process behavior; every "true" rejects without
-    /// counting.
+    /// f19: the cross-site verdict per header shape. Every "false" counts
+    /// and processes the request; every "true" rejects without counting.
     #[test]
     fn cross_site_context_classification() {
         let get = Method::GET;
         let post = Method::POST;
         let none = HeaderMap::new();
 
-        // No signals at all (curl, health checks): not cross-site.
+        // No signals at all (curl, health checks): not cross-site
         assert!(!cross_site_context(&get, &none));
 
-        // Fetch Metadata, non-cross-site values keep counting.
+        // Fetch Metadata, non-cross-site values keep counting
         let site = |value: &str| {
             let mut h = HeaderMap::new();
             h.insert("sec-fetch-site", value.parse().unwrap());
@@ -1494,7 +1482,7 @@ mod tests {
         assert!(!cross_site_context(&get, &site("none")));
         assert!(!cross_site_context(&post, &site("same-origin")));
 
-        // Cross-site fetch/XHR and subresource loads: reject.
+        // Cross-site fetch/XHR and subresource loads: reject
         let cross_fetch = |mode: &str, dest: &str| {
             let mut h = HeaderMap::new();
             h.insert("sec-fetch-site", "cross-site".parse().unwrap());
@@ -1504,34 +1492,34 @@ mod tests {
         };
         assert!(cross_site_context(&get, &cross_fetch("cors", "empty")));
         assert!(cross_site_context(&get, &cross_fetch("no-cors", "image")));
-        // An iframe navigation is not a top-level one.
+        // An iframe navigation is not a top-level one
         assert!(cross_site_context(&get, &cross_fetch("navigate", "iframe")));
         // A cross-site form POST navigation is the CSRF shape, even though
-        // it navigates a top-level document.
+        // it navigates a top-level document
         assert!(cross_site_context(
             &post,
             &cross_fetch("navigate", "document")
         ));
         // Metadata ships as a set: a cross-site claim without mode/dest is
-        // not exempted as a navigation.
+        // not exempted as a navigation
         let mut h = HeaderMap::new();
         h.insert("sec-fetch-site", "cross-site".parse().unwrap());
         assert!(cross_site_context(&get, &h));
 
         // The one exempt shape: the operator following a link from another
-        // page, a top-level GET navigation.
+        // page, a top-level GET navigation
         assert!(!cross_site_context(
             &get,
             &cross_fetch("navigate", "document")
         ));
 
-        // Origin fallback (no Fetch Metadata, older browsers).
+        // Origin fallback (no Fetch Metadata, older browsers)
         let mut h = HeaderMap::new();
         h.insert("origin", "https://panel.example.com".parse().unwrap());
         h.insert("host", "panel.example.com".parse().unwrap());
         assert!(!cross_site_context(&post, &h), "matching origin counts");
 
-        // Default-port spelling differences are the same origin.
+        // Default-port spelling differences are the same origin
         let mut h = HeaderMap::new();
         h.insert("origin", "https://panel.example.com".parse().unwrap());
         h.insert("host", "panel.example.com:443".parse().unwrap());
@@ -1540,18 +1528,18 @@ mod tests {
         h.insert("origin", "http://localhost:8081".parse().unwrap());
         h.insert("host", "localhost:8081".parse().unwrap());
         assert!(!cross_site_context(&post, &h));
-        // Host names compare case-insensitively.
+        // Host names compare case-insensitively
         let mut h = HeaderMap::new();
         h.insert("origin", "https://Panel.Example.com".parse().unwrap());
         h.insert("host", "panel.example.com".parse().unwrap());
         assert!(!cross_site_context(&post, &h));
-        // Bracketed IPv6 literals with ports.
+        // Bracketed IPv6 literals with ports
         let mut h = HeaderMap::new();
         h.insert("origin", "http://[::1]:8081".parse().unwrap());
         h.insert("host", "[::1]:8081".parse().unwrap());
         assert!(!cross_site_context(&post, &h));
 
-        // A different origin (host or effective port) is cross-site.
+        // A different origin (host or effective port) is cross-site
         let mut h = HeaderMap::new();
         h.insert("origin", "https://evil.example".parse().unwrap());
         h.insert("host", "panel.example.com".parse().unwrap());
@@ -1560,7 +1548,7 @@ mod tests {
         h.insert("origin", "https://panel.example.com:8443".parse().unwrap());
         h.insert("host", "panel.example.com:8081".parse().unwrap());
         assert!(cross_site_context(&post, &h));
-        // `Origin: null` (sandboxed frame) and unparsable origins.
+        // `Origin: null` (sandboxed frame) and unparsable origins
         let mut h = HeaderMap::new();
         h.insert("origin", "null".parse().unwrap());
         h.insert("host", "panel.example.com".parse().unwrap());
@@ -1570,7 +1558,7 @@ mod tests {
         h.insert("host", "panel.example.com".parse().unwrap());
         assert!(cross_site_context(&post, &h));
         // Origin without a Host to compare against: cannot establish
-        // same-origin.
+        // same-origin
         let mut h = HeaderMap::new();
         h.insert("origin", "https://panel.example.com".parse().unwrap());
         assert!(cross_site_context(&post, &h));
@@ -1595,7 +1583,7 @@ mod tests {
         let app = crate::admin::router(state);
 
         // An attacker page hammering the panel from the operator's browser:
-        // every request is rejected and none of them touches the window.
+        // every request is rejected and none of them touches the window
         let cross_fetch = || {
             let mut req = request("GET", "/admin/login", "", None);
             let headers = req.headers_mut();
@@ -1609,7 +1597,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
 
-        // Same-origin-shaped requests keep counting: the window is 2.
+        // Same-origin-shaped requests keep counting: the window is 2
         let counted = || request("GET", "/admin/login", "", None);
         assert_eq!(
             app.clone().oneshot(counted()).await.unwrap().status(),
@@ -1625,13 +1613,13 @@ mod tests {
         );
 
         // Still 403, not 429: the cross-site requests never shared the
-        // window they would have exhausted.
+        // window they would have exhausted
         let response = app.clone().oneshot(cross_fetch()).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         // The navigation exemption only exempts from *rejection*, not from
         // counting: a top-level cross-site GET lands in the exhausted
-        // window like any other request.
+        // window like any other request
         let mut navigation = request("GET", "/admin/login", "", None);
         let headers = navigation.headers_mut();
         headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
@@ -1672,7 +1660,7 @@ mod tests {
         }
 
         // The genuine form: same-origin POST counts once and succeeds with
-        // the full login window behind it.
+        // the full login window behind it
         let mut genuine = request("POST", "/admin/login", &format!("token={TOKEN}"), None);
         let headers = genuine.headers_mut();
         headers.insert("origin", "https://panel.example.com".parse().unwrap());
@@ -1699,7 +1687,7 @@ mod tests {
         let app = crate::admin::router(state);
 
         // The shared test writer funneling the subscriber's output into a
-        // buffer the assertions read back (`fumox_core::logging::capture`).
+        // buffer the assertions read back (`fumox_core::logging::capture`)
         let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1710,17 +1698,17 @@ mod tests {
         crate::test_support::stabilize_callsite_interests();
         // A call site whose first execution predates this test may already
         // be cached as `never`; re-evaluate every call site against the
-        // now-multi-dispatcher registry so the lines below are observable.
+        // now-multi-dispatcher registry so the lines below are observable
         tracing::callsite::rebuild_interest_cache();
 
-        // A wrong token renders the 422 the middleware attributes.
+        // A wrong token renders the 422 the middleware attributes
         let response = app
             .clone()
             .oneshot(request("POST", "/admin/login", "token=wrong-guess", None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        // A correct token logs in; no failed-login line for it.
+        // A correct token logs in; no failed-login line for it
         let response = app
             .oneshot(request(
                 "POST",
@@ -1789,8 +1777,8 @@ mod tests {
         let cookie = cookie_from(&response);
 
         // A POST whose body carries no CSRF field: the session is valid,
-        // the token is not (a stale tab after a logout elsewhere, say).
-        // The English catalog cookie pins the language the page must use.
+        // the token is not (a stale tab after a logout elsewhere, say)
+        // The English catalog cookie pins the language the page must use
         let response = app
             .clone()
             .oneshot(request(
@@ -1810,7 +1798,7 @@ mod tests {
             "the plain browser must get a localized HTML page: {html:.400}"
         );
 
-        // The same request from HTMX moves the whole page to login.
+        // The same request from HTMX moves the whole page to login
         let mut htmx = request("POST", "/admin/logout", "", Some(&cookie));
         htmx.headers_mut()
             .insert("HX-Request", "true".parse().unwrap());
@@ -1839,8 +1827,8 @@ mod tests {
     /// The 503 an unreadable revocation epoch produces is a user-facing
     /// answer, so it comes from the message catalog like every other panel
     /// text: the body carries the localized sentence, not the bare key a
-    /// typo would render — on both paths that answer it, the session check
-    /// and the login mint.
+    /// typo would render, on both paths that answer it (the session check
+    /// and the login mint).
     #[tokio::test]
     async fn an_unreadable_epoch_answers_the_localized_503() {
         use http_body_util::BodyExt;
@@ -1856,7 +1844,7 @@ mod tests {
         .await;
         let app = crate::admin::router(state.clone());
 
-        // Mint a session while the database is still alive.
+        // Mint a session while the database is still alive
         let response = app
             .clone()
             .oneshot(request(
@@ -1872,7 +1860,7 @@ mod tests {
 
         state.pool.close().await;
 
-        // The session check cannot read the epoch.
+        // The session check cannot read the epoch
         let response = app
             .clone()
             .oneshot(request(
@@ -1891,7 +1879,7 @@ mod tests {
             "the 503 body must come from the message catalog: {body:.400}"
         );
 
-        // A correct token cannot read the epoch to mint a session under.
+        // A correct token cannot read the epoch to mint a session under
         let response = app
             .oneshot(request(
                 "POST",

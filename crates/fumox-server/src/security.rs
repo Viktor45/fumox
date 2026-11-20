@@ -1,13 +1,12 @@
 //! Security primitives shared by the public subscription listener and the
 //! admin panel: the fixed-window rate limiter, the trusted-proxy client-IP
-//! key, constant-time secret comparison, and the RFC 3339 timestamp helper
-//! the subscription header block renders.
+//! key, constant-time secret comparison, and the RFC 3339 timestamp helper.
 //!
-//! They live at the crate root, outside the admin tree, because the public
-//! listener's rate limiting and capability-token checks are security core,
-//! not panel functionality: they must stay reachable no matter how the
-//! admin surface is wired, and the public serving layer (`serve`,
-//! `alive_export`) must not depend on the admin module for them.
+//! They live at the crate root, outside the admin tree: the public
+//! listener's rate limiting and capability-token checks are security core
+//! and must stay reachable no matter how the admin surface is wired, so
+//! the public serving layer (`serve`, `alive_export`) does not depend on
+//! the admin module for them.
 
 use axum::http::HeaderMap;
 use fumox_core::config::TrustedHeader;
@@ -20,13 +19,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Constant-time string equality (cookie/CSRF comparison). Also used for
-/// the public capability-token checks (`/sub` access token, alive-export
-/// link) so every secret comparison goes through one implementation.
-///
-/// The implementation lives in `fumox-core`, next to the token hashing it
-/// has to stay consistent with: the profile access token is verified
-/// against its stored hash there.
+/// Constant-time string equality (cookie/CSRF comparison, and the public
+/// capability-token checks: the `/sub` access token, the alive-export
+/// link), so every secret comparison goes through one implementation.
+/// Lives in `fumox-core`, next to the token hashing it must stay
+/// consistent with.
 pub fn ct_eq(a: &str, b: &str) -> bool {
     fumox_core::token::ct_eq(a, b)
 }
@@ -34,24 +31,21 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 /// What one forwarded header says about the request it arrived on.
 ///
 /// The three cases are not interchangeable. "Found no address" and "found
-/// an address" tell [`client_key`] nothing about who wrote the *other*
-/// header, but "every entry was inside the trust list" does: a trusted
-/// address can only sit in a chain there because a trusted hop put it
-/// there, and a chain of nothing-but-trusted hops is a chain that ran
-/// *past* the client address this header is responsible for.
+/// an address" say nothing about the *other* header, but "every entry was
+/// inside the trust list" does: a trusted address can only sit in a chain
+/// there because a trusted hop put it there, and a chain of
+/// nothing-but-trusted hops is a chain that ran *past* the client address
+/// this header is responsible for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Forwarded {
     /// An originating-client address, with the trusted-CIDR entries
     /// skipped from the right.
     Client(IpAddr),
-    /// The header parsed, and every entry it holds is inside the trust
-    /// list. The client address is not in this header; something further
-    /// left in the chain, or another header, carries it.
+    /// The header parsed and every entry is inside the trust list; the
+    /// client address sits further left in the chain or in another header.
     TrustedChain,
-    /// No usable entry at all: the header is absent, empty, unparsable, or
-    /// deliberately opaque (`for=_hidden`, `for=unknown`). This is silence,
-    /// not evidence. A proxy that hides the client writes exactly this,
-    /// and so does a client that sends a header the proxy ignores.
+    /// No usable entry: absent, empty, unparsable, or deliberately opaque
+    /// (`for=_hidden`, `for=unknown`). This is silence, not evidence.
     Nothing,
 }
 
@@ -63,20 +57,19 @@ pub enum ClientKeySource {
     Forwarded,
     /// The key is the peer address by design: no forwarding header is
     /// declared, no trusted proxy is configured, or the peer is not
-    /// trusted to speak for a client. This is the best-available key,
-    /// not a degradation.
+    /// trusted to speak for a client. The best-available key, not a
+    /// degradation.
     Peer,
-    /// The operator declared a forwarding header and the peer is trusted,
-    /// but the walks still produced no client address: the key fell back
-    /// to the peer, and every client behind that peer shares one
-    /// rate-limit bucket. The rate-limit middlewares warn about this
-    /// once per window, see [`warn_shared_peer_bucket`].
+    /// A trusted peer's forwarding walks produced no client address: the
+    /// key fell back to the peer and every client behind it shares one
+    /// rate-limit bucket. Warned once per window, see
+    /// [`warn_shared_peer_bucket`].
     PeerFallback,
 }
 
-/// The one address a single header names, if it names one, and where it
-/// came from. Past [`client_key`]'s gates a peer fallback is a degraded
-/// key ([`ClientKeySource::PeerFallback`]), not the designed outcome.
+/// The one address a single header names, if it names one. Past
+/// [`client_key`]'s gates a peer fallback is a degraded key
+/// ([`ClientKeySource::PeerFallback`]), not the designed outcome.
 fn sole(found: Forwarded, peer: SocketAddr) -> (IpAddr, ClientKeySource) {
     match found {
         Forwarded::Client(ip) => (ip, ClientKeySource::Forwarded),
@@ -94,8 +87,8 @@ fn sole(found: Forwarded, peer: SocketAddr) -> (IpAddr, ClientKeySource) {
 /// 2. No trusted proxies configured ⇒ never honor forwarded headers.
 /// 3. Peer is not in any trusted CIDR ⇒ the header is untrusted.
 /// 4. `xff` declared ⇒ whatever the `X-Forwarded-For` walk returns, else
-///    the peer. A `Forwarded` header beside it is ignored: it is text
-///    nobody vouched for.
+///    the peer. A `Forwarded` header beside it is ignored: text nobody
+///    vouched for.
 /// 5. `forwarded` declared ⇒ the same walk over the RFC 7239 header,
 ///    `X-Forwarded-For` ignored.
 /// 6. `both` declared ⇒ the two walks must name the same address, or the
@@ -103,12 +96,10 @@ fn sole(found: Forwarded, peer: SocketAddr) -> (IpAddr, ClientKeySource) {
 ///
 /// No precedence between `Forwarded` and `X-Forwarded-For`: the walk cannot
 /// tell a proxy-appended entry from a client-authored one, so either fixed
-/// order is client-chosen.
-///
-/// The returned [`ClientKeySource`] says where the key came from: rules
-/// 1–3 make the peer the key by design ([`ClientKeySource::Peer`]), past
-/// them a peer key is what the walks degraded to
-/// ([`ClientKeySource::PeerFallback`]).
+/// order is client-chosen. The returned [`ClientKeySource`] says where the
+/// key came from: rules 1-3 make the peer the key by design
+/// ([`ClientKeySource::Peer`]), past them a peer key is what the walks
+/// degraded to ([`ClientKeySource::PeerFallback`]).
 pub fn client_key(
     peer: SocketAddr,
     headers: &HeaderMap,
@@ -116,15 +107,15 @@ pub fn client_key(
     trusted_header: TrustedHeader,
 ) -> (IpAddr, ClientKeySource) {
     // 1. The operator named no header: nothing a client sends can move the
-    // key off the peer address.
+    // key off the peer address
     if trusted_header == TrustedHeader::None {
         return (peer.ip(), ClientKeySource::Peer);
     }
-    // 2. No trusted proxies configured ⇒ never honor forwarded headers.
+    // 2. No trusted proxies configured ⇒ never honor forwarded headers
     if trusted_cidrs.is_empty() {
         return (peer.ip(), ClientKeySource::Peer);
     }
-    // 3. Peer is not in any trusted CIDR ⇒ the header is untrusted.
+    // 3. Peer is not in any trusted CIDR ⇒ the header is untrusted
     if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
         return (peer.ip(), ClientKeySource::Peer);
     }
@@ -150,28 +141,23 @@ pub fn client_key(
 /// peer. A trusted proxy either appends the address it observed (nginx
 /// `$proxy_add_x_forwarded_for`) or overwrites the header wholesale, so the
 /// entry closest to the peer is the client IP as seen by the innermost
-/// trusted hop; scanning toward the left then skips further trusted hops
-/// and lands on the first non-trusted IP.
+/// trusted hop; scanning left then skips further trusted hops and lands on
+/// the first non-trusted IP.
 ///
-/// The previous left-to-right walk took the left-most non-trusted entry,
-/// which is text the *client* chose whenever it sends its own XFF and the
+/// A left-to-right walk would take the left-most non-trusted entry, which
+/// is text the *client* chose whenever it sends its own XFF and the
 /// trusted proxy merely appends: every forged IP then got a fresh
 /// rate-limit window, voiding the login brute-force cap (security review
-/// f2). The right-to-left walk is the mirror image, so a client-supplied
-/// prefix no longer wins.
-///
-/// What the walk does *not* do is prove authorship: a single-element XFF
-/// reads the same whether the trusted proxy appended it or the client
-/// authored it, since the proxy either appends or overwrites. Callers must
-/// therefore establish that the trusted hop writes this header at all,
-/// see [`client_key`], which does it from the operator's declaration
-/// ([`TrustedHeader`]). A trust list broad enough to contain the clients
-/// themselves (`0.0.0.0/0`, a `/8` the subscribers live in) also erases the
-/// distinction: their addresses are skipped like a hop's.
+/// f2). The walk also does not prove authorship: a single-element XFF
+/// reads the same whether the proxy appended it or the client authored
+/// it, so callers must establish that the trusted hop writes this header
+/// at all ([`client_key`], from the operator's declaration). A trust list
+/// broad enough to contain the clients themselves (`0.0.0.0/0`) also
+/// erases the distinction: their addresses are skipped like a hop's.
 fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
     // RFC 7230 §3.2.2: a repeated header field is equivalent to one field
     // with the values joined by commas. Reading only the first value would
-    // silently drop the entries a proxy appended after it.
+    // silently drop the entries a proxy appended after it
     let value = headers
         .get_all("x-forwarded-for")
         .iter()
@@ -200,13 +186,12 @@ fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
 }
 
 /// Walk RFC 7239 `Forwarded: for=…` right-to-left from the peer, the same
-/// direction [`walk_xff`] scans and for the same reason, and to the same
-/// three-way outcome. Port-suffixed literals (`ip:port`,
-/// `[v6]:port`) are reduced to the bare address; skip `for=_hidden` and
-/// `for=unknown`, both mean the proxy declined to name the client, which
-/// is [`Forwarded::Nothing`], never a chain that ran past it.
+/// direction and reason as [`walk_xff`], to the same three-way outcome.
+/// Port-suffixed literals are reduced to the bare address; `for=_hidden`
+/// and `for=unknown` mean the proxy declined to name the client, which is
+/// [`Forwarded::Nothing`], never a chain that ran past it.
 fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
-    // Repeated `Forwarded` headers are one field with comma-joined values.
+    // Repeated `Forwarded` headers are one field with comma-joined values
     let value = headers
         .get_all(axum::http::header::FORWARDED)
         .iter()
@@ -219,7 +204,7 @@ fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwar
     let mut parsed_any = false;
     for raw in value.split(',').rev() {
         let entry = raw.trim();
-        // Each Forwarded element is a `;`-separated list of parameters.
+        // Each Forwarded element is a `;`-separated list of parameters
         for param in entry.split(';') {
             let param = param.trim();
             let Some(value) = param.strip_prefix("for=") else {
@@ -252,7 +237,7 @@ fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwar
 /// literal loses its brackets and the port behind them; a bare IPv6
 /// literal always carries at least two colons, so a port is never cut
 /// from one. Whatever still does not parse is skipped by the caller,
-/// fail-closed as before.
+/// fail-closed.
 fn strip_port(entry: &str) -> &str {
     if entry.starts_with('[') {
         return entry
@@ -268,8 +253,7 @@ fn strip_port(entry: &str) -> &str {
 }
 
 /// Strip surrounding quotes from a `for=` value; `_hidden`/`unknown` are
-/// recognised by the caller ([`walk_forwarded`]), this only unwraps
-/// quoting.
+/// recognised by the caller ([`walk_forwarded`]).
 fn strip_obfuscation(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -287,11 +271,9 @@ static PEER_BUCKET_WARNS: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Warn that the rate-limit `key` degraded to the shared peer bucket
-/// ([`ClientKeySource::PeerFallback`]): a trusted peer's forwarding data
-/// produced no client address, so every client behind that peer now
-/// shares one rate-limit window. One warn per key per `window` — the
-/// limiter's own window is the natural horizon, since the condition holds
-/// for every request it covers — not one warn per request.
+/// ([`ClientKeySource::PeerFallback`]): every client behind that peer
+/// shares one rate-limit window. One warn per key per `window` (the
+/// limiter's own window is the natural horizon), not one per request.
 pub fn warn_shared_peer_bucket(key: &str, window: Duration) {
     let now = Instant::now();
     let mut seen = PEER_BUCKET_WARNS
@@ -299,8 +281,7 @@ pub fn warn_shared_peer_bucket(key: &str, window: Duration) {
         .unwrap_or_else(|poison| poison.into_inner());
     if seen.len() >= PEER_BUCKET_MAX_TRACKED {
         // Bound the map, not the warnings: entries whose window elapsed
-        // go first, the keys they held warn again from scratch; past that
-        // the oldest entry is dropped.
+        // go first; past that the oldest entry is dropped
         seen.retain(|_, began| now.duration_since(*began) < window);
         if seen.len() >= PEER_BUCKET_MAX_TRACKED
             && let Some(oldest) = seen
@@ -329,10 +310,9 @@ pub fn warn_shared_peer_bucket(key: &str, window: Duration) {
 const DEFAULT_MAX_KEYS: u64 = 100_000;
 
 /// The data a warn window accumulated since its last rollover: the
-/// rejections it dropped to debug and how many there were in total. The
-/// caller renders the summary sentence — the two registries word theirs
-/// differently (auth failures vs. host-gate rejections), but the facts
-/// are the same.
+/// rejections it dropped to debug. The caller renders the summary
+/// sentence; the two registries word theirs differently, the facts are
+/// the same.
 #[derive(Debug, Default)]
 pub struct WarnSummary {
     /// Rejections the window dropped to debug, named ones first.
@@ -343,19 +323,17 @@ pub struct WarnSummary {
 }
 
 /// One bounded per-key warn registry, the shape both public-listener
-/// coalescers share: a failed secret check (`serve`'s auth-failure log)
-/// and a host-gate rejection (`alive_export`'s host log) warn once per key
-/// per window, then drop to debug, under a per-window budget that stops a
-/// flood from mirroring itself into the log, with a rollover summary that
-/// names what the window swallowed.
+/// coalescers share: warn once per key per window, then drop to debug,
+/// under a per-window budget that stops a flood from mirroring itself
+/// into the log, with a rollover summary naming what the window
+/// swallowed.
 ///
-/// The registry owns three caps: the window, the number of distinct keys
-/// tracked (bounding memory; hitting it never silences new keys), and the
-/// warn budget per window. Eviction is O(log n) (an insert-order map,
-/// oldest slot first), and a key that returns after its own quiet window
-/// re-enters tracking and spends the same budget as a new one — a
-/// campaign that rotates through a small key set cannot out-warn the
-/// budget by waiting.
+/// Three caps: the window, the distinct keys tracked (bounding memory;
+/// hitting it never silences new keys), and the warn budget per window.
+/// Eviction is O(log n) (an insert-order map, oldest slot first), and a
+/// key that returns after its own quiet window re-enters tracking and
+/// spends the same budget as a new one, so a campaign rotating through a
+/// small key set cannot out-warn the budget by waiting.
 #[derive(Debug)]
 pub struct WarnRegistry {
     window: Duration,
@@ -408,7 +386,7 @@ impl WarnRegistry {
     /// the window that just closed (when it suppressed anything).
     fn roll_window(&mut self, now: Instant) -> Option<WarnSummary> {
         let Some(start) = self.window_start else {
-            // First failure ever: open the window, report nothing.
+            // First failure ever: open the window, report nothing
             self.window_start = Some(now);
             return None;
         };
@@ -427,7 +405,7 @@ impl WarnRegistry {
     fn track(&mut self, key: &str, now: Instant) {
         if !self.seen.contains_key(key) {
             if self.seen.len() >= self.max_tracked {
-                // Bound the map, not the warnings: drop the oldest entry.
+                // Bound the map, not the warnings: drop the oldest entry
                 if let Some((_, oldest)) = self.order.pop_first() {
                     self.seen.remove(&oldest);
                 }
@@ -439,7 +417,7 @@ impl WarnRegistry {
             return;
         }
         // A key that comes back after its own window keeps its slot: only
-        // the quiet window restarts.
+        // the quiet window restarts
         let slot = self.seen.get(key).map(|(_, slot)| *slot).unwrap_or(0);
         self.seen.insert(key.to_string(), (now, slot));
     }
@@ -447,12 +425,11 @@ impl WarnRegistry {
     /// `true` when this occurrence for `key` should warn, plus the summary
     /// of a window that just rolled over.
     ///
-    /// Three rules, in order: a key already warned inside the window is
-    /// quiet; a key past the window's budget is quiet but remembered for
-    /// the summary; otherwise it warns. The per-window budget covers a key
-    /// that returns after its own quiet window as well: a flood of
-    /// *repeat* visitors must not be able to spend the window's warns
-    /// either.
+    /// In order: a key already warned inside the window is quiet; a key
+    /// past the window's budget is quiet but remembered for the summary;
+    /// otherwise it warns. The budget covers a key that returns after its
+    /// own quiet window as well: a flood of *repeat* visitors must not be
+    /// able to spend the window's warns either.
     pub fn should_warn(&mut self, key: &str, now: Instant) -> (bool, Option<WarnSummary>) {
         let summary = self.roll_window(now);
         if let Some((first, _)) = self.seen.get(key)
@@ -474,8 +451,8 @@ impl WarnRegistry {
 }
 
 /// One fixed-window counter: the hit count and the instant the window
-/// closes. The deadline travels with the entry — the same moment moka's
-/// TTL starts from — so a rejection can name the exact `Retry-After`
+/// closes. The deadline travels with the entry (the same moment moka's
+/// TTL starts from), so a rejection can name the exact `Retry-After`
 /// instead of the whole window.
 struct Window {
     count: AtomicU64,
@@ -486,11 +463,10 @@ struct Window {
 /// TTL = window, so expiry resets the window.
 ///
 /// The counter cache holds at most `max_keys` keys (100 000 by default);
-/// past that the least-recently-used counters are evicted, and an evicted
-/// key starts a fresh window — its counter is gone, so the next request
-/// from it counts as the first one again. The ceiling bounds the memory a
-/// flood of distinct keys could pin; it never bounds the number of
-/// requests a single key may make.
+/// past that the least-recently-used counters are evicted and an evicted
+/// key starts a fresh window (its counter is gone). The ceiling bounds the
+/// memory a flood of distinct keys could pin, never the requests a single
+/// key may make.
 pub struct RateLimiter {
     counters: Cache<String, Arc<Window>>,
     limit: u64,
@@ -538,10 +514,10 @@ impl RateLimiter {
     /// exhausted, carrying the `Retry-After` value: the seconds until the
     /// window's deadline, never zero (a zero would let an aggressive
     /// client spin on the same instant). The deadline is fixed by the
-    /// entry's creation — the first hit of the window, the same moment
-    /// moka's TTL starts from — so the header and the actual reset agree.
+    /// entry's creation, the same moment moka's TTL starts from, so the
+    /// header and the actual reset agree.
     pub async fn check(&self, key: &str) -> Result<(), u64> {
-        // moka's future cache expects a future (not a closure) as the init.
+        // moka's future cache expects a future (not a closure) as the init
         let window = self.window;
         let init = async move {
             Ok::<_, std::convert::Infallible>(Arc::new(Window {
@@ -564,11 +540,10 @@ impl RateLimiter {
 
     /// Give one hit back to `key`'s window: the outer middleware counts
     /// every request up front, but a deeper rate-limiting layer may reject
-    /// the very same request too, without the refund the outer window pays
+    /// the same request too, without the refund the outer window would pay
     /// for hits the inner limiter already punished. Saturating: a refund
-    /// for a key whose counter already expired with its window (or never
-    /// existed) must never wrap below zero, the wrap would blacklist the
-    /// key for the whole window.
+    /// for a key whose counter already expired must never wrap below
+    /// zero, the wrap would blacklist the key for the whole window.
     pub async fn refund(&self, key: &str) {
         let init = async {
             Ok::<_, std::convert::Infallible>(Arc::new(Window {
@@ -647,7 +622,7 @@ mod tests {
     #[test]
     fn empty_trusted_list_never_honors_forwarded_headers() {
         // Even with XFF claiming 1.2.3.4, an unconfigured trust list must
-        // not let the header influence the rate-limit key, peer wins.
+        // not let the header influence the rate-limit key, peer wins
         let h = xff("1.2.3.4");
         assert_eq!(
             client_key(peer(), &h, &[], TrustedHeader::Both).0,
@@ -677,7 +652,7 @@ mod tests {
             "a consistent pair of headers must resolve to the peer without a declaration"
         );
         // The same pair under a declaration names the client: the operator
-        // has taken responsibility for the header.
+        // has taken responsibility for the header
         assert_eq!(key_both(&headers), "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
@@ -691,13 +666,13 @@ mod tests {
     fn trusted_peer_with_chain_walks_past_trusted_hops_right_to_left() {
         // Two trusted hops appended in order: the innermost observation is
         // at the right, so the walk starts there, skips the trusted entry
-        // and lands on the client IP the first trusted proxy observed.
+        // and lands on the client IP the first trusted proxy observed
         let h = xff("1.1.1.1, 2.2.2.2");
         assert_eq!(key_xff(&h), "1.1.1.1".parse::<IpAddr>().unwrap());
     }
 
     /// The attack from security review f2: the client sends its own XFF
-    /// prefix and a trusted proxy *appends* the real client IP (nginx
+    /// prefix and a trusted proxy appends the real client IP (nginx
     /// `$proxy_add_x_forwarded_for`). The left-most entry is attacker text;
     /// only the right-most non-trusted entry is what the trusted hop saw.
     /// The old left-to-right walk returned 6.6.6.6, giving every forged IP
@@ -717,12 +692,11 @@ mod tests {
         assert_eq!(key_forwarded(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 
-    /// A proxy configured for RFC 7239 (`Forwarded`) leaves
-    /// `X-Forwarded-For` alone, so a client-supplied XFF is the only XFF
-    /// text the request carries. Under the `forwarded` declaration the XFF
-    /// is not read at all, so the five forged XFFs cannot produce five
-    /// rate-limit keys on the login brute-force cap: the key is the
-    /// address the proxy itself observed.
+    /// A proxy configured for RFC 7239 leaves `X-Forwarded-For` alone, so
+    /// a client-supplied XFF is the only XFF text present. Under the
+    /// `forwarded` declaration the XFF is not read at all: five forged
+    /// XFFs cannot produce five rate-limit keys on the login brute-force
+    /// cap, the key is the address the proxy itself observed.
     #[test]
     fn client_authored_xff_cannot_pick_the_key_when_the_proxy_writes_forwarded() {
         for forged in [
@@ -743,10 +717,10 @@ mod tests {
         }
     }
 
-    /// The mirror image: a proxy that writes only XFF (nginx, Caddy) and
-    /// forwards the client's `Forwarded` verbatim, the default of
-    /// `proxy_pass_request_headers on`. Under the `xff` declaration the
-    /// client's `for=` is not read, so it cannot pick the key.
+    /// The mirror image: a proxy that writes only XFF (nginx, Caddy)
+    /// forwards the client's `Forwarded` verbatim (the default of
+    /// `proxy_pass_request_headers on`); under the `xff` declaration the
+    /// client's `for=` is not read.
     #[test]
     fn client_authored_forwarded_cannot_pick_the_key_when_the_proxy_writes_xff() {
         for forged in [
@@ -793,13 +767,12 @@ mod tests {
     }
 
     /// A two-proxy chain where the outer hop writes `Forwarded` and the
-    /// inner one (the peer) writes XFF: Traefik in front of nginx, both in
-    /// `trust_proxy_ips`. The XFF nginx appends is Traefik's own address,
-    /// inside the trust list, so the walk returns nothing at all and the
-    /// client address only exists in the `Forwarded` the outer hop wrote.
-    /// Treating "one header found nothing" as a forged pair collapsed this
-    /// whole deployment onto the peer's bucket, which for `/admin/login` is
-    /// one shared 5-per-minute window.
+    /// inner one (the peer) writes XFF (Traefik in front of nginx, both in
+    /// `trust_proxy_ips`). The XFF nginx appends is Traefik's own address,
+    /// inside the trust list, so the client address only exists in the
+    /// `Forwarded` the outer hop wrote. Treating "one header found
+    /// nothing" as a forged pair collapsed this deployment onto the peer's
+    /// bucket, one shared 5-per-minute window for `/admin/login`.
     #[test]
     fn a_two_proxy_chain_writing_one_header_each_keeps_the_client_key() {
         let trusted: Vec<ipnet::IpNet> = vec![
@@ -807,9 +780,9 @@ mod tests {
             "10.0.0.0/8".parse().unwrap(), // Traefik, the outer hop
         ];
         let mut headers = HeaderMap::new();
-        // nginx appends the address it observed from Traefik.
+        // nginx appends the address it observed from Traefik
         headers.insert("x-forwarded-for", "10.0.0.7".parse().unwrap());
-        // Traefik writes the address it observed from the client.
+        // Traefik writes the address it observed from the client
         headers.insert(
             header::FORWARDED,
             "for=9.9.9.9;proto=https".parse().unwrap(),
@@ -823,16 +796,14 @@ mod tests {
 
     /// A chain the walk can exhaust, every XFF entry inside the trust
     /// list, beside a header that names a client is the one disagreement
-    /// that is not a forgery: an all-trusted XFF is evidence that the
-    /// peer wrote it (only a trusted hop's appending puts a trusted
-    /// address there, and the client then sits further left, in the
-    /// other header). The mirror shape is pinned too, so neither
-    /// direction is accidental.
+    /// that is not a forgery: an all-trusted XFF is evidence that the peer
+    /// wrote it (the client then sits further left, in the other header).
+    /// The mirror shape is pinned too, so neither direction is accidental.
     #[test]
     fn an_exhausted_chain_defers_to_the_header_that_names_a_client() {
         let trusted: Vec<ipnet::IpNet> =
             vec!["2.2.2.2/32".parse().unwrap(), "10.0.0.0/8".parse().unwrap()];
-        // XFF exhausted on trusted entries, `Forwarded` exhausted on one.
+        // XFF exhausted on trusted entries, `Forwarded` exhausted on one
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "10.0.0.7, 10.0.0.8".parse().unwrap());
         headers.insert(header::FORWARDED, "for=10.0.0.9".parse().unwrap());
@@ -841,7 +812,7 @@ mod tests {
             peer().ip()
         );
 
-        // Mirror: the `Forwarded` chain is the exhausted one.
+        // Mirror: the `Forwarded` chain is the exhausted one
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
         headers.insert(
@@ -854,28 +825,25 @@ mod tests {
         );
     }
 
-    /// The remaining disagreement, pinned deliberately: a client that sends
-    /// its own `Forwarded` (or arrives behind a proxy that writes only
-    /// `Forwarded`) beside an XFF-writing peer is indistinguishable from a
-    /// forgery, so under the `both` declaration the key is the peer's.
-    /// That bucket is *shared*, one window for everything that lands there,
-    /// which is the documented cost of failing closed here, never a
-    /// bypass: the key is still not the client's choice.
+    /// A client sending its own `Forwarded` beside an XFF-writing peer is
+    /// indistinguishable from a forgery, so under the `both` declaration
+    /// the key is the peer's. That bucket is *shared*, one window for
+    /// everything that lands there: the documented cost of failing closed,
+    /// never a bypass (the key is still not the client's choice).
     #[test]
     fn a_disagreeing_client_forwarded_lands_in_the_shared_peer_bucket() {
         let mut headers = HeaderMap::new();
-        // The peer (nginx) writes XFF with the address it observed.
+        // The peer (nginx) writes XFF with the address it observed
         headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-        // The client, or a proxy in front of nginx, writes this one.
+        // The client, or a proxy in front of nginx, writes this one
         headers.insert(header::FORWARDED, "for=6.6.6.6".parse().unwrap());
         assert_eq!(key_both(&headers), peer().ip());
     }
 
-    /// The same request with only the proxy's XFF and no `Forwarded` at all
-    /// still resolves through the XFF walk when the operator declared
-    /// `xff`: a legacy proxy that writes XFF only must keep its
-    /// per-client rate-limit key. Under the `both` declaration the missing
-    /// half is a disagreement and the peer wins.
+    /// Only the proxy's XFF, no `Forwarded` at all, still resolves through
+    /// the XFF walk under the `xff` declaration: a legacy proxy that
+    /// writes XFF only must keep its per-client key. Under `both` the
+    /// missing half is a disagreement and the peer wins.
     #[test]
     fn xff_is_still_honored_when_no_forwarded_is_present() {
         let mut headers = HeaderMap::new();
@@ -886,8 +854,7 @@ mod tests {
 
     /// RFC 7230 §3.2.2: a repeated header field is one field with the
     /// values joined by commas. Reading only the first value would drop
-    /// the entries the proxy appended after it, and the client address
-    /// with them.
+    /// the entries the proxy appended after it.
     #[test]
     fn a_repeated_forwarded_header_is_read_as_one_joined_field() {
         let mut headers = HeaderMap::new();
@@ -907,7 +874,7 @@ mod tests {
     #[test]
     fn chain_with_all_trusted_entries_falls_back_to_peer() {
         // Both hops are inside the trusted CIDR, walking past them all
-        // leaves nothing usable, so the peer wins.
+        // leaves nothing usable, so the peer wins
         let h = xff("2.2.2.2, 2.2.2.2");
         assert_eq!(key_xff(&h), peer().ip());
     }
@@ -918,19 +885,19 @@ mod tests {
     /// literal alike, in both headers.
     #[test]
     fn port_suffixed_entries_still_name_the_client() {
-        // XFF: a bare IPv4 literal with port, and a bracketed IPv6 literal.
+        // XFF: a bare IPv4 literal with port, and a bracketed IPv6 literal
         let h = xff("9.9.9.9:5678");
         assert_eq!(key_xff(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
         let h = xff("[2001:db8::1]:443");
         assert_eq!(key_xff(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
 
-        // Forwarded: the quoted and the unquoted shape.
+        // Forwarded: the quoted and the unquoted shape
         let h = fwd("for=\"9.9.9.9:5678\"");
         assert_eq!(key_forwarded(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
         let h = fwd("for=[2001:db8::1]:443");
         assert_eq!(key_forwarded(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
 
-        // A bare IPv6 literal is never mistaken for `ip:port`.
+        // A bare IPv6 literal is never mistaken for `ip:port`
         let h = xff("2001:db8::1");
         assert_eq!(key_xff(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
     }
@@ -961,7 +928,7 @@ mod tests {
     fn forwarded_walks_right_to_left_past_trusted_for_entries() {
         // The innermost trusted proxy's observation is on the right
         // (for=2.2.2.2); the walk starts there, skips the trusted entry and
-        // returns the client IP the first trusted hop observed (1.1.1.1).
+        // returns the client IP the first trusted hop observed (1.1.1.1)
         let h = fwd("for=1.1.1.1, for=2.2.2.2");
         assert_eq!(key_forwarded(&h), "1.1.1.1".parse::<IpAddr>().unwrap());
     }
@@ -972,17 +939,16 @@ mod tests {
         assert_eq!(key_forwarded(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
     }
 
-    /// RFC 7239 §4 does not pin parameter ordering. A non-`for=` parameter
-    /// appearing before the `for=` must not abort the walk, only the `for=`
-    /// parameter is load-bearing for the originating-client lookup. The
-    /// audit's reported shape was `Forwarded: proto=https;for=1.2.3.4` and
-    /// the pre-fix code bailed at `proto=https` (`?` on `strip_prefix`).
+    /// RFC 7239 §4 does not pin parameter ordering: a non-`for=` parameter
+    /// before the `for=` must not abort the walk. The audit's reported
+    /// shape was `Forwarded: proto=https;for=1.2.3.4` and the pre-fix code
+    /// bailed at `proto=https`.
     #[test]
     fn walk_forwarded_takes_first_for_param_regardless_of_position() {
         let h = fwd("proto=https;for=1.2.3.4");
         assert_eq!(key_forwarded(&h), "1.2.3.4".parse::<IpAddr>().unwrap());
-        // Also pin a chain shape with a non-`for=` parameter in the same
-        // entry to make sure the loop walks the whole `;`-separated list.
+        // A non-`for=` parameter in the same entry: the loop walks the
+        // whole `;`-separated list
         let h = fwd("for=1.2.3.4;by=2.2.2.2;proto=https");
         assert_eq!(key_forwarded(&h), "1.2.3.4".parse::<IpAddr>().unwrap());
     }
@@ -994,7 +960,7 @@ mod tests {
         assert!(limiter.allow("ip1").await);
         assert!(limiter.allow("ip1").await);
         assert!(!limiter.allow("ip1").await);
-        // Other keys are independent.
+        // Other keys are independent
         assert!(limiter.allow("ip2").await);
     }
 
@@ -1021,18 +987,18 @@ mod tests {
     async fn rate_limiter_refund_returns_the_hit_to_the_window() {
         let limiter = RateLimiter::new(2, Duration::from_secs(60));
         // One request counted here, rejected deeper, the refund leaves
-        // the window exactly as it was before the request arrived.
+        // the window exactly as it was before the request arrived
         assert!(limiter.allow("ip1").await);
         limiter.refund("ip1").await;
 
-        // The full quota is still available.
+        // The full quota is still available
         assert!(limiter.allow("ip1").await);
         assert!(limiter.allow("ip1").await);
         assert!(!limiter.allow("ip1").await);
 
         // Refunding a key that was never counted is a no-op, not a credit:
         // a below-zero wrap (fetch_sub on 0) would blacklist the key for
-        // the whole window instead.
+        // the whole window instead
         limiter.refund("never-seen").await;
         assert!(limiter.allow("never-seen").await);
         assert!(limiter.allow("never-seen").await);

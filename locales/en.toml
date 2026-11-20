@@ -1,9 +1,7 @@
-# Fumox: admin panel messages (English).
-# Format: flat "domain.name" = "text" pairs.
-# Quoted names and values in text use straight ASCII quotes, escaped as \" in TOML strings.
-# The file name is the language code. Placeholders in values: {} —
-# positional, substituted by the caller via .replace("{}", …); {0}/{1} —
-# positional, via t_args; {name} — named, via t_named.
+# Fumox admin panel messages (English), flat "domain.name" = "text" pairs.
+# Quoted names and values in text use straight ASCII quotes, escaped as \" in TOML strings
+# Placeholders: {} positional via .replace("{}", …), {0}/{1} via t_args,
+# {name} via t_named
 
 "common.action_failed" = "The action failed"
 "common.admin" = "Admin"
@@ -692,7 +690,7 @@
 "val.url_ssrf" = "SSRF protection: {0}"
 "val.url_too_long" = "the URL is longer than {0} characters"
 
-# Field caps: guard against unbounded stored form input.
+# Field caps: guard against unbounded stored form input
 "val.field_too_long" = "at most {} characters"
 "val.pipeline_builder_too_long" = "the pipeline is too large: the limit is {} bytes; reduce the number of widget rows"
 "val.pipeline_too_long" = "the pipeline is too large: the limit of {} bytes applies to the compact JSON that is stored, so a document this size has to be edited in builder mode"

@@ -1,8 +1,6 @@
-# Fumox: сообщения админ-панели (русский).
-# Формат: плоский список ключей "домен.имя" = "текст".
-# Имя файла задаёт код языка. Подстановки в тексте: {} — позиционная,
-# подставляется вызывающим кодом через .replace("{}", …); {0}/{1} —
-# позиционные, через t_args; {name} — именные, через t_named.
+# Fumox admin panel messages (Russian), flat "domain.name" = "text" pairs.
+# Placeholders: {} positional via .replace("{}", …), {0}/{1} via t_args,
+# {name} via t_named
 
 "common.action_failed" = "Действие не выполнено"
 "common.admin" = "Админка"
@@ -691,7 +689,7 @@
 "val.url_ssrf" = "SSRF-защита: {0}"
 "val.url_too_long" = "URL длиннее {0} символов"
 
-# Лимиты полей: защита от раздувания хранимых форм.
+# Field caps: guard against unbounded stored form input
 "val.field_too_long" = "не длиннее {} символов"
 "val.pipeline_builder_too_long" = "конвейер слишком велик: предел {} байт; сократите число строк"
 "val.pipeline_too_long" = "конвейер слишком большой: предел в {} байт применяется к компактному JSON, который сохраняется, поэтому документ такого размера нужно править в режиме конструктора"

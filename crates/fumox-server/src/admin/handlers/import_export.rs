@@ -1,33 +1,29 @@
 //! Configuration import/export.
 //!
 //! Export serializes every source and profile (plus profile composition)
-//! into a versioned JSON file; import recreates them. The semantics are
-//! **create-new only**: imported objects always
-//! receive fresh `nanoid(12)` ids, profile composition is remapped onto the
-//! new source ids, and existing rows are never overwritten. Slug collisions
-//! with the database (or within the file) drop the slug rather than the
-//! object; a source and a profile live in separate slug name-spaces (one
-//! UNIQUE column each), so the same slug on both is kept on both. References
-//! to sources absent from the file are excluded from the composition. Both
-//! cases surface as warnings, not errors. A reference
-//! repeated inside one profile is kept once (the composition is keyed by
-//! source, a repeat would abort the insert after the profile row was
-//! already written). Two *source rows* sharing one reference are a hard
-//! error: the reference binds them together, so the file does not say
-//! which row a profile composition means.
+//! into a versioned JSON file; import recreates them, create-new only:
+//! fresh `nanoid(12)` ids, profile composition remapped onto the new
+//! source ids, existing rows never overwritten. Slug collisions with the
+//! database (or within the file) drop the slug rather than the object; a
+//! source and a profile live in separate slug name-spaces (one UNIQUE
+//! column each), so the same slug on both is kept on both. References to
+//! sources absent from the file are excluded from the composition. Both
+//! cases surface as warnings, not errors. A reference repeated inside one
+//! profile is kept once (the composition is keyed by source); two *source
+//! rows* sharing one reference are a hard error: the reference binds them
+//! together, so the file does not say which row a profile composition
+//! means.
 //!
-//! The file carries the source request headers as stored — in plain
-//! text, secrets included — so a downloaded export must be handled as a
+//! The file carries the source request headers as stored, in plain text
+//! with secrets included, so a downloaded export must be handled as a
 //! secret (the export hint on the screen says the same).
 //!
 //! Validation mirrors the source/profile forms (the shared field
 //! validators in [`super`]) and is all-or-nothing: any hard error yields a
 //! 422 with the full list and writes nothing. A *transient* DNS failure is
-//! not a hard error: the URL is vetted again at fetch time, so it is
-//! reported as a warning and the import continues.
-//!
-//! The write phase runs in one transaction: a failure half-way through
-//! leaves the database exactly as it was.
+//! not a hard error: the URL is vetted again at fetch time. The write
+//! phase runs in one transaction: a failure half-way through leaves the
+//! database exactly as it was.
 
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -66,8 +62,6 @@ pub(in crate::admin) struct ImportPayloadForm {
 
 /// Only schema version we understand today.
 const SUPPORTED_VERSION: u32 = 1;
-
-// Wire format
 
 /// Versioned export file. `ref` carries the original id so profile
 /// composition can be remapped onto fresh ids at import time; primary keys
@@ -161,7 +155,7 @@ impl From<&models::Source> for ExportSource {
             reference: s.id.clone(),
             slug: s.slug.clone(),
             // The stored token is a hash, so the file carries the hash: no
-            // working secret ever leaves the deployment.
+            // working secret ever leaves the deployment
             access_token: s.access_token.clone(),
             name: s.name.clone(),
             url: s.url.clone(),
@@ -185,7 +179,7 @@ impl From<&models::Profile> for ExportProfile {
             // The stored token is a hash, so the file carries the hash: no
             // working secret ever leaves the deployment, and the import
             // stores the same hash, which keeps the endpoint usable for
-            // the clients that already know the token.
+            // the clients that already know the token
             access_token: p.access_token.clone(),
             name: p.name.clone(),
             output_format: p.output_format,
@@ -194,7 +188,7 @@ impl From<&models::Profile> for ExportProfile {
             include_unknown_country: p.include_unknown_country,
             enabled: p.enabled,
             // The composition is per-deployment state, not a stable field:
-            // `export_config` resolves it separately, in profile order.
+            // `export_config` resolves it separately, in profile order
             source_refs: Vec::new(),
         }
     }
@@ -205,7 +199,7 @@ impl From<ExportSource> for models::Source {
         Self {
             // Stamped by the write phase (a fresh id, the collision-checked
             // slug, the creation stamps); the last-error facts belong to
-            // the new row, not to the file.
+            // the new row, not to the file
             id: String::new(),
             slug: s.slug,
             access_token: s.access_token,
@@ -215,7 +209,7 @@ impl From<ExportSource> for models::Source {
             encoding: s.encoding,
             input_format: s.input_format,
             // An empty allowlist means "no filter", never "nothing passes":
-            // the list is normalised before the source is written.
+            // the list is normalised before the source is written
             protocols: models::normalize_protocols(s.protocols),
             cache_ttl_seconds: s.cache_ttl_seconds,
             tags: s.tags,
@@ -236,7 +230,7 @@ impl From<ExportProfile> for models::Profile {
         Self {
             // Stamped by the write phase, like [`models::Source`] above;
             // the country allowlist is normalized by the caller, which
-            // owns the validation language for its messages.
+            // owns the validation language for its messages
             id: String::new(),
             slug: p.slug,
             access_token: p.access_token,
@@ -251,8 +245,6 @@ impl From<ExportProfile> for models::Profile {
         }
     }
 }
-
-// Export
 
 /// Which import cap an export exceeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -302,7 +294,7 @@ fn serialize_export(
     file: &ConfigExport,
 ) -> Result<(BytesMut, Option<ImportLimit>), serde_json::Error> {
     // The row caps are counts on the in-memory file: they need no
-    // serialization.
+    // serialization
     if let Some(limit) = if file.sources.len() > caps::IMPORT_ROWS {
         Some(ImportLimit {
             cap: ImportCap::Rows,
@@ -335,7 +327,7 @@ fn serialize_export(
         return Ok((body, None));
     }
     // Over the byte cap: re-measure the marker says so on the size the
-    // plain document had.
+    // plain document had
     let limit = ImportLimit {
         cap: ImportCap::Bytes,
         limit: caps::IMPORT_BODY_BYTES,
@@ -368,8 +360,8 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
         export_sources.push(ExportSource::from(s));
     }
 
-    // One read groups the whole composition table by profile; the
-    // per-profile read below used to issue one indexed query per row.
+    // One read groups the whole composition table by profile, instead of
+    // one indexed query per profile row
     let compositions = match profiles::sources_by_profile(&state.pool).await {
         Ok(compositions) => compositions,
         Err(err) => return super::server_error(&state, &headers, "export.profile_sources", &err),
@@ -379,7 +371,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     for p in &prof_rows {
         let mut export = ExportProfile::from(p);
         // Each profile's rows arrive in position order (the query orders
-        // them, the same order the per-profile read sorted into).
+        // them, the same order the per-profile read sorted into)
         export.source_refs = compositions
             .get(&p.id)
             .map(|rows| rows.iter().map(|(id, _)| id.clone()).collect())
@@ -399,7 +391,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     };
 
     // The audit line carries the row counts only: no URL, no token, no
-    // peer data.
+    // peer data
     tracing::info!(
         sources = file.sources.len(),
         profiles = file.profiles.len(),
@@ -420,7 +412,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/json; charset=utf-8"),
     );
-    // ASCII-only value (fixed prefix + calendar date), try_from cannot fail.
+    // ASCII-only value (fixed prefix + calendar date), try_from cannot fail
     if let Ok(value) =
         header::HeaderValue::try_from(format!("attachment; filename=\"fumox-config-{date}.json\""))
     {
@@ -430,8 +422,6 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     }
     response
 }
-
-// Import
 
 /// Outcome of a successful import.
 #[derive(Debug, Default)]
@@ -522,7 +512,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
     } = args;
     // The links are a convenience panel, not the subject of the page: a
     // broken counter or token hides the block instead of replacing the
-    // whole screen with an error page.
+    // whole screen with an error page
     let endpoints = match endpoint_links(state, peer, headers).await {
         Ok(links) => Some(links),
         Err(err) => {
@@ -628,7 +618,7 @@ async fn stage_import(
                 .replace("{}", &parsed.version.to_string()),
         ]),
         Ok(parsed) => {
-            // All-or-nothing validation pass.
+            // All-or-nothing validation pass
             let validation = validate_import(state, lang, &parsed).await;
             if validation.errors.is_empty() {
                 Ok((parsed, validation.warnings))
@@ -674,7 +664,7 @@ pub async fn import_submit(
 
     // The document cap: the payload travels urlencoded (every byte up to
     // three), so the transport limit is not the document limit. The
-    // document is measured here, before it is parsed.
+    // document is measured here, before it is parsed
     if payload.len() > caps::IMPORT_BODY_BYTES {
         let errors = vec![lang.t_args(
             "io.err_too_large",
@@ -702,7 +692,7 @@ pub async fn import_submit(
                 "configuration imported"
             );
             // The operator gets the totals in a toast on the import
-            // screen; the details stay in the log.
+            // screen; the details stay in the log
             for warning in &summary.warnings {
                 tracing::info!(warning = %warning, "import warning");
             }
@@ -768,7 +758,7 @@ pub async fn rotate_alive_token(
             // Audit line for a capability change that instantly invalidates
             // both export links (one secret, shared by /export/alive and
             // /export/ready). The peer names who ran the rotation; the
-            // token value itself is never logged.
+            // token value itself is never logged
             tracing::info!(peer = %peer, "alive-export capability token rotated");
             super::flash_redirect("/admin/import", lang.t("io.alive_rotated"), "ok")
         }
@@ -807,7 +797,7 @@ fn push_pipeline_errors(
 ) {
     // Same cap the source form applies: the JSON is stored verbatim and
     // re-rendered into every edit form, and the preview
-    // recompiles it on each keystroke.
+    // recompiles it on each keystroke
     if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
         errors.push(format!(
             "{ctx}: {}",
@@ -836,7 +826,7 @@ fn push_pipeline_errors(
 async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -> ImportValidation {
     // Row-count caps: one 1 MiB body could carry thousands of rows, each
     // triggering cache invalidation and (before the window below) a DNS
-    // lookup. Nothing else is worth checking past the caps.
+    // lookup. Nothing else is worth checking past the caps
     let mut validation = ImportValidation {
         errors: row_cap_errors(file, lang),
         ..Default::default()
@@ -849,14 +839,14 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     // compositions naming it. Two rows sharing one are ambiguous: the
     // write phase keys new ids by reference, so the second row would win
     // and the first be silently orphaned. Reject the file instead of
-    // guessing which of the two the operator meant.
+    // guessing which of the two the operator meant
     let mut seen_refs: HashSet<&str> = HashSet::new();
 
     // Whether each source's URL passed the static check: only those are
-    // worth a name lookup.
+    // worth a name lookup
     let mut url_is_valid: Vec<bool> = Vec::with_capacity(file.sources.len());
 
-    // The static pass: every row, no name resolution, no I/O.
+    // The static pass: every row, no name resolution, no I/O
     for (index, s) in file.sources.iter().enumerate() {
         let url_ok = validate_source_row(s, index, &mut seen_refs, lang, &mut validation.errors);
         url_is_valid.push(url_ok);
@@ -866,7 +856,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     }
 
     // The DNS pass over the statically-valid URLs, bounded by its own
-    // window: see `vet_dns_window`.
+    // window: see `vet_dns_window`
     vet_dns_window(state, lang, file, &url_is_valid, &mut validation).await;
 
     validation
@@ -922,7 +912,7 @@ fn validate_source_row<'a>(
     // The same floor the profile token has: a third-party file must
     // not plant a guessable secret on a public endpoint (`/src`), and
     // an already-hashed value is what a deployment stored, not what
-    // the file chooses.
+    // the file chooses
     if let Some(token) = s.access_token.as_deref()
         && !token.is_empty()
         && !fumox_core::token::is_hashed(token)
@@ -968,14 +958,10 @@ fn validate_profile_row(p: &ExportProfile, index: usize, lang: &Lang, errors: &m
     {
         errors.push(format!("{ctx}: {message}"));
     }
-    // Imported access tokens: a third-party file
-    // must not plant a guessable secret on a public endpoint. Tokens
-    // shorter than the floor are hard errors, silently regenerating
-    // them would change what the operator expects the file to contain.
-    //
-    // A token that is already a hash is not a secret the file chooses:
-    // it is what this deployment stored (the export of a hashed row),
-    // and the plaintext rules below do not apply to it.
+    // Imported access tokens: a third-party file must not plant a
+    // guessable secret on a public endpoint. A token that is already a
+    // hash is what this deployment stored (the export of a hashed row),
+    // and the plaintext rules do not apply to it
     if let Some(token) = p.access_token.as_deref()
         && !token.is_empty()
         && !fumox_core::token::is_hashed(token)
@@ -1076,7 +1062,7 @@ async fn vet_dns_window(
                 } else {
                     // A name that did not resolve (timeout, SERVFAIL) says
                     // nothing about the target: the row goes in and is
-                    // vetted again at fetch time.
+                    // vetted again at fetch time
                     validation.warnings.push(format!(
                         "{ctx}: {message} — {}",
                         lang.t("io.warn_dns_transient")
@@ -1093,7 +1079,7 @@ async fn vet_dns_window(
     // Not an error: the URLs the window left behind were only statically
     // validated and are re-vetted (with DNS) at fetch time. The operator
     // sees it either way: the deadline case keeps its own warning, the
-    // budget case says how many rows it covered.
+    // budget case says how many rows it covered
     let total_valid = url_is_valid.iter().filter(|ok| **ok).count();
     let unvetted = total_valid.saturating_sub(vetted);
     if expired {
@@ -1137,7 +1123,7 @@ async fn apply_import(
     // `/sub/{id}` (serve.rs:234) and `sources::resolve_token` behind
     // `/src/{id}` (serve.rs:295), each querying one table. The same slug is
     // therefore legal on a source and on a profile, and must survive the
-    // round trip on both.
+    // round trip on both
     let mut taken_source_slugs: HashSet<String> = sources::list_slugs(&state.pool)
         .await?
         .into_iter()
@@ -1155,14 +1141,14 @@ async fn apply_import(
 
     // BEGIN IMMEDIATE: the write phase takes the WAL write lock up front,
     // so a concurrent writer cannot slip in between the rows of one
-    // import.
+    // import
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
 
     for s in file.sources {
         let id = models::new_id();
         ref_to_id.insert(s.reference.clone(), id.clone());
         // The stable fields come from the file; the write phase stamps the
-        // fresh id, the collision-checked slug and the creation stamps.
+        // fresh id, the collision-checked slug and the creation stamps
         let mut source = models::Source::from(s);
         source.slug = claim_slug(
             source.slug.take(),
@@ -1177,7 +1163,7 @@ async fn apply_import(
         sources::create(&mut *tx, &source).await?;
         // No cache invalidation: the id is brand new, no rendered output can
         // reference it yet, and `last_fetched_at` is NULL, so the first
-        // ingest is due immediately.
+        // ingest is due immediately
         summary.sources_created += 1;
     }
 
@@ -1185,13 +1171,13 @@ async fn apply_import(
         let id = models::new_id();
 
         // Remap composition onto the freshly created source ids; references
-        // to sources missing from the file are dropped with a warning.
+        // to sources missing from the file are dropped with a warning
         // A reference repeated inside one profile collapses to its first
         // position: `profile_sources` is keyed by (profile_id, source_id),
         // so writing it twice aborts the whole composition insert, after
         // the profile row was already committed, leaving an empty profile
         // behind a 500. `/admin/export` never emits a duplicate ref, so
-        // this only ever sees a hand-edited file.
+        // this only ever sees a hand-edited file
         let mut composition: Vec<(String, i64)> = Vec::new();
         let mut placed: HashSet<String> = HashSet::new();
         for (position, reference) in p.source_refs.iter().enumerate() {
@@ -1213,7 +1199,7 @@ async fn apply_import(
         // The write phase stamps the fresh id, the collision-checked slug,
         // the normalized allowlist and the creation stamps. A plaintext
         // token from a hand-written file is hashed by the repository; a
-        // hash from an export is stored as it is.
+        // hash from an export is stored as it is
         profile.slug = claim_slug(
             profile.slug.take(),
             &mut taken_profile_slugs,
@@ -1226,7 +1212,7 @@ async fn apply_import(
         // list this call refuses cannot come through `validate_import`, so
         // an error means the gate was bypassed — and an empty list means
         // "no filtering" (`ExportProfile`), so defaulting to one would
-        // widen access instead of failing the import.
+        // widen access instead of failing the import
         profile.countries = validate_countries(&profile.countries, lang).map_err(|message| {
             fumox_core::Error::Config(format!("imported profile «{}»: {message}", profile.name))
         })?;
@@ -1243,7 +1229,7 @@ async fn apply_import(
 
     // The caches are touched only after the commit: an invalidation for a
     // profile the transaction rolled back would evict a live entry for
-    // nothing.
+    // nothing
     for id in &created_profiles {
         state.caches.invalidate_profile(id).await;
     }
@@ -1318,7 +1304,7 @@ mod tests {
     #[test]
     fn export_file_round_trips_through_json() {
         let mut s1 = source("srcA0000000", "s1", Some("slug-a"));
-        // A pinned IP family rides along and survives the round trip.
+        // A pinned IP family rides along and survives the round trip
         s1.ip_family = Some(IpFamily::Ipv4);
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
@@ -1327,7 +1313,7 @@ mod tests {
             profiles: vec![profile("p1", Some("prof-a"), &["srcA0000000"])],
         };
         // A country allowlist rides along and survives the round trip;
-        // an empty list is omitted from the file entirely.
+        // an empty list is omitted from the file entirely
         let mut p1 = profile("p2", None, &["srcA0000000"]);
         p1.countries = vec!["DE".into(), "US".into()];
         let file = ConfigExport {
@@ -1335,7 +1321,7 @@ mod tests {
             ..file
         };
         let json = serde_json::to_string(&file).unwrap();
-        // The ref key (not "reference") is what lands in the file.
+        // The ref key (not "reference") is what lands in the file
         assert!(json.contains("\"ref\":\"srcA0000000\""));
         assert!(json.contains("\"countries\":[\"DE\",\"US\"]"));
         assert!(json.contains("\"ip_family\":\"ipv4\""));
@@ -1367,17 +1353,14 @@ mod tests {
         let mut taken: HashSet<String> = ["taken".to_string()].into_iter().collect();
         let mut summary = ImportSummary::default();
 
-        // A free slug is claimed.
         assert_eq!(
             claim_slug(Some("free".into()), &mut taken, "n", &lang, &mut summary),
             Some("free".into())
         );
-        // Reusing it now collides → None + warning.
         assert_eq!(
             claim_slug(Some("free".into()), &mut taken, "n", &lang, &mut summary),
             None
         );
-        // A slug taken by the DB also collides.
         assert_eq!(
             claim_slug(Some("taken".into()), &mut taken, "n", &lang, &mut summary),
             None
@@ -1393,7 +1376,7 @@ mod tests {
             crate::admin::test_admin_state(Default::default(), Default::default()).await;
         let lang = state.locales.default_lang();
 
-        // 501 sources trip the row cap before any DNS work happens.
+        // 501 sources trip the row cap before any DNS work happens
         let flood = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,
@@ -1404,7 +1387,7 @@ mod tests {
         };
         let errors = validate_import(&state, &lang, &flood).await.errors;
         // The cap is substituted into the message before the kind suffix
-        // is appended, so the assert matches the substituted wording.
+        // is appended, so the assert matches the substituted wording
         let wording = lang
             .t("val.import_too_many_rows")
             .replace("{}", &caps::IMPORT_ROWS.to_string());
@@ -1414,7 +1397,7 @@ mod tests {
         );
 
         // A profile with a guessable short token from a third-party file is
-        // rejected (the endpoint would be "protected" by a known secret).
+        // rejected (the endpoint would be "protected" by a known secret)
         let mut planted = profile("p", None, &[]);
         planted.access_token = Some("123".to_string());
         let file = ConfigExport {
@@ -1426,7 +1409,6 @@ mod tests {
         let errors = validate_import(&state, &lang, &file).await.errors;
         assert!(!errors.is_empty(), "short imported token must be rejected");
 
-        // A proper-length token passes validation.
         let mut ok = profile("p", None, &[]);
         ok.access_token = Some("a".repeat(32));
         let file = ConfigExport {
@@ -1446,7 +1428,7 @@ mod tests {
         let (_dir, state) = test_state().await;
         let lang = state.locales.default_lang();
 
-        // Right length, so only the charset rule can reject these.
+        // Right length, so only the charset rule can reject these
         for token in [
             format!("{} ", "a".repeat(caps::TOKEN_MIN)),
             "ё".repeat(caps::TOKEN_MIN),
@@ -1492,7 +1474,7 @@ mod tests {
         let pool = state.pool.clone();
         let lang = state.locales.default_lang();
 
-        // The DB itself allows one slug on both tables.
+        // The DB itself allows one slug on both tables
         let now = models::now_ts();
         let existing_source = models::Source {
             slug: Some("main".into()),
@@ -1517,7 +1499,7 @@ mod tests {
         profiles::create(&pool, &existing_profile).await.unwrap();
 
         // Importing the same deployment again: every object collides
-        // with its own table's row, so nothing may keep a slug.
+        // with its own table's row, so nothing may keep a slug
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,
@@ -1540,7 +1522,7 @@ mod tests {
 
         // A fresh deployment importing the same file: the source and the
         // profile share a slug, and both must keep it, each in its own
-        // table.
+        // table
         let (_dir, fresh) = test_state().await;
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
@@ -1667,7 +1649,7 @@ mod tests {
         );
 
         // Distinct references stay silent under the same rule, whatever the
-        // URLs vet to in this environment.
+        // URLs vet to in this environment
         let file = ConfigExport {
             sources: vec![
                 source("srcA0000000", "s1", None),
@@ -1728,7 +1710,6 @@ mod tests {
             "the cap, not a pipeline semantic, is the reason: {errors:?}"
         );
 
-        // A pipeline inside the cap still imports.
         let mut s = source("srcA0000000", "s1", None);
         s.pipeline = Some(serde_json::json!({ "version": 1 }));
         let file = ConfigExport {
@@ -1751,7 +1732,7 @@ mod tests {
         let (_dir, state) = test_state().await;
         let old = state.export_token.current(&state.pool).await.unwrap();
 
-        // The shared test writer of `fumox_core::logging::capture`.
+        // The shared test writer of `fumox_core::logging::capture`
         let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1768,7 +1749,6 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-        // The rotation took effect: a fresh token replaced the old one.
         let new = fumox_core::repo::meta_get(&state.pool, crate::alive_export::TOKEN_KEY)
             .await
             .unwrap()
@@ -1803,7 +1783,7 @@ mod tests {
         };
         sources::create(&pool, &source).await.unwrap();
 
-        // The shared test writer of `fumox_core::logging::capture`.
+        // The shared test writer of `fumox_core::logging::capture`
         let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1842,7 +1822,7 @@ mod tests {
         let lang = state.locales.default_lang();
 
         // The second profile insert aborts; the source and the first
-        // profile are already written when it happens.
+        // profile are already written when it happens
         sqlx::query(
             "CREATE TRIGGER block_p2 BEFORE INSERT ON profiles
              WHEN NEW.name = 'p2'
@@ -1869,8 +1849,6 @@ mod tests {
             "the write error must surface: {err}"
         );
 
-        // Nothing survived the abort: neither the source nor the profile
-        // written before it.
         let rows = sources::list(&pool, false).await.unwrap();
         assert!(rows.is_empty(), "the source must be rolled back: {rows:?}");
         let rows = profiles::list(&pool, false).await.unwrap();
@@ -1894,7 +1872,7 @@ mod tests {
 
         let mut p1 = profile("p1", None, &[]);
         // Three letters: no entry of the list parses, and `validate_import`
-        // refuses the file with the same message.
+        // refuses the file with the same message
         p1.countries = vec!["DEU".into()];
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
@@ -1911,7 +1889,7 @@ mod tests {
         );
 
         // The refusal is a transaction abort, not a widened import: the
-        // profile must not be stored without its filter.
+        // profile must not be stored without its filter
         let rows = profiles::list(&pool, false).await.unwrap();
         assert!(rows.is_empty(), "nothing must be written: {rows:?}");
     }
@@ -1947,10 +1925,10 @@ mod tests {
     #[test]
     fn an_export_over_the_import_limits_says_so_in_the_file() {
         // The serializer answers with the response buffer; the assertions
-        // read it as text.
+        // read it as text
         let text = |body: BytesMut| String::from_utf8(body.to_vec()).unwrap();
 
-        // A small file is importable: no marker.
+        // A small file is importable: no marker
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,
@@ -1962,7 +1940,7 @@ mod tests {
         let body = text(body);
         assert!(!body.contains("import_limit"), "{body}");
 
-        // Too many rows: the row cap is named.
+        // Too many rows: the row cap is named
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,
@@ -1983,7 +1961,7 @@ mod tests {
             "the marker names the cap: {body}"
         );
 
-        // Within the row cap but over the byte cap: the size is named.
+        // Within the row cap but over the byte cap: the size is named
         let mut big = source("srcA0000000", "s1", None);
         big.name = "x".repeat(caps::IMPORT_BODY_BYTES);
         let file = ConfigExport {

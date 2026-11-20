@@ -31,8 +31,8 @@ pub enum RejectionReason {
     /// The `Host` header is present but its value can never be a host: a
     /// literal `@` (the userinfo separator), a non-ASCII byte, or a
     /// bracketed literal that is not a whole IPv6 address with an optional
-    /// port. A different failure than [`RejectionReason::Missing`] — the
-    /// header was sent, its value is just not a host — so the rejection
+    /// port. A different failure than [`RejectionReason::Missing`] (the
+    /// header was sent, its value is just not a host), so the rejection
     /// log names it differently.
     Malformed,
     /// Allowlist is non-empty and the host is set but does not match.
@@ -84,9 +84,9 @@ pub enum RequestHost {
 }
 
 /// The gate's view of the request authority. Extraction goes through the
-/// same [`host_header`] helper the serve-link builder uses; a value that is
-/// present but unreadable as text (a byte outside UTF-8) is
-/// [`RequestHost::Malformed`], not missing — the two read differently in
+/// same [`host_header`] helper the serve-link builder uses; a value that
+/// is present but unreadable as text (a byte outside UTF-8) is
+/// [`RequestHost::Malformed`], not missing: the two read differently in
 /// the rejection log.
 pub fn canonical_request_host(headers: &HeaderMap) -> RequestHost {
     match host_header(headers) {
@@ -98,7 +98,7 @@ pub fn canonical_request_host(headers: &HeaderMap) -> RequestHost {
         None => match headers.get(header::HOST) {
             // Present but not readable as text: the value can never be a
             // host, which is a different rejection than a header that is
-            // simply not there.
+            // simply not there
             Some(value) if value.to_str().is_err() => RequestHost::Malformed,
             _ => RequestHost::Missing,
         },
@@ -106,7 +106,7 @@ pub fn canonical_request_host(headers: &HeaderMap) -> RequestHost {
 }
 
 /// Canonicalization failed: the value can never be a host. The raw value
-/// is deliberately not carried on the error — it may be attacker-controlled
+/// is deliberately not carried on the error: it may be attacker-controlled
 /// and must not be echoed into a rejection log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MalformedHost;
@@ -142,26 +142,26 @@ fn canonicalize_host_str(raw: &str) -> Result<String, MalformedHost> {
     }
     // One `split_once`, three shapes: no colon (a name or an IPv4 literal),
     // a remainder free of colons (the single-colon `host:port` authority),
-    // a remainder still carrying colons (a bare IPv6).
+    // a remainder still carrying colons (a bare IPv6)
     match raw.split_once(':') {
         // A FQDN may spell a trailing dot; stripping it gives the name one
         // canonical form, so the allowlist match does not depend on the
-        // resolver style the client used.
+        // resolver style the client used
         None => Ok(strip_trailing_dot(&raw.to_ascii_lowercase()).to_owned()),
-        // Exactly one colon: a `host:port` authority.
+        // Exactly one colon: a `host:port` authority
         Some((host, port)) if !port.contains(':') => {
             Ok(strip_trailing_dot(&host.to_ascii_lowercase()).to_owned())
         }
         // Bare IPv6, wrap in brackets so the canonical form matches
-        // `[2001:db8::1]`.
+        // `[2001:db8::1]`
         Some(_) => Ok(format!("[{}]", raw.to_ascii_lowercase())),
     }
 }
 
 /// The tail of a bracketed literal: the content up to the closing `]`, and
 /// whatever rides on it. Only `]` and `]:digits` after a whole IPv6 address
-/// are hosts — the port must be all digits and nothing may follow it
-/// (`[::1]junk` is junk, not a host).
+/// are hosts (the port must be all digits and nothing may follow it;
+/// `[::1]junk` is junk, not a host).
 fn bracketed_ipv6(rest: &str) -> Result<String, MalformedHost> {
     let Some((inside, tail)) = rest.split_once(']') else {
         return Err(MalformedHost); // no closing bracket: never a host
@@ -188,11 +188,11 @@ fn strip_trailing_dot(host: &str) -> &str {
 
 /// A Host allowlist canonicalized once at config load. Every entry runs
 /// through the same [`canonicalize_host_str`] as the request hosts it is
-/// compared against, so the hot path is a plain string compare — no
+/// compared against, so the hot path is a plain string compare: no
 /// per-request canonicalization, no allocation. Built from
 /// `[server].allowed_hosts` or `[admin].allowed_hosts`; a port an entry
 /// spells is dropped, and an entry that can never be a host is dropped
-/// with it — both are named in the log, and the type is constructed at
+/// with it: both are named in the log, and the type is constructed at
 /// config load only, so the warnings land where the operator reads them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostAllowlist {
@@ -218,7 +218,7 @@ impl HostAllowlist {
             // `example.com:443` matches `example.com` on *any* port: worth
             // saying out loud, the operator may have meant the gate to pin
             // the port too. A bracketed IPv6 literal spells its port in
-            // the one form there is, so it is not called out.
+            // the one form there is, so it is not called out
             if !entry.starts_with('[') && authority_port(entry).is_some() {
                 tracing::warn!(
                     entry = %entry,
@@ -235,8 +235,8 @@ impl HostAllowlist {
         self.entries.is_empty()
     }
 
-    /// True when `host` — already canonical, the callers canonicalize the
-    /// request side — is on the list.
+    /// True when `host` (already canonical, the callers canonicalize the
+    /// request side) is on the list.
     fn contains(&self, host: &str) -> bool {
         self.entries.iter().any(|entry| entry == host)
     }
@@ -254,7 +254,7 @@ impl HostAllowlist {
 /// brackets (`[::1]`); a port an entry may spell is ignored.
 ///
 /// A missing, blank or malformed `Host` header is never on a non-empty
-/// allowlist, so it is rejected whenever one is configured — the
+/// allowlist, so it is rejected whenever one is configured: the
 /// deny-by-default semantic.
 pub fn validate_request_host(
     headers: &HeaderMap,
@@ -312,7 +312,7 @@ pub fn canonical_forwarded_host(headers: &HeaderMap, trusted_header: TrustedHead
     {
         // A malformed forwarded host is simply not usable: the caller
         // falls through to the RFC 7239 element, and the `Host` header
-        // carries its own rejection reason.
+        // carries its own rejection reason
         return host;
     }
     if trusted_header.honors_forwarded()
@@ -407,12 +407,13 @@ pub struct ServeLinkHost {
     pub from_header: bool,
 }
 
-/// The serve link's host comes from the same [`host_header`] extraction and
-/// the same canonicalization the gate uses — see [`canonicalize_host_str`]
-/// for what is rejected — plus a grammar check: only a well-formed
-/// authority (a DNS name, an IPv4 literal, a bracketed IPv6 literal)
-/// becomes a URL host component, the link carries a capability token and
-/// must not grow a path, a query or a userinfo from the header.
+/// The serve link's host comes from the same [`host_header`] extraction
+/// and the same canonicalization the gate uses (see
+/// [`canonicalize_host_str`] for what is rejected) plus a grammar check:
+/// only a well-formed authority (a DNS name, an IPv4 literal, a bracketed
+/// IPv6 literal) becomes a URL host component, the link carries a
+/// capability token and must not grow a path, a query or a userinfo from
+/// the header.
 fn serve_link_host(headers: &HeaderMap) -> Option<String> {
     let host = canonicalize_host_str(host_header(headers)?).ok()?;
     if host_grammar_ok(&host) {
@@ -466,7 +467,7 @@ pub fn build_serve_link_host(
     }
     // No usable Host header: fall back to the bound IP. The fallback is
     // distinguishable for the caller (`ServeLinkHost::from_header`), so
-    // the admin's serve-link builder can log it (see `serve_base`).
+    // the admin's serve-link builder can log it (see `serve_base`)
     Ok(ServeLinkHost {
         host: fallback_host(bind),
         port: None,
@@ -476,7 +477,7 @@ pub fn build_serve_link_host(
 
 /// The serve-link host when the request named no usable authority: the
 /// bound IP itself, loopback for an unspecified bind. The family follows
-/// the bind — an unspecified IPv6 bind (`[::]:8080`) never answers on
+/// the bind: an unspecified IPv6 bind (`[::]:8080`) never answers on
 /// IPv4, so its link must name the IPv6 loopback `[::1]`; the IPv4
 /// wildcard keeps `127.0.0.1` for the same reason, an IPv4 bind never
 /// answers on `::1`.
@@ -554,9 +555,8 @@ mod tests {
     /// Bare IPv6 (no brackets) is wrapped in brackets and lowercased so the
     /// canonical form matches the bracketed-input shape (`[x]`): a bare
     /// IPv6 address with a trailing port (`2001:db8::1:8080`) must stay
-    /// whole inside brackets — it is not a `host:port` pair, only the
-    /// single-colon form is (the branch whose remainder after the first
-    /// colon carries no colon).
+    /// whole inside brackets (it is not a `host:port` pair, only the
+    /// single-colon form is).
     #[test]
     fn canonicalize_host_str_handles_bare_ipv6() {
         assert_eq!(canon("2001:db8::1"), "[2001:db8::1]");
@@ -579,11 +579,11 @@ mod tests {
         ] {
             assert_eq!(canonicalize_host_str(raw), Err(MalformedHost), "{raw:?}");
         }
-        // The well-formed shapes still canonicalize.
+        // The well-formed shapes still canonicalize
         assert_eq!(canon("[::1]"), "[::1]");
         assert_eq!(canon("[::1]:80"), "[::1]");
         // The gate rejects the same values as malformed, and the one
-        // well-formed bracketed shape still matches its allowlist entry.
+        // well-formed bracketed shape still matches its allowlist entry
         let allowed = allowlist(&["[::1]"]);
         assert!(validate_request_host(&host("[::1]:80"), &allowed).is_ok());
         let err = validate_request_host(&host("[::1]junk"), &allowed).unwrap_err();
@@ -595,8 +595,8 @@ mod tests {
     /// gate itself is a no-op.
     #[test]
     fn build_serve_link_host_never_emits_userinfo() {
-        // `@` without a colon, the shape the gate's single-colon port strip
-        // used to leave untouched.
+        // `@` without a colon: the shape a plain single-colon port strip
+        // lets through
         let out = build_serve_link_host(
             bind(),
             &host("vpn.example.com@evil.com"),
@@ -604,7 +604,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.host, "127.0.0.1");
-        // Same with a port on the attacker side.
+        // Same with a port on the attacker side
         let out = build_serve_link_host(
             bind(),
             &host("vpn.example.com:8080@evil.com"),
@@ -612,7 +612,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.host, "127.0.0.1");
-        // An ordinary host still canonicalizes as before, allowlist or not.
+        // An ordinary host still canonicalizes as before, allowlist or not
         assert_eq!(
             build_serve_link_host(
                 bind(),
@@ -625,9 +625,9 @@ mod tests {
         );
     }
 
-    /// A `@` in the Host is a malformed value, not a missing one — the two
-    /// need different lines in the rejection log
-    /// ([`RejectionReason::Malformed`]).
+    /// A `@` in the Host is a malformed value, not a missing one (the two
+    /// need different lines in the rejection log,
+    /// [`RejectionReason::Malformed`]).
     #[test]
     fn canonical_request_host_rejects_userinfo_with_at_sign() {
         let h = host("vpn.example.com:8080@evil.com");
@@ -687,7 +687,7 @@ mod tests {
         );
         assert_eq!(canonical_request_host(&host("")), RequestHost::Missing);
         assert_eq!(canonical_request_host(&host("   ")), RequestHost::Missing);
-        // A bare `:port` carries no host either.
+        // A bare `:port` carries no host either
         assert_eq!(canonical_request_host(&host(":8080")), RequestHost::Missing);
     }
 
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(canon("vpn.example.com."), "vpn.example.com");
         assert_eq!(canon("vpn.example.com.:8081"), "vpn.example.com");
         // A lone dot is not a name; it stays as it is and can never match
-        // a real entry.
+        // a real entry
         assert_eq!(canon("."), ".");
         assert!(
             validate_request_host(&host("vpn.example.com."), &allowlist(&["vpn.example.com"]))
@@ -729,7 +729,7 @@ mod tests {
             assert!(link.from_header, "{raw:?}");
         }
         // The paths also agree on what is no host at all: the gate answers
-        // Missing, the builder falls back to the bind address.
+        // Missing, the builder falls back to the bind address
         let missing = host("   ");
         assert_eq!(canonical_request_host(&missing), RequestHost::Missing);
         let out = build_serve_link_host(bind(), &missing, &HostAllowlist::default()).unwrap();
@@ -753,12 +753,12 @@ mod tests {
 
     /// The allowlist is canonicalized once at load: an entry may spell an
     /// uppercase name and a port, the request host arrives lowercase and
-    /// bare — they must still match.
+    /// bare, and they must still match.
     #[test]
     fn allowlist_entries_are_canonicalized_once_at_load() {
         let allowed = allowlist(&["VPN.EXAMPLE.COM:443"]);
         assert!(validate_request_host(&host("vpn.example.com"), &allowed).is_ok());
-        // An IPv6 entry with a port matches the bare bracketed literal.
+        // An IPv6 entry with a port matches the bare bracketed literal
         let ipv6 = allowlist(&["[::1]:9999"]);
         assert!(validate_request_host(&host("[::1]"), &ipv6).is_ok());
     }
@@ -790,11 +790,11 @@ mod tests {
     fn build_serve_link_host_returns_canonical_when_in_allowlist() {
         let allowed = allowlist(&["vpn.example.com"]);
         // The port is stripped for the URL host component, the caller
-        // appends the public port from `[server].bind`.
+        // appends the public port from `[server].bind`
         let out = build_serve_link_host(bind(), &host("vpn.example.com:8081"), &allowed).unwrap();
         assert_eq!(out.host, "vpn.example.com");
         // The port the authority spelled is reported separately: behind a
-        // trusted proxy it is the public authority's port.
+        // trusted proxy it is the public authority's port
         assert_eq!(out.port, Some(8081));
     }
 
@@ -823,7 +823,7 @@ mod tests {
             );
         }
 
-        // A well-formed host still builds the link.
+        // A well-formed host still builds the link
         assert_eq!(
             build_serve_link_host(bind(), &host("vpn.example.com"), &HostAllowlist::default())
                 .unwrap()
@@ -840,11 +840,11 @@ mod tests {
 
     /// Without a usable `Host` header the link falls back to the bind
     /// address, family-aware: an unspecified IPv6 bind names the IPv6
-    /// loopback, the IPv4 wildcard the IPv4 one — and the fallback is
+    /// loopback, the IPv4 wildcard the IPv4 one. The fallback is
     /// distinguishable from a Host-derived link.
     #[test]
     fn build_serve_link_host_falls_back_to_a_family_matched_bind_address() {
-        // A specific IPv6 bind keeps its brackets.
+        // A specific IPv6 bind keeps its brackets
         let out = build_serve_link_host(
             "[2001:db8::1]:80".parse().unwrap(),
             &HeaderMap::new(),
@@ -853,7 +853,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.host, "[2001:db8::1]");
         assert!(!out.from_header);
-        // An unspecified IPv6 bind falls back to the IPv6 loopback.
+        // An unspecified IPv6 bind falls back to the IPv6 loopback
         let out = build_serve_link_host(
             "[::]:80".parse().unwrap(),
             &HeaderMap::new(),
@@ -861,7 +861,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.host, "[::1]");
-        // The IPv4 wildcard keeps the IPv4 loopback.
+        // The IPv4 wildcard keeps the IPv4 loopback
         let out = build_serve_link_host(
             "0.0.0.0:80".parse().unwrap(),
             &HeaderMap::new(),

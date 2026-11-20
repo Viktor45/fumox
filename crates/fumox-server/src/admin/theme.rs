@@ -11,7 +11,6 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 
-/// Theme cookie name.
 pub const THEME_COOKIE: &str = "fumox_theme";
 
 /// Interface theme. `Auto` is the default and follows the OS
@@ -19,12 +18,9 @@ pub const THEME_COOKIE: &str = "fumox_theme";
 /// custom properties and flips the palette on `[data-theme="dark"]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Theme {
-    /// Follow the OS setting (the default).
     #[default]
     Auto,
-    /// Day theme.
     Light,
-    /// Night theme.
     Dark,
 }
 
@@ -57,8 +53,8 @@ impl Theme {
     }
 }
 
-/// Read the selected theme from the `fumox_theme` cookie (`auto` — the
-/// system preference — when the cookie is absent or garbled).
+/// Read the selected theme from the `fumox_theme` cookie (the system
+/// preference `auto` when the cookie is absent or garbled).
 pub fn from_headers(headers: &axum::http::HeaderMap) -> Theme {
     super::cookie_value(headers, THEME_COOKIE)
         .map(Theme::parse)
@@ -109,8 +105,8 @@ mod tests {
         assert_eq!(Theme::parse(" light "), Theme::Light);
         assert_eq!(Theme::parse("dark"), Theme::Dark);
         assert_eq!(Theme::parse(" dark "), Theme::Dark);
-        // Anything else — an absent value, a garbled one — follows the
-        // system preference instead of pinning a palette.
+        // Anything else, an absent or garbled value, follows the
+        // system preference instead of pinning a palette
         assert_eq!(Theme::parse(""), Theme::Auto);
         assert_eq!(Theme::parse("blue"), Theme::Auto);
     }
@@ -127,7 +123,7 @@ mod tests {
         headers.insert(header::COOKIE, "fumox_theme=light".parse().unwrap());
         assert_eq!(from_headers(&headers), Theme::Light);
 
-        // No cookie (or a garbled one) means the system preference.
+        // No cookie (or a garbled one) means the system preference
         assert_eq!(from_headers(&axum::http::HeaderMap::new()), Theme::Auto);
         let mut garbled = axum::http::HeaderMap::new();
         garbled.insert(header::COOKIE, "fumox_theme=neon".parse().unwrap());

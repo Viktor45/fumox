@@ -3,20 +3,18 @@
 //!
 //! Every failure carries a class from the single `error_class` vocabulary
 //! (`network` / `http_server` / `http_client`): the coarse bucket the
-//! journal and the admin panel group failures by, not a retry verdict —
-//! retryability is answered separately by [`FetchFailure::is_recoverable`],
-//! which retries everything except the two terminal cases: a `permanent`
-//! network failure (the URL itself is unusable, e.g. an unparseable or
-//! unsupported-scheme address) and [`FetchFailure::ResponseTooLarge`] (a
-//! body over the cap is over it on every attempt). An SSRF-blocked URL is
-//! reported as `http_client` with status 403, the source configuration is
-//! at fault and retrying cannot help.
+//! journal and the admin panel group failures by, not a retry verdict.
+//! Retryability is answered by [`FetchFailure::is_recoverable`], which
+//! retries everything except the two terminal cases: a `permanent` network
+//! failure (the URL itself is unusable) and [`FetchFailure::ResponseTooLarge`]
+//! (a body over the cap is over it on every attempt). An SSRF-blocked URL
+//! is reported as `http_client` with status 403, retrying cannot help.
 //!
 //! Two paths have to stay the same path: the address that was vetted and
 //! the address that is connected to. The client ignores the environment
-//! proxy configuration for that reason (`no_proxy()`), and the vetted
-//! address is pinned into the request (`resolve()`), so nothing between
-//! the check and the connect can move the connection elsewhere.
+//! proxy configuration (`no_proxy()`) and the vetted address is pinned
+//! into the request (`resolve()`), so nothing between the check and the
+//! connect can move the connection elsewhere.
 //!
 //! One fetch has one wall-clock budget ([`MAX_FETCH_BUDGET`]): the first
 //! attempt, every retry and every backoff sleep share it, so a source
@@ -47,25 +45,17 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 /// the source's in-flight mark and one concurrency permit.
 pub(crate) const MAX_RETRIES: u32 = 16;
 /// Wall-clock ceiling for one fetch: the initial attempt, every retry and
-/// every backoff sleep together.
-///
-/// The retry count and the per-request timeout bound a *single* attempt.
-/// Without a ceiling for the whole fetch, a source that keeps answering
-/// `503` holds a concurrency permit and the source's in-flight mark for
-/// the sum of every backoff (16 retries from the shipped 500 ms base
-/// already reach ~33 s of pure sleep, and every attempt adds up to a
-/// connect plus a read timeout on top).
+/// every backoff sleep together. Without it, a source that keeps answering
+/// `503` holds a concurrency permit and the in-flight mark for the sum of
+/// every backoff.
 pub(crate) const MAX_FETCH_BUDGET: Duration = Duration::from_secs(180);
 
-/// The wall-clock ceiling of one fetch, in seconds. The admin panel
-/// quotes it next to the running refresh, so the operator knows how long
-/// a slow source may take before it is dropped.
+/// The wall-clock ceiling of one fetch, in seconds; the admin panel quotes
+/// it next to the running refresh.
 pub(crate) fn budget_seconds() -> u64 {
     MAX_FETCH_BUDGET.as_secs()
 }
 
-/// The number of requests one fetch may make: the first attempt plus
-/// every retry it is allowed.
 pub(crate) fn max_requests() -> u32 {
     MAX_RETRIES + 1
 }
@@ -77,7 +67,7 @@ pub struct FetchedPayload {
     pub bytes: u64,
     pub body: Vec<u8>,
     /// How many HTTP attempts produced the payload (first try plus every
-    /// retry), stamped by [`Fetcher::fetch`] once the loop is done.
+    /// retry).
     pub attempts: u32,
 }
 
@@ -88,12 +78,12 @@ pub enum FetchFailure {
     Network {
         message: String,
         /// The URL itself is unusable (unparseable, no host, a scheme the
-        /// fetcher does not speak). No attempt can change the outcome, so it
-        /// is not retried; a real network fault is.
+        /// fetcher does not speak). No attempt can change the outcome, so
+        /// it is not retried; a real network fault is.
         permanent: bool,
-        /// How many HTTP attempts ended in this failure (first try plus
-        /// every retry), stamped by [`Fetcher::fetch`] once the loop is
-        /// done; the constructors default to 1 (one attempt, no retry).
+        /// How many HTTP attempts ended in this failure, stamped by
+        /// [`Fetcher::fetch`] once the loop is done; the constructors
+        /// default to 1.
         attempts: u32,
     },
     #[error("server error: HTTP {status}")]
@@ -101,8 +91,8 @@ pub enum FetchFailure {
     #[error("client error: HTTP {status}{}", detail(.reason.as_deref()))]
     HttpClient {
         status: u16,
-        /// Why the request was refused, when the status code alone does not
-        /// explain it. The text reaches `fetch_log.error` and
+        /// Why the request was refused, when the status code alone does
+        /// not explain it. The text reaches `fetch_log.error` and
         /// `sources.last_error`, so it is the only trace the operator has
         /// of a chain that lost its source headers on the way.
         reason: Option<String>,
@@ -121,12 +111,11 @@ fn detail(reason: Option<&str>) -> String {
 }
 
 impl FetchFailure {
-    /// A client error with an optional human-readable cause; the text is
-    /// what the operator reads in `fetch_log` and in the source's
-    /// `last_error`. Synthesized client errors (SSRF 403, oversized-URL
-    /// 414, redirect-loop 508) always pass a reason — the status alone
-    /// would leave the operator guessing at a failure no upstream ever
-    /// answered.
+    /// A client error with an optional human-readable cause, what the
+    /// operator reads in `fetch_log` and in the source's `last_error`.
+    /// Synthesized client errors (SSRF 403, oversized-URL 414,
+    /// redirect-loop 508) always pass a reason: the status alone would
+    /// leave the operator guessing at a failure no upstream ever answered.
     fn http_client_why(status: u16, reason: Option<&str>) -> Self {
         FetchFailure::HttpClient {
             status,
@@ -136,10 +125,8 @@ impl FetchFailure {
     }
 
     /// Stamp the attempt count of a finished fetch. The constructors
-    /// default to 1 (one attempt, no retry); the retry loop of
-    /// [`Fetcher::fetch`] knows the real count and writes it here before
-    /// returning the failure, so the journal row carries the number the
-    /// caller actually paid for.
+    /// default to 1; the retry loop of [`Fetcher::fetch`] knows the real
+    /// count and writes it here before returning the failure.
     fn set_attempts(&mut self, attempts: u32) {
         match self {
             FetchFailure::Network { attempts: n, .. }
@@ -172,11 +159,10 @@ impl FetchFailure {
 
     /// Whether a retry can plausibly succeed.
     ///
-    /// Two classes are left out because the same attempt fails the same way
-    /// every time. `ResponseTooLarge` is a property of the body: a feed over
-    /// `[fetch].max_response_bytes` is still over it on the fourth try, and
-    /// every try reads the whole cap. A `permanent` network failure is a
-    /// malformed URL rather than a fault, so re-reading it cannot help.
+    /// Two classes are left out because the same attempt fails the same
+    /// way every time: `ResponseTooLarge` is a property of the body, and a
+    /// `permanent` network failure is a malformed URL rather than a fault,
+    /// so re-reading it cannot help.
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
@@ -200,14 +186,14 @@ impl FetchFailure {
 
 /// What kind of SSRF rejection this is.
 ///
-/// The distinction decides what a caller may do with it: a policy
-/// rejection is a property of the target and holds on every retry, a
-/// transient one says only that the name could not be resolved this time.
+/// A policy rejection is a property of the target and holds on every
+/// retry, a transient one says only that the name could not be resolved
+/// this time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsrfRejectionKind {
-    /// The target is refused by the address policy: a private, loopback
-    /// or link-local address, or a host that cannot serve the requested
-    /// address family. The fetcher will refuse to dial it as well.
+    /// The target is refused by the address policy: private, loopback or
+    /// link-local, or a host that cannot serve the requested address
+    /// family. The fetcher will refuse to dial it as well.
     Policy,
     /// The name could not be resolved: the resolver failed or the lookup
     /// timed out. Nothing is known about the target.
@@ -219,8 +205,6 @@ pub enum SsrfRejectionKind {
 #[error("SSRF protection: {reason}")]
 pub struct SsrfRejection {
     pub reason: String,
-    /// Whether the target is refused by the policy or merely unresolvable
-    /// right now.
     pub kind: SsrfRejectionKind,
 }
 
@@ -228,10 +212,9 @@ pub struct SsrfRejection {
 ///
 /// A seam, not an abstraction for its own sake: the redirect loop must
 /// re-vet every hop, and the only honest way to test that is to answer
-/// the vetting question per host. The production implementation resolves
-/// and vets in one step ([`vet_host`]); a test supplies its own answers
-/// and counts the calls, which turns "every hop is vetted again" from a
-/// claim in a doc comment into an assertion.
+/// the vetting question per host; a test supplies its own answers and
+/// counts the calls, turning "every hop is vetted again" from a claim in
+/// a doc comment into an assertion.
 pub(crate) trait HostResolver: Send + Sync {
     fn resolve_and_vet<'a>(
         &'a self,
@@ -271,8 +254,6 @@ pub struct Fetcher {
     /// The resolution + vetting layer; a seam so the redirect handling can
     /// be tested against hosts a real resolver would refuse.
     resolver: Arc<dyn HostResolver>,
-    /// The wall-clock ceiling of one fetch: the first attempt, every retry
-    /// and every backoff sleep share it.
     budget: Duration,
 }
 
@@ -289,17 +270,16 @@ impl Fetcher {
         }
     }
 
-    /// Replace the wall-clock budget of one fetch. Test-only: the
-    /// shipped budget is three minutes, far too long for a test to wait
-    /// out.
+    /// Replace the wall-clock budget of one fetch. Test-only: the shipped
+    /// budget is far too long for a test to wait out.
     #[cfg(test)]
     fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
         self
     }
 
-    /// Replace the resolution + vetting layer. Test-only: it exists so a
-    /// test can hand out an address per host and count the calls.
+    /// Replace the resolution + vetting layer. Test-only: hand out an
+    /// address per host and count the calls.
     #[cfg(test)]
     fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
         self.resolver = resolver;
@@ -322,25 +302,23 @@ impl Fetcher {
     ///
     /// reqwest exposes DNS override only on `ClientBuilder`, so the client
     /// is constructed per request with the vetted address pinned via
-    /// `resolve()`, this is what closes the DNS-rebinding window between
-    /// the SSRF check and the connect. Construction cost is negligible
-    /// against network latency at the scheduler's fetch rate.
+    /// `resolve()`: this closes the DNS-rebinding window between the SSRF
+    /// check and the connect. Construction cost is negligible against
+    /// network latency at the scheduler's fetch rate.
     ///
     /// `Policy::none()` is load-bearing, not a default: reqwest's redirect
-    /// layer would consume the 3xx internally and hand back only the final
-    /// response, which silently skips the per-hop SSRF vetting in
-    /// [`Self::fetch_once`]. `resolve()` does
-    /// not contain an automatic follow, it is a per-hostname DNS override,
-    /// ignored outright for IP literals and overridden by a port in the
-    /// redirect target, so the loop must see every hop itself.
+    /// layer would consume the 3xx internally and silently skip the
+    /// per-hop SSRF vetting in [`Self::fetch_once`]. `resolve()` is a
+    /// per-hostname DNS override, not an automatic follow (ignored for IP
+    /// literals, overridden by a port in the redirect target), so the loop
+    /// must see every hop itself.
     ///
     /// `no_proxy()` is load-bearing for the same reason: without it reqwest
     /// picks the `HTTP_PROXY` / `ALL_PROXY` environment configuration up,
-    /// and the connection would leave the vetted address entirely. The
-    /// vetting and the connect would then look at two different paths, and
-    /// the pinned address would only describe the hop *to* the proxy. This
-    /// process has no egress-proxy setting, so the environment must not
-    /// smuggle one in.
+    /// and the connection would leave the vetted address entirely, the
+    /// pinned address only describing the hop *to* the proxy. This process
+    /// has no egress-proxy setting, so the environment must not smuggle
+    /// one in.
     fn build_client(
         &self,
         host: &str,
@@ -348,11 +326,11 @@ impl Fetcher {
         deadline: tokio::time::Instant,
     ) -> Result<reqwest::Client, reqwest::Error> {
         // reqwest is compiled without a crypto provider and panics when a
-        // client is built before one is installed.
+        // client is built before one is installed
         fumox_core::tls::install_crypto_provider();
         // The request may not outlive the fetch budget: the whole-request
-        // timeout is the smaller of the configured read timeout and what is
-        // left of the budget.
+        // timeout is the smaller of the configured read timeout and what
+        // is left of the budget
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let timeout = remaining.min(Duration::from_secs(self.config.read_timeout_secs));
         reqwest::Client::builder()
@@ -370,14 +348,14 @@ impl Fetcher {
     /// Fetch a URL with retries for recoverable failures.
     ///
     /// `headers` are extra request headers from the source configuration
-    /// (they may override the default User-Agent). `family` is the source's
-    /// preferred IP family; `None` inherits the deployment default from
-    /// `[fetch] ip_family`. The family is strict: when the host has no
-    /// address of that family the fetch fails with a client error.
+    /// (they may override the default User-Agent). `family` is the
+    /// source's preferred IP family; `None` inherits the deployment
+    /// default from `[fetch] ip_family`. The family is strict: when the
+    /// host has no address of that family the fetch fails with a client
+    /// error.
     ///
-    /// The whole fetch — the first attempt, every retry and every backoff
-    /// sleep — shares one wall-clock budget ([`MAX_FETCH_BUDGET`]). The
-    /// retry count alone does not bound the time: the backoff grows
+    /// The whole fetch shares one wall-clock budget ([`MAX_FETCH_BUDGET`]):
+    /// the retry count alone does not bound the time, the backoff grows
     /// exponentially and every attempt adds a connect plus a read timeout.
     pub async fn fetch(
         &self,
@@ -409,13 +387,13 @@ impl Fetcher {
                     }
                     let delay = self.backoff_delay(attempt);
                     // A backoff that would run past the budget is not slept
-                    // through: the budget is the ceiling, and the fetch ends
-                    // with the cause of the failure rather than with a
-                    // timeout nobody asked for.
+                    // through: the budget is the ceiling, and the fetch
+                    // ends with the cause of the failure rather than a
+                    // timeout nobody asked for
                     if tokio::time::Instant::now() + delay >= deadline {
                         return Err(budget_exhausted(self.budget, &failure));
                     }
-                    // The URL may carry userinfo credentials, never log it raw.
+                    // The URL may carry userinfo credentials, never log it raw
                     tracing::warn!(
                         url = %redact_url(url),
                         attempt = attempt + 1,
@@ -448,20 +426,21 @@ impl Fetcher {
         family: IpFamily,
         deadline: tokio::time::Instant,
     ) -> Result<FetchedPayload, FetchFailure> {
-        // Redirects are followed manually (up to MAX_REDIRECTS hops) because
-        // every hop must pass the full SSRF vetting again, an automatic
-        // redirect policy would let a public URL bounce the client into a
-        // private or metadata address. `build_client` therefore pins
-        // `Policy::none()`; see the note there.
+        // Redirects are followed manually (up to MAX_REDIRECTS hops)
+        // because every hop must pass the full SSRF vetting again; an
+        // automatic redirect policy would let a public URL bounce the
+        // client into a private or metadata address. `build_client`
+        // therefore pins `Policy::none()`; see the note there
         let mut current = url.to_string();
         // Source-configured headers may carry subscription secrets, and
         // reqwest only strips the standardized ones (`Authorization`,
-        // `Cookie`, …) across a redirect. They stay scoped to the origin the
-        // admin configured, so a redirect to a collector harvests nothing.
+        // `Cookie`, …) across a redirect. They stay scoped to the origin
+        // the admin configured, so a redirect to a collector harvests
+        // nothing
         let configured_origin = Url::parse(url).ok().map(|parsed| origin_of(&parsed));
         // Set when a hop had to withhold the source headers because the
         // redirect left the configured origin. Carried into the failure so
-        // the operator sees why the request looked anonymous to the target.
+        // the operator sees why the request looked anonymous to the target
         let mut withheld: Option<&'static str> = None;
         for _hop in 0..=MAX_REDIRECTS {
             if tokio::time::Instant::now() >= deadline {
@@ -513,7 +492,7 @@ impl Fetcher {
             // but transient by nature: the server itself says "try again",
             // so they are retried like the 5xx and journaled as
             // `http_server` (the class is the journal's coarse grouping,
-            // not a retry verdict — [`FetchFailure::is_recoverable`] is).
+            // not a retry verdict, [`FetchFailure::is_recoverable`] is)
             if status >= 500 || status == 408 || status == 429 {
                 return Err(FetchFailure::HttpServer {
                     status,
@@ -524,7 +503,7 @@ impl Fetcher {
                 return Err(FetchFailure::http_client_why(status, withheld));
             }
 
-            // Stream the body with a hard cap (decompression-bomb guard).
+            // Stream the body with a hard cap (decompression-bomb guard)
             let limit = self.config.max_response_bytes;
             let body = stream_body(response, limit).await?;
             let bytes = body.len() as u64;
@@ -536,7 +515,7 @@ impl Fetcher {
             });
         }
         // Redirect chain longer than MAX_REDIRECTS, a persistent server
-        // misconfiguration, reported as 508 Loop Detected.
+        // misconfiguration, reported as 508 Loop Detected
         Err(FetchFailure::http_client_why(
             508,
             Some(&format!("redirect chain longer than {MAX_REDIRECTS} hops")),
@@ -545,12 +524,10 @@ impl Fetcher {
 
     /// Parse and vet one hop of the redirect chain: the URL is parsed, the
     /// scheme is checked, and the host is resolved with every resolved
-    /// address vetted against the SSRF policy. Returns the hop ready to
-    /// dial: the parsed URL plus the connect address the vetting picked.
-    ///
-    /// That address is what [`Self::send_hop`] pins into the request
-    /// client, so nothing between this check and the connect can move the
-    /// connection elsewhere (DNS rebinding).
+    /// address vetted against the SSRF policy. The picked connect address
+    /// is what [`Self::send_hop`] pins into the request client, so nothing
+    /// between this check and the connect can move the connection
+    /// elsewhere (DNS rebinding).
     async fn vet_hop(&self, current: &str, family: IpFamily) -> Result<VettedHop, FetchFailure> {
         let parsed = Url::parse(current).map_err(|e| FetchFailure::Network {
             message: format!("invalid URL: {e}"),
@@ -580,7 +557,7 @@ impl Fetcher {
             .resolve_and_vet(&host, family)
             .await
             .map_err(|e| {
-                // The URL may carry userinfo credentials, never log it raw.
+                // The URL may carry userinfo credentials, never log it raw
                 tracing::warn!(url = %redact_url(current), reason = %e, "SSRF protection blocked the fetch");
                 FetchFailure::http_client_why(403, Some("SSRF policy blocked the resolved address"))
             })?;
@@ -595,7 +572,6 @@ impl Fetcher {
     }
 
     /// Build the pinned client for a vetted hop and send the request.
-    ///
     /// The source-configured headers are applied only while the hop is on
     /// the origin the admin configured; a redirect that left it marks
     /// `withheld`, so the failures of this chain carry the reason the
@@ -637,9 +613,7 @@ impl Fetcher {
     }
 }
 
-/// One hop of the redirect chain, vetted and ready to dial: the parsed
-/// URL, the host it carries and the connect address the SSRF vetting
-/// picked for that host.
+/// One hop of the redirect chain, vetted and ready to dial.
 struct VettedHop {
     parsed: Url,
     host: String,
@@ -689,9 +663,10 @@ fn format_budget(budget: Duration) -> String {
     }
 }
 
-/// Scheme + host + effective port, the scope source headers are confined to.
-/// A redirect that changes any of the three is a different origin, even when
-/// only the port moved, the pinned DNS override does not constrain the port.
+/// Scheme + host + effective port, the scope source headers are confined
+/// to. A redirect that changes any of the three is a different origin,
+/// even when only the port moved: the pinned DNS override does not
+/// constrain the port.
 fn origin_of(url: &Url) -> (String, String, u16) {
     let port = url
         .port_or_known_default()
@@ -703,13 +678,11 @@ fn origin_of(url: &Url) -> (String, String, u16) {
     )
 }
 
-/// Display text of a reqwest error with the embedded URL redacted:
-/// reqwest appends ` for url (<url>)`, userinfo included.
-///
-/// The tail is replaced rather than the URL text inside it: reqwest does
-/// not always print the URL exactly as this process built it (it may drop
-/// the userinfo or the default port), and a substitution that misses
-/// leaves the raw credentials in the message.
+/// Display text of a reqwest error with the embedded URL redacted (reqwest
+/// appends ` for url (<url>)`, userinfo included). The tail is replaced
+/// rather than the URL text inside it: reqwest does not always print the
+/// URL exactly as built, and a substitution that misses leaves the raw
+/// credentials in the message.
 pub(crate) fn redacted_request_error(error: &reqwest::Error) -> String {
     let text = error.to_string();
     let Some(url) = error.url() else {
@@ -725,7 +698,6 @@ pub(crate) fn redacted_request_error(error: &reqwest::Error) -> String {
     text
 }
 
-/// Whether `ip` belongs to the requested family (`Any` matches both).
 fn family_matches(ip: IpAddr, family: IpFamily) -> bool {
     match family {
         IpFamily::Any => true,
@@ -752,8 +724,8 @@ pub(crate) use fumox_core::ssrf::pick_vetted as pick_address;
 /// and the save-time check ([`vet_url_with_policy`]).
 ///
 /// `dns_timeout` is the operator-supplied upper bound for the async DNS
-/// resolution step. A hostile resolver can otherwise pin the runtime
-/// worker for the OS resolver's default timeout (~30 s+).
+/// resolution: a hostile resolver can otherwise pin the runtime worker
+/// for the OS resolver's default timeout (~30 s+).
 pub async fn vet_host(
     host: &str,
     allow_private_urls: bool,
@@ -762,7 +734,7 @@ pub async fn vet_host(
 ) -> Result<IpAddr, SsrfRejection> {
     let addrs: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
         // The literal fixes the family; a source pinned to the other one
-        // can never reach it.
+        // can never reach it
         if !family_matches(ip, family) {
             return Err(SsrfRejection {
                 reason: format!(
@@ -775,7 +747,7 @@ pub async fn vet_host(
         }
         vec![ip]
     } else {
-        // The name did not resolve: the target is unknown, not refused.
+        // The name did not resolve: the target is unknown, not refused
         let lookup = fumox_core::ssrf::lookup_with_timeout(host, dns_timeout)
             .await
             .map_err(|e| SsrfRejection {
@@ -809,8 +781,7 @@ pub async fn vet_host(
 /// A static URL-validation problem, typed so this layer stays free of
 /// i18n concerns: the admin layer maps each variant onto its `val.url_*`
 /// catalog key and renders it with `Lang::t_args` in the panel language;
-/// embedded diagnostics (URL-parser and SSRF-rejection details) stay
-/// technical English, only the sentence around them is localized.
+/// embedded diagnostics stay technical English.
 #[derive(Debug, Clone)]
 pub enum UrlProblem {
     /// The URL is longer than the limit (the argument, in characters).
@@ -832,9 +803,9 @@ pub enum UrlProblem {
 
 impl UrlProblem {
     /// Whether the problem is a property of the URL itself, so a caller
-    /// that retries gets the same answer. A name that did not resolve (an
-    /// SSRF rejection of the transient kind) says nothing about the
-    /// target and the fetch path re-checks it on every request.
+    /// that retries gets the same answer. A transient SSRF rejection says
+    /// nothing about the target and the fetch path re-checks it on every
+    /// request.
     pub fn is_permanent(&self) -> bool {
         !matches!(
             self,
@@ -850,9 +821,9 @@ impl UrlProblem {
 ///
 /// The DNS-level SSRF vetting happens at fetch time (addresses can change
 /// between save and fetch), but scheme, length and host shape are checked
-/// up front so that obviously bad URLs never reach the scheduler. The
-/// parsed [`Url`] comes back with the verdict, so a caller that vetts the
-/// host next does not parse the same string a second time.
+/// up front so obviously bad URLs never reach the scheduler. The parsed
+/// [`Url`] comes back with the verdict, so a caller that vetts the host
+/// next does not parse the same string a second time.
 pub fn validate_url(url: &str) -> Result<Url, UrlProblem> {
     if url.len() > MAX_URL_LEN {
         return Err(UrlProblem::TooLong(MAX_URL_LEN));
@@ -868,22 +839,17 @@ pub fn validate_url(url: &str) -> Result<Url, UrlProblem> {
     Ok(parsed)
 }
 
-/// Save-time SSRF check: static validation plus DNS
-/// resolution and address vetting. The fetch path re-vets on every request
-/// to defend against DNS rebinding, so a failure here is fast feedback for
-/// the form, not the last line of defense. Private URLs are allowed by the
-/// flag, but the DNS vetting still runs: `check_ip` passes every address
-/// under `allow_private = true`, yet the family check of an IP literal and
-/// the family filtering of the resolved addresses stay in force, so the
-/// form flags a host that can never be reached. `family` is the source's
-/// effective IP family (after resolving `None` against
-/// `[fetch] ip_family`), so the form flags hosts that can never be reached
-/// under the strict constraint.
+/// Save-time SSRF check: static validation plus DNS resolution and
+/// address vetting. The fetch path re-vets on every request to defend
+/// against DNS rebinding, so a failure here is fast feedback for the
+/// form, not the last line of defense. The DNS vetting still runs under
+/// `allow_private = true`: `check_ip` passes every address, but the
+/// family checks stay in force, so the form flags a host that can never
+/// be reached under the source's effective IP family.
 ///
 /// The failure carries its kind ([`UrlProblem::is_permanent`]): a caller
-/// that may treat an unresolvable name as a warning (the import path,
-/// where the file is vetted again at fetch time) reads that instead of
-/// parsing the message.
+/// that may treat an unresolvable name as a warning (the import path)
+/// reads that instead of parsing the message.
 pub async fn vet_url_with_policy(
     url: &str,
     allow_private_urls: bool,
@@ -903,9 +869,7 @@ pub async fn vet_url_with_policy(
 
 /// Vet a single IP address against the SSRF policy. A decorated form of
 /// `fumox_core::ssrf::vet_addr`: the blocklist lives in `fumox-core` so
-/// the probe daemon applies the identical policy to its dial targets, the
-/// server only flattens the typed reason into a message.
-///
+/// the probe daemon applies the identical policy to its dial targets.
 /// With `allow_private = false` the rejected set is the one the core
 /// policy documents (loopback, RFC 1918, link-local incl. the cloud
 /// metadata endpoint, CGNAT, the reserved, benchmark and TEST-NET ranges,
@@ -931,7 +895,7 @@ mod tests {
         assert_eq!(fetcher.backoff_delay(0), Duration::from_millis(500));
         assert_eq!(fetcher.backoff_delay(1), Duration::from_millis(1000));
         // An absurd max_retries must saturate into the cap, not overflow
-        // (debug builds would panic on the raw 2u64.pow).
+        // (debug builds panic on the raw 2u64.pow)
         assert_eq!(fetcher.backoff_delay(100), Duration::from_secs(60));
 
         let huge = FetchConfig {
@@ -943,9 +907,8 @@ mod tests {
     }
 
     /// The server-side gate is a decorated form of the core policy: the
-    /// blocklist is not forked here, every verdict (and its class code)
-    /// comes from `fumox_core::ssrf`. The range coverage itself is pinned
-    /// by the core suite (`ssrf::tests`), not duplicated.
+    /// blocklist is not forked here; the range coverage itself is pinned
+    /// by the core suite, not duplicated.
     #[test]
     fn check_ip_is_the_decorated_core_policy() {
         for addr in [
@@ -960,9 +923,8 @@ mod tests {
                 "{addr} verdict must match the core policy"
             );
         }
-        // The allow flag is passed through unchanged.
+        // The allow flag is passed through unchanged
         assert!(check_ip(ip("127.0.0.1"), true).is_ok());
-        // The decorated message still names the refused range.
         let reason = check_ip(ip("169.254.169.254"), false).unwrap_err();
         assert!(reason.contains("link-local"), "{reason}");
     }
@@ -999,7 +961,7 @@ mod tests {
             ErrorClass::HttpServer
         );
         // A body over the cap and a malformed URL fail identically on every
-        // attempt, so neither is retried; a real network fault still is.
+        // attempt, so neither is retried; a real network fault still is
         assert!(
             !FetchFailure::ResponseTooLarge {
                 limit: 10,
@@ -1039,8 +1001,6 @@ mod tests {
 
     #[test]
     fn url_validation() {
-        // The Ok value is the parsed URL, so a caller that vetts the host
-        // next does not parse the same string twice.
         let parsed = validate_url("https://example.com/sub").unwrap();
         assert_eq!(parsed.host_str(), Some("example.com"));
         assert!(validate_url("http://example.com").is_ok());
@@ -1055,13 +1015,13 @@ mod tests {
         let v4_only = [ip("203.0.113.10")];
         let v6_only = [ip("2001:db8::1")];
 
-        // Any: first IPv4 wins, IPv6 fallback (historical behavior).
+        // Any: first IPv4 wins, IPv6 fallback
         assert_eq!(pick_address(&both, IpFamily::Any), Some(ip("203.0.113.10")));
         assert_eq!(
             pick_address(&v6_only, IpFamily::Any),
             Some(ip("2001:db8::1"))
         );
-        // Strict families pick their own address and never the other one.
+        // Strict families pick their own address and never the other one
         assert_eq!(
             pick_address(&both, IpFamily::Ipv4),
             Some(ip("203.0.113.10"))
@@ -1074,9 +1034,8 @@ mod tests {
 
     #[tokio::test]
     async fn literal_ip_of_the_wrong_family_is_rejected() {
-        // A private URL would normally be vetted with allow_private=false,
-        // but the family check fires before the private-range check either
-        // way; use public test-net addresses to exercise both orders.
+        // The family check fires before the private-range check either
+        // way; use public test-net addresses to exercise both orders
         let v4 = vet_host("203.0.113.10", true, IpFamily::Ipv6, Duration::from_secs(5))
             .await
             .unwrap_err();
@@ -1085,7 +1044,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(v6.reason.contains("IPv6"), "{}", v6.reason);
-        // The matching family passes.
         assert!(
             vet_host("2001:db8::1", true, IpFamily::Ipv6, Duration::from_secs(5))
                 .await
@@ -1098,7 +1056,7 @@ mod tests {
         // On macOS the OS resolver short-circuits `.invalid` synchronously
         // with a "DNS resolution failed" error; on glibc with a hostile
         // resolver the wrapper returns "timed out". Both prove the call
-        // returns quickly under the operator's `dns_timeout` knob.
+        // returns quickly under the operator's `dns_timeout` knob
         let rejection = vet_host(
             "this-host-does-not-exist.invalid",
             false,
@@ -1118,8 +1076,7 @@ mod tests {
     /// Minimal HTTP/1.1 responder on 127.0.0.1; serves any number of
     /// requests while the test runtime lives. One shape for every test
     /// endpoint: `make` builds each response from the request bytes it
-    /// receives, a counter it needs lives in an `Arc` the test owns and
-    /// the closure captures.
+    /// receives.
     async fn spawn_responder(
         make: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
     ) -> std::net::SocketAddr {
@@ -1137,8 +1094,6 @@ mod tests {
         addr
     }
 
-    /// Minimal HTTP/1.1 responder on 127.0.0.1; serves any number of
-    /// requests while the test runtime lives.
     async fn spawn_v4_listener() -> std::net::SocketAddr {
         spawn_responder(|_| b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()).await
     }
@@ -1152,8 +1107,8 @@ mod tests {
         .await
     }
 
-    /// Responder that echoes back which of the request's headers it saw,
-    /// so a test can assert what survived a redirect.
+    /// Responder that echoes back whether it saw a subscription token
+    /// header, so a test can assert what survived a redirect.
     async fn spawn_header_echo() -> std::net::SocketAddr {
         spawn_responder(|request| {
             let request = String::from_utf8_lossy(request).to_ascii_lowercase();
@@ -1175,13 +1130,12 @@ mod tests {
     /// fetcher refuses the private first hop before any redirect is
     /// seen, and a lenient one walks the chain and comes back with the
     /// body of the target. The per-hop re-vetting of the *target* is
-    /// covered by [`every_redirect_hop_is_vetted_again`], which can hand
-    /// the resolver a public first host and a private target.
+    /// covered by [`every_redirect_hop_is_vetted_again`].
     #[tokio::test]
     async fn a_redirect_into_a_private_address_is_blocked() {
         let internal = spawn_v4_listener().await;
         // The source itself is vetted with allow_private=true (it is a
-        // loopback listener in the test), but the hop is re-vetted strictly.
+        // loopback listener in the test), but the hop is re-vetted strictly
         let redirector = spawn_redirector(format!("http://{internal}/meta-data")).await;
 
         let strict = Fetcher::new(FetchConfig::default(), false, Duration::from_secs(5));
@@ -1194,13 +1148,12 @@ mod tests {
             .await
             .unwrap_err();
         // The very first hop is already private here, so vetting rejects it
-        // before any redirect, assert the class, then prove the hop itself
-        // is seen by a lenient fetcher below.
+        // before any redirect
         assert_eq!(err.error_class(), ErrorClass::HttpClient);
         assert!(!err.is_recoverable());
 
-        // With private URLs allowed the same chain succeeds, which proves the
-        // loop followed the redirect manually rather than erroring out.
+        // With private URLs allowed the same chain succeeds, which proves
+        // the loop followed the redirect manually rather than erroring out
         let lenient = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         let payload = lenient
             .fetch(
@@ -1225,7 +1178,7 @@ mod tests {
             "SECRET".to_string(),
         )]);
 
-        // Straight to the echo endpoint: same origin, header applied.
+        // Straight to the echo endpoint: same origin, header applied
         let direct = fetcher
             .fetch(&format!("http://{echo}/sub"), &headers, None)
             .await
@@ -1235,7 +1188,6 @@ mod tests {
             "header must reach the configured origin"
         );
 
-        // Via a redirect to a different port: header withheld.
         let redirected = fetcher
             .fetch(&format!("http://{redirector}/sub"), &headers, None)
             .await
@@ -1253,7 +1205,8 @@ mod tests {
             origin_of(&base),
             origin_of(&Url::parse("https://EXAMPLE.com/other?x=1").unwrap())
         );
-        // Explicit default port is the same origin; a different port is not.
+        // Explicit default port is the same origin; a different port is
+        // not
         assert_eq!(
             origin_of(&base),
             origin_of(&Url::parse("https://example.com:443/sub").unwrap())
@@ -1278,13 +1231,13 @@ mod tests {
         let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         let url = format!("http://{addr}/sub");
 
-        // Default (Any) reaches the IPv4-only endpoint...
+        // Default (Any) reaches the IPv4-only endpoint, an explicit source
+        // family that matches works too
         let payload = fetcher
             .fetch(&url, &Default::default(), None)
             .await
             .unwrap();
         assert_eq!(payload.body, b"ok");
-        // ...and an explicit source family that matches works too.
         assert!(
             fetcher
                 .fetch(&url, &Default::default(), Some(IpFamily::Ipv4))
@@ -1293,7 +1246,7 @@ mod tests {
         );
 
         // Strict IPv6 against an IPv4-only endpoint: rejected before any
-        // connection, classified as a client error (no retries).
+        // connection, classified as a client error (no retries)
         let err = fetcher
             .fetch(&url, &Default::default(), Some(IpFamily::Ipv6))
             .await
@@ -1350,9 +1303,9 @@ mod tests {
     }
 
     /// The retry loop exists for transient upstream failures: a 503
-    /// followed by a 200 must come back as a success after exactly one
-    /// retry, an always-503 must give up after `max_retries` (3 attempts
-    /// for 2 retries), and a client error must return without any retry.
+    /// followed by a 200 succeeds after exactly one retry, an always-503
+    /// gives up after `max_retries`, a client error returns without any
+    /// retry.
     #[tokio::test]
     async fn retryable_failures_are_retried_and_client_errors_are_not() {
         use std::sync::atomic::Ordering;
@@ -1387,11 +1340,10 @@ mod tests {
             3,
             "max_retries = 2 means the initial attempt plus two retries"
         );
-        // The attempt count travels with the failure into the journal:
-        // three requests, not one.
+        // The attempt count travels with the failure into the journal
         assert_eq!(err.attempts(), 3);
 
-        // 403 is not recoverable: exactly one attempt, no backoff sleep.
+        // 403 is not recoverable: exactly one attempt, no backoff sleep
         let (addr, hits) = spawn_canned_listener(403).await;
         let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         let err = fetcher
@@ -1401,9 +1353,8 @@ mod tests {
         assert!(matches!(err, FetchFailure::HttpClient { status: 403, .. }));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "403 is terminal");
 
-        // 408 and 429 are 4xx by class but transient by nature: the server
-        // itself says "try again", so they are retried like the 5xx and
-        // journaled as `http_server`.
+        // 408 and 429 must be retried like the 5xx and journaled as
+        // `http_server`
         for status in [408u16, 429] {
             let (addr, hits) = spawn_canned_listener(status).await;
             let config = FetchConfig {
@@ -1432,13 +1383,11 @@ mod tests {
     }
 
     /// The body cap is the decompression-bomb guard: a response larger
-    /// than `max_response_bytes` fails as `ResponseTooLarge` instead of
-    /// being buffered to completion. The class is `http_server` — the
-    /// `error_class` vocabulary is the journal's coarse grouping, not a
-    /// retry verdict — while [`FetchFailure::is_recoverable`] says false:
-    /// the same body is over the cap on every attempt, so retrying reads
-    /// the whole oversized body again. The same body under a bigger cap
-    /// passes.
+    /// than `max_response_bytes` fails as `ResponseTooLarge`. The class is
+    /// `http_server` (the `error_class` vocabulary is the journal's coarse
+    /// grouping, not a retry verdict) while
+    /// [`FetchFailure::is_recoverable`] says false, the same body is over
+    /// the cap on every attempt. The same body under a bigger cap passes.
     #[tokio::test]
     async fn oversized_bodies_stop_at_the_configured_cap() {
         let addr = spawn_body_listener().await;
@@ -1457,7 +1406,6 @@ mod tests {
             FetchFailure::ResponseTooLarge { limit: 1024, .. }
         ));
         assert_eq!(err.error_class(), ErrorClass::HttpServer);
-        // The body is over the cap on every attempt, so it is not retried.
         assert!(!err.is_recoverable());
 
         let config = FetchConfig {
@@ -1473,10 +1421,8 @@ mod tests {
     }
 
     /// A redirect sequence longer than MAX_REDIRECTS terminates as 508
-    /// Loop Detected instead of chasing forever. The hop count proves the
-    /// cap is enforced on the wire (the initial request plus MAX_REDIRECTS
-    /// followed hops), and the failure is terminal: `HttpClient`, never
-    /// retried.
+    /// Loop Detected instead of chasing forever; the hop count proves the
+    /// cap is enforced on the wire, and the failure is terminal.
     #[tokio::test]
     async fn redirect_chains_longer_than_the_cap_end_as_loop_detected() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1514,9 +1460,9 @@ mod tests {
         );
     }
 
-    /// A gzip stream of 128 KiB of zeros: 161 bytes on the wire that expand
-    /// to 131072 bytes of body. The compressed size is what the wire
-    /// carries, the expanded size is what the cap has to count.
+    /// A gzip stream of 128 KiB of zeros: 161 bytes on the wire that
+    /// expand to 131072 bytes of body. The expanded size is what the cap
+    /// has to count.
     const GZIP_128K_ZEROS: [u8; 161] = [
         31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 237, 193, 49, 1, 0, 0, 0, 194, 160, 245, 79, 237, 97,
         13, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1555,7 +1501,7 @@ mod tests {
         addr
     }
 
-    /// The size cap counts the *decompressed* bytes. A body that is tiny
+    /// The size cap counts the *decompressed* bytes: a body that is tiny
     /// on the wire and huge after decompression must still be refused,
     /// otherwise the cap is a decompression-bomb hole.
     #[tokio::test]
@@ -1577,9 +1523,9 @@ mod tests {
     }
 
     /// The credentials a source URL carries must not survive into the
-    /// failure text: the userinfo and the token query pair end up in
-    /// `fetch_log.error` and in the source's `last_error`, which live in
-    /// the database and in every log shipper downstream of it.
+    /// failure text: they end up in `fetch_log.error` and in the source's
+    /// `last_error`, which live in the database and in every log shipper
+    /// downstream of it.
     #[tokio::test]
     async fn a_failing_fetch_does_not_leak_the_source_credentials() {
         let addr = spawn_closing_listener().await;
@@ -1603,9 +1549,9 @@ mod tests {
         assert!(!message.contains("TOPSECRET"), "token leaked: {message}");
     }
 
-    /// The credential-bearing query names the feeds use in the wild: a
-    /// signature, a session id, a credential of its own. A harmless pair
-    /// survives, because the query is where the diagnostics are.
+    /// The credential-bearing query names the feeds use in the wild. A
+    /// harmless pair survives, because the query is where the diagnostics
+    /// are.
     #[test]
     fn credential_bearing_query_names_are_masked() {
         for url in [
@@ -1625,10 +1571,9 @@ mod tests {
         );
     }
 
-    /// A chain that lost its source headers has to say so: the refusal the
-    /// collector answers with is otherwise indistinguishable from a plain
-    /// 403, and the operator cannot tell that the subscription token never
-    /// reached the target.
+    /// A chain that lost its source headers has to say so: the refusal is
+    /// otherwise indistinguishable from a plain 403, and the operator
+    /// cannot tell that the subscription token never reached the target.
     #[tokio::test]
     async fn a_refused_redirect_states_that_the_headers_were_withheld() {
         let (collector, _) = spawn_canned_listener(403).await;
@@ -1654,13 +1599,12 @@ mod tests {
             }
             other => panic!("expected a client error, got {other:?}"),
         }
-        // The reason travels with the journal text the operator reads.
         assert!(text.contains("headers withheld"), "{text}");
     }
 
     /// The retry ceiling is applied, not merely documented: the config
     /// file and the `FUMOX_*` env layer can ask for more retries than the
-    /// process supports, and the request must not be made more often.
+    /// process supports.
     #[test]
     fn the_retry_count_is_capped_at_the_supported_ceiling() {
         let fetcher = Fetcher::new(
@@ -1685,9 +1629,7 @@ mod tests {
         let (addr, hits) = spawn_canned_listener(503).await;
         let config = FetchConfig {
             max_retries: 100,
-            // No backoff: the point of the test is the number of attempts,
-            // and the real backoff would stretch it into a minute of
-            // sleeping.
+            // No backoff: the point of the test is the number of attempts
             retry_base_backoff_ms: 0,
             ..FetchConfig::default()
         };
@@ -1705,9 +1647,8 @@ mod tests {
     }
 
     /// One fetch has one wall-clock budget: the attempts and the backoffs
-    /// share it, so a source that never recovers cannot hold a
-    /// concurrency permit and the source's in-flight mark for the sum of
-    /// every backoff.
+    /// share it, so a source that never recovers cannot hold a concurrency
+    /// permit and the in-flight mark for the sum of every backoff.
     #[tokio::test]
     async fn a_fetch_is_bounded_by_its_wall_clock_budget() {
         use std::sync::atomic::Ordering;
@@ -1726,8 +1667,7 @@ mod tests {
             .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("fetch budget of 300ms"), "{text}");
-        // It was the budget that ended the retrying, not the retry
-        // ceiling: the ceiling would have allowed seventeen attempts.
+        // It was the budget that ended the retrying, not the retry ceiling
         assert!(
             hits.load(Ordering::SeqCst) < (MAX_RETRIES + 1) as usize,
             "the budget must cut the retrying short"
@@ -1737,11 +1677,9 @@ mod tests {
     /// The client must not pick up the environment proxy configuration:
     /// the vetted address and the address that is connected to have to be
     /// the same one, and a proxy in between would make the vetting
-    /// describe a path the request does not take.
-    ///
-    /// The proxy variables are process-global, so the fetch runs in a child
-    /// process: setting them here would change the behaviour of every
-    /// other test in this binary.
+    /// describe a path the request does not take. The proxy variables are
+    /// process-global, so the fetch runs in a child process: setting them
+    /// here would change the behaviour of every other test in this binary.
     #[test]
     fn the_client_ignores_the_environment_proxy_configuration() {
         let exe = std::env::current_exe().expect("test executable path");
@@ -1753,7 +1691,7 @@ mod tests {
                 "--nocapture",
             ])
             // A proxy that points nowhere: a request that went through it
-            // could not succeed.
+            // could not succeed
             .env("ALL_PROXY", "http://127.0.0.1:1")
             .env("all_proxy", "http://127.0.0.1:1")
             .env("HTTP_PROXY", "http://127.0.0.1:1")
@@ -1767,8 +1705,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         // The child really ran: a name that matches nothing exits zero
-        // without a test, and the check above would pass on a green run
-        // that tested nothing.
+        // without a test
         assert!(
             stdout.contains("1 passed"),
             "the child test did not run:\n{stdout}"
@@ -1795,8 +1732,7 @@ mod tests {
     /// A resolver that answers per host and records the hosts it was
     /// asked about.
     struct ScriptedResolver {
-        /// The answer per host: the address to hand out, or the reason to
-        /// refuse the host.
+        /// The address to hand out per host, or the reason to refuse it.
         answers: std::collections::HashMap<String, Result<IpAddr, String>>,
         calls: std::sync::Mutex<Vec<String>>,
     }
@@ -1828,9 +1764,9 @@ mod tests {
 
     /// The manual redirect loop must re-vet *every* hop: a vetted public
     /// source must not be able to bounce the fetch into a private
-    /// address. The resolver seam answers per host and records what it
-    /// was asked, so the test can show that the second hop went through
-    /// the vetting layer and was refused there.
+    /// address. The resolver seam records what it was asked, so the test
+    /// can show the second hop went through the vetting layer and was
+    /// refused there.
     #[tokio::test]
     async fn every_redirect_hop_is_vetted_again() {
         let redirector = spawn_redirector("http://internal.example/meta-data".to_string()).await;
@@ -1855,13 +1791,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // The refusal is a client error: the source configuration is at
-        // fault and retrying cannot help.
         assert_eq!(err.error_class(), ErrorClass::HttpClient);
         assert!(!err.is_recoverable());
 
         // Both hops went through the vetting layer, and the second one is
-        // the hop that was refused.
+        // the hop that was refused
         let calls = resolver
             .calls
             .lock()

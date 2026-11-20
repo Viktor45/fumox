@@ -1,5 +1,5 @@
-//! T1 connectivity checks: TCP connect with an optional TLS handshake
-//!. The measured wall time becomes the proxy's latency.
+//! T1 connectivity checks: TCP connect with an optional TLS handshake.
+//! The measured wall time becomes the proxy's latency.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,31 +30,23 @@ impl CheckKind {
 /// Decide the T1 flavour from the scheme and the node's own parameters.
 ///
 /// The decision must match what the T2 batch asks the engine for, or the
-/// two grades disagree about the same node: a check that passes a node the
-/// tunnel cannot open leaves it `alive`.
+/// two grades disagree about the same node: a check that passes a node
+/// the tunnel cannot open leaves it `alive`.
 ///
 /// The protocols that carry their credential inside the TLS session and
 /// have no plain-text form always negotiate TLS (trojan/naive/anytls); the
 /// ones the mihomo mapping never wraps are plain TCP (ss/snell and the
-/// QUIC schemes, which never reach T1 at all).
-///
-/// For vless/vmess the decision belongs to the shared core predicate
+/// QUIC schemes, which never reach T1 at all). For vless/vmess the
+/// decision belongs to the shared core predicate
 /// ([`fumox_core::params::wants_tls`]), the same one the Clash writer and
-/// the sing-box writer ask: a node whose parameters say it is wrapped is
-/// checked with a handshake, and one whose parameters say it is not is
-/// checked with a plain connect. The two used to answer differently — the
-/// writer took an SNI as a TLS signal and the check did not, so a
-/// `vless://` link with an SNI was written as a TLS node and probed as
-/// plaintext, and a broken one passed the probe and was served.
-///
-/// SOCKS5 is the one scheme the writers decide on their own: both of them
-/// wrap a socks5 node only when it asks for it explicitly, so the check
-/// asks the same toggle.
+/// the sing-box writer ask. SOCKS5 is the one scheme the writers decide
+/// on their own: both wrap a socks5 node only when it asks for it
+/// explicitly, so the check asks the same toggle.
 pub fn check_kind(scheme: Scheme, entry: &ProxyEntry) -> CheckKind {
     match scheme {
         Scheme::Trojan | Scheme::Naive | Scheme::AnyTls => CheckKind::Tls,
         // Snell's obfs is spoken inside the tunnel, not a handshake T1
-        // could validate: connect-only, the T2 tunnel is the verification.
+        // could validate: connect-only, the T2 tunnel is the verification
         Scheme::Ss | Scheme::Snell => CheckKind::Tcp,
         Scheme::Hysteria2 | Scheme::Tuic | Scheme::Mieru => CheckKind::Tcp,
         Scheme::Socks5 => {
@@ -82,9 +74,9 @@ pub fn check_kind(scheme: Scheme, entry: &ProxyEntry) -> CheckKind {
 /// produce false deaths. This is deliberately not a trust boundary.
 ///
 /// The pinned `ring` provider always speaks the safe default protocol
-/// versions, so the builder error cannot happen in practice — but that
+/// versions, so the builder error cannot happen in practice, but that
 /// fact lives in the provider's runtime data, not in the types, so the
-/// error is propagated to the check instead of unwrapped here.
+/// error is propagated instead of unwrapped here.
 fn tls_connector() -> Result<&'static TlsConnector, String> {
     static CONNECTOR: OnceLock<Result<TlsConnector, String>> = OnceLock::new();
     CONNECTOR
@@ -163,13 +155,11 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 pub struct Target<'a> {
     pub host: &'a str,
     /// The name the handshake presents: the node's own SNI when it carries
-    /// one, else the stored host.
-    ///
-    /// The stored host is not always the right name: a node reached
-    /// through a CDN carries the CDN's name in `sni`/`servername`, and a
-    /// node whose host is an IP literal carries the name its certificate
-    /// was issued for. Presenting the host instead made the handshake
-    /// fail against a server that only accepts its own name.
+    /// one, else the stored host. A node reached through a CDN carries the
+    /// CDN's name in `sni`/`servername`, and a node whose host is an IP
+    /// literal carries the name its certificate was issued for; presenting
+    /// the host instead failed the handshake against a server that only
+    /// accepts its own name.
     pub server_name: Option<&'a str>,
     pub port: u16,
     pub kind: CheckKind,
@@ -188,11 +178,11 @@ enum Plan {
 /// vetted. Returns the elapsed time on success or a human-readable failure
 /// reason (journaled verbatim into `probe_results.error`).
 ///
-/// `target.vetted` must be non-empty: it is what `fumox_core::ssrf::
-/// vet_probe_host_addrs` returned for `target.host` moments ago. Connecting
-/// to those exact IPs (instead of re-resolving the hostname) closes the
-/// DNS-rebinding window between vet and dial, and sidesteps the IPv6
-/// `host:port` formatting trap entirely, a `SocketAddr` needs no brackets.
+/// `target.vetted` must be non-empty: it is what the SSRF gate returned
+/// for `target.host` moments ago. Connecting to those exact IPs (instead
+/// of re-resolving the hostname) closes the DNS-rebinding window between
+/// vet and dial, and sidesteps the IPv6 `host:port` formatting trap, a
+/// `SocketAddr` needs no brackets.
 ///
 /// Every vetted address is dialed at the same time and the first one that
 /// completes wins; the rest are cancelled. A TLS failure on one address
@@ -208,7 +198,7 @@ pub async fn run(
 
     // The plan is resolved before the first dial: an invalid server name is
     // a property of the node, not of the address, and every address would
-    // fail the same way.
+    // fail the same way
     let plan = match target.kind {
         CheckKind::Tcp => Plan::Tcp,
         CheckKind::Tls => Plan::Tls(server_name_of(target)?),
@@ -247,7 +237,7 @@ pub async fn run(
 fn server_name_of(target: &Target<'_>) -> Result<ServerName<'static>, String> {
     let name = target.server_name.unwrap_or(target.host);
     // Debug formatting: the name is feed-controlled, and a control byte
-    // in it must not reach the journal (`probe_results.error`) verbatim.
+    // in it must not reach the journal (`probe_results.error`) verbatim
     ServerName::try_from(name.to_string())
         .map_err(|error| format!("invalid TLS server name {name:?}: {error}"))
 }
@@ -293,7 +283,6 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
 
-    /// A node with the given parameters.
     fn entry(scheme: Scheme, params: &[(&str, &str)]) -> ProxyEntry {
         ProxyEntry {
             scheme,
@@ -333,13 +322,13 @@ mod tests {
             CheckKind::Tcp
         );
         // Snell's obfs is spoken inside the tunnel, not a handshake T1
-        // could validate: connect-only, the T2 tunnel is the verification.
+        // could validate: connect-only, the T2 tunnel is the verification
         assert_eq!(
             check_kind(Scheme::Snell, &plain(Scheme::Snell)),
             CheckKind::Tcp
         );
         // AnyTLS speaks TLS; the verdict ignores params (there is no
-        // plain-TCP spelling of the protocol to fall back to).
+        // plain-TCP spelling of the protocol to fall back to)
         assert_eq!(
             check_kind(Scheme::AnyTls, &plain(Scheme::AnyTls)),
             CheckKind::Tls
@@ -360,7 +349,7 @@ mod tests {
             CheckKind::Tls
         );
         // `xtls` is the older spelling of the REALITY transport and states
-        // a TLS layer like the others.
+        // a TLS layer like the others
         assert_eq!(
             check_kind(
                 Scheme::Vless,
@@ -380,7 +369,7 @@ mod tests {
             CheckKind::Tcp
         );
         // Clash-sourced spells, the same params the T2 mapping reads
-        // (`formats::clash`): boolean `tls: true` plus `servername`.
+        // (`formats::clash`): boolean `tls: true` plus `servername`
         assert_eq!(
             check_kind(
                 Scheme::Vless,
@@ -395,7 +384,7 @@ mod tests {
             check_kind(Scheme::Vmess, &entry(Scheme::Vmess, &[("tls", "true")])),
             CheckKind::Tls
         );
-        // vmess JSON spells it `tls: "tls"`.
+        // vmess JSON spells it `tls: "tls"`
         assert_eq!(
             check_kind(
                 Scheme::Vmess,
@@ -403,7 +392,7 @@ mod tests {
             ),
             CheckKind::Tls
         );
-        // The negative Clash spelling stays plain TCP.
+        // The negative Clash spelling stays plain TCP
         assert_eq!(
             check_kind(
                 Scheme::Vless,
@@ -425,7 +414,7 @@ mod tests {
         );
         // An unknown, non-empty `security` is a spelling this build does
         // not know: the node is treated as wrapped, because probing it as
-        // plaintext passes a node whose TLS is broken.
+        // plaintext passes a node whose TLS is broken
         assert_eq!(
             check_kind(
                 Scheme::Vless,
@@ -434,7 +423,7 @@ mod tests {
             CheckKind::Tls
         );
         // SOCKS5 is wrapped only when the node asks for it, the way both
-        // writers decide it.
+        // writers decide it
         assert_eq!(
             check_kind(Scheme::Socks5, &entry(Scheme::Socks5, &[("tls", "true")])),
             CheckKind::Tls
@@ -444,8 +433,7 @@ mod tests {
     /// The verdict must not depend on which feed spelling a node arrived
     /// in: the same TLS proxy parsed from a Clash YAML source and from a
     /// `vless://` URI has to be checked the same way, and T2's mapping of
-    /// the very same two entries has to negotiate TLS for both, otherwise
-    /// the daemon would tunnel-test a node it considered plain TCP.
+    /// the very same two entries has to negotiate TLS for both.
     #[test]
     fn clash_and_uri_spellings_agree_on_tls() {
         let yaml = "proxies:\n  - name: clash-tls\n    type: vless\n    server: h.example.com\n    port: 443\n    uuid: uuid-1\n    network: ws\n    tls: true\n    servername: s.example.com\n";
@@ -463,7 +451,7 @@ mod tests {
         assert_eq!(check_kind(Scheme::Vless, &uri), CheckKind::Tls);
 
         // T2 builds its proxy from the same two entries, through the shared
-        // core mapping the subscriptions are served with.
+        // core mapping the subscriptions are served with
         for (spelling, entry) in [("clash", &clash_entry), ("uri", &uri)] {
             let value = fumox_core::formats::clash::entry_to_clash(entry)
                 .expect("vless has a mihomo counterpart");
@@ -495,9 +483,9 @@ mod tests {
         assert!(result.is_ok(), "expected a successful connect: {result:?}");
     }
 
-    /// An IPv6-literal host connects fine when dialed as a `SocketAddr` ,
-    /// the previous `format!("{host}:{port}")` produced an unparseable
-    /// `2001:db8::1:443` string and every IPv6 proxy failed T1.
+    /// An IPv6-literal host connects fine when dialed as a `SocketAddr`:
+    /// a `format!("{host}:{port}")` would produce an unparseable
+    /// `2001:db8::1:443` string and every IPv6 proxy would fail T1.
     #[tokio::test]
     async fn tcp_check_handles_ipv6_loopback() {
         let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
@@ -523,7 +511,7 @@ mod tests {
         // Bind and immediately drop to obtain a port that is (almost
         // certainly) closed, then verify the refusal: a port another
         // test grabbed between the drop and the check would fail this
-        // test for the wrong reason.
+        // test for the wrong reason
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -600,7 +588,7 @@ mod tests {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     // The handshake is the verdict; the connection is
-                    // closed right after it.
+                    // closed right after it
                     let _ = acceptor.accept(stream).await;
                 });
             }
@@ -616,7 +604,7 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     // Hold the connection open without answering: the
-                    // handshake has to run into its timeout or fail.
+                    // handshake has to run into its timeout or fail
                     let mut buffer = [0u8; 64];
                     let _ = stream.read(&mut buffer).await;
                 });
@@ -635,7 +623,7 @@ mod tests {
             while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     // Dropping the stream would close the connection and
-                    // fail the handshake with an EOF instead of a timeout.
+                    // fail the handshake with an EOF instead of a timeout
                     let _held = stream;
                     std::future::pending::<()>().await;
                 });
@@ -712,7 +700,7 @@ mod tests {
     /// A handshake against a listener that never speaks runs into the
     /// deadline. The clock is paused, so the two-second timeout is
     /// virtual: the runtime advances it the moment nothing else is left
-    /// to do, and the test waits no real time.
+    /// to do.
     #[tokio::test(start_paused = true)]
     async fn tls_check_times_out_against_a_silent_listener() {
         let port = silent_listener().await;
@@ -737,12 +725,11 @@ mod tests {
 
     /// A check that dialled several vetted addresses and failed on all of
     /// them reports every dial target with its own reason: the journal
-    /// line is the operator's only window into why the node died, and a
-    /// lone last-error hid the rest.
+    /// line is the operator's only window into why the node died.
     #[tokio::test]
     async fn the_failure_names_every_dialled_address() {
         // One closed port, two loopback addresses: every attempt fails
-        // and the aggregate must carry both dial targets.
+        // and the aggregate must carry both dial targets
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -858,7 +845,7 @@ mod tests {
     }
 
     /// Every vetted address is tried: a TLS failure on one of them does
-    /// not stop the others, and the error is the one of the last attempt.
+    /// not stop the others.
     #[tokio::test]
     async fn every_vetted_address_is_tried() {
         let (port, _) = tls_listener().await;
@@ -907,20 +894,16 @@ mod tests {
     /// A connect that never completes runs into its deadline. The
     /// listener's accept queue is filled and left unaccepted, so the
     /// kernel drops the dial's SYN: from the outside this is what a
-    /// firewalled host looks like (no refusal, no answer — a refused
-    /// port would fail the connect immediately with `connection refused`
-    /// and never reach the deadline). The clock is paused, so the
-    /// one-second timeout is virtual: the runtime advances it the moment
-    /// nothing else is left to do, and the test waits no real time.
+    /// firewalled host looks like (a refused port would fail the connect
+    /// immediately with `connection refused`). The clock is paused, so
+    /// the one-second timeout is virtual.
     #[tokio::test(start_paused = true)]
     async fn a_hanging_connect_runs_into_its_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         // Fill the accept queue: a connect completes while the queue has
-        // room and stops completing once it is full; the attempt that
-        // runs into its own short deadline is the proof the dial below
-        // cannot complete on its own. The held streams keep the queue
-        // full for the whole test.
+        // room and stops completing once it is full; the held streams keep
+        // it full for the whole test
         let mut held = Vec::new();
         let mut full = false;
         for _ in 0..512 {

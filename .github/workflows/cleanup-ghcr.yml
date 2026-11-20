@@ -1,31 +1,25 @@
-# Manifest-aware GHCR retention for the Fumox container images.
-#
-# The build workflow pushes per-arch images BY DIGEST (untagged) and then
-# runs a merge job that stitches them, plus the provenance attestation
-# manifests, into one multi-arch index tagged with `latest`, semver
-# (`0.2.0`, `0.2`), `main` and a transient `sha-<shortsha>`. The per-arch
-# children therefore have NO tags of their own, and every live tag
-# references them.
-#
-# A naive "delete anything not `latest`", or "delete anything untagged",
-# cleanup breaks the merged manifest list: the per-arch digests it
-# references would disappear and `docker pull` of `latest`/semver starts
-# failing with manifest-unknown (and `gh attestation verify` loses its
-# targets). The policy therefore lives in scripts/cleanup-ghcr.sh, which
-# deletes ONLY:
+# Manifest-aware GHCR retention for the Fumox container images
+# The build workflow pushes per-arch images BY DIGEST (untagged) and a merge
+# job stitches them, plus the provenance attestation manifests, into one
+# multi-arch index tagged `latest`, semver (`0.2.0`, `0.2`), `main` and a
+# transient `sha-<shortsha>`; the per-arch children have NO tags of their
+# own, every live tag references them
+# A naive "delete anything not latest / untagged" cleanup breaks the merged
+# manifest list: `docker pull` of `latest`/semver fails with
+# manifest-unknown and `gh attestation verify` loses its targets. The
+# policy lives in scripts/cleanup-ghcr.sh, which deletes ONLY:
 #   - versions whose tag list contains ONLY `sha-*` entries, older than
-#     RETENTION_DAYS (default 30), these are the merged indexes of past
-#     builds nobody consumes anymore;
+#     RETENTION_DAYS (default 30): merged indexes of past builds nobody
+#     consumes anymore
 #   - untagged versions, ONLY when PRUNE_UNTAGGED is enabled AND the
 #     version's digest is not referenced by ANY kept tag's manifest list
-#     AND is neither an attestation manifest nor a subject one vouches
-#     for AND older than RETENTION_DAYS. Disabled by default: run a
-#     `dry_run` pass first and check the output before enabling.
+#     AND is neither an attestation manifest nor a subject one vouches for
+#     AND older than RETENTION_DAYS (disabled by default, run a dry_run
+#     pass first and check the output before enabling)
 # All other tags (`latest`, `main`, `0.x.y`) and ALL other untagged
-# versions (the children of live tags, attestations) are kept.
-#
+# versions (children of live tags, attestations) are kept
 # The script is not inline shell: scripts/tests/cleanup-ghcr.test.sh pins
-# its behaviour, so the retention rules cannot drift silently.
+# its behaviour, so the retention rules cannot drift silently
 
 name: Cleanup Old GHCR Images
 

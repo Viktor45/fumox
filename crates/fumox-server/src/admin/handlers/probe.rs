@@ -38,8 +38,6 @@ use std::time::Duration;
 /// its own when the socket closes, so this is harmless to the UI.
 const SSE_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
 
-// Overview screen.
-
 /// One `meta` stamp as the panel reads it.
 ///
 /// The three states are kept apart on purpose: "the daemon has not
@@ -315,7 +313,6 @@ impl ProbeTemplate {
         self.lang.t(key).to_string()
     }
 
-    ///
     /// CSS modifier for the backlog banner: `ok`, `warning`, or `danger`.
     fn backlog_level_class(&self) -> &'static str {
         backlog_level_class(self.backlog.level)
@@ -359,13 +356,13 @@ impl ProbeTemplate {
             "stale_oldest" => {
                 // Rounded up: a queue 25 h old must not read as "1 day
                 // waited" where it already waited two. The trigger fires
-                // only past 80 % of the window, so the ceiling is >= 1.
+                // only past 80 % of the window, so the ceiling is >= 1
                 let days = b
                     .oldest_quarantined_age_secs
                     .map(|s| s.max(0).saturating_add(86_399) / 86_400)
                     .unwrap_or(0);
                 // The clamped value the heuristic actually compared
-                // against, not the raw setting.
+                // against, not the raw setting
                 self.lang.t_named(
                     &key,
                     &[
@@ -377,7 +374,7 @@ impl ProbeTemplate {
             "heartbeat_dead" => {
                 // The age the heuristic compared against, taken from the
                 // diagnostic so the figure and the verdict come from one
-                // place.
+                // place
                 let secs = b.heartbeat_age_secs.unwrap_or(0);
                 self.lang.t_named(&key, &[("secs", secs.to_string())])
             }
@@ -385,7 +382,7 @@ impl ProbeTemplate {
             // instead of recomputing it: there is no second formula on
             // the rendering side that could drift from the one the
             // gate used. `drain_minutes` is `Some` in both arms by
-            // construction. A missing figure is the `all_idle` arm.
+            // construction. A missing figure is the `all_idle` arm
             "drain_over_target" | "all_ok" => self.lang.t_named(
                 &key,
                 &[
@@ -396,7 +393,7 @@ impl ProbeTemplate {
             ),
             // The cycle took nothing: report that, with the numbers the
             // operator needs to see it, instead of a cause the page
-            // cannot support.
+            // cannot support
             "all_idle" => self.lang.t_named(
                 &key,
                 &[
@@ -459,7 +456,7 @@ fn parse_probe_meta(
             version: hb.version,
             // Same threshold the banner applies, so the card and
             // the banner can never call the same daemon alive in
-            // one place and dead in the other.
+            // one place and dead in the other
             alive: now - hb.ts <= heartbeat_stale_after(probe, hb.interval_secs),
             interval_secs: hb.interval_secs,
             cycle_interval_secs: hb.cycle_interval_secs,
@@ -478,7 +475,7 @@ fn parse_probe_meta(
             ts,
             // Without this verdict a contact from last month rendered as
             // a green "available". The cycle period the daemon reported in
-            // its own heartbeat outranks this server's config copy.
+            // its own heartbeat outranks this server's config copy
             alive: now - ts
                 <= meow_stale_after(
                     probe,
@@ -539,7 +536,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     // stamps, the counters and the queue come from separate queries and
     // none of them waits for another. One `try_join!` runs them
     // concurrently (SQLite reads run concurrently in WAL mode) and
-    // leaves one error site instead of nine.
+    // leaves one error site instead of nine
     let (proxy_counts, coverage, queue, due_count, oldest_quarantined_at, meta) = match tokio::try_join!(
         proxies::count_by_status(pool),
         proxies::count_by_check_coverage(pool),
@@ -562,7 +559,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     };
 
     // The journal row counts are two COUNT scans of a growing table, so
-    // they are cached for a minute instead of running on every render.
+    // they are cached for a minute instead of running on every render
     let (journal_probe_rows, journal_fetch_rows) = match state.journal_counts.get(pool).await {
         Ok(counts) => counts,
         Err(err) => return server_error(&state, &headers, "probe.journal_counts", &err),
@@ -583,7 +580,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     // ran; pull the entry out instead of issuing another query. The status
     // name travels through the shared enum contract, not a literal, so a
     // wire-name change cannot orphan the lookup. Missing status (e.g. empty
-    // DB) collapses to 0.
+    // DB) collapses to 0
     let quarantine_count = proxy_counts
         .iter()
         .find(|(status, _)| status == ProxyStatus::Quarantine.as_str())
@@ -639,8 +636,6 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         StatusCode::OK,
     )
 }
-
-// SSE stream.
 
 /// One step of the SSE event loop: what the connection does next.
 /// Extracted from the stream builder so the time-dependent branches are
@@ -703,8 +698,8 @@ async fn sse_step(
             Ok(event) => SseStep::Event(event),
             // Lagged: the consumer lost events, not state, every fetch.*
             // event merely tells the page to refresh a fragment that
-            // polls on its own, so the only cost is a delayed update.
-            // Logged so a persistently slow consumer stays visible.
+            // polls on its own, so the only cost is a delayed update
+            // Logged so a persistently slow consumer stays visible
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped,
@@ -750,14 +745,14 @@ pub async fn events_stream(
     let conn = fumox_core::models::new_id();
     tracing::debug!(conn = %conn, "SSE client subscribed to the admin event bus");
     // The stream body logs its own ends and needs the id for that, while
-    // the span below keeps it for the events forwarded in between.
+    // the span below keeps it for the events forwarded in between
     let stream_conn = conn.clone();
     let stream = async_stream::stream! {
         // One sleep for the whole connection: created once here, pinned,
         // and polled across every forwarded event, so the stream never
         // outlives SSE_MAX_CONNECTION_LIFETIME (10 min) even under steady
         // traffic. The browser's EventSource reconnects on its own, and
-        // the reconnect passes auth again.
+        // the reconnect passes auth again
         let lifetime = tokio::time::sleep(SSE_MAX_CONNECTION_LIFETIME);
         tokio::pin!(lifetime);
         let mut exit = SseDisconnectGuard {
@@ -773,7 +768,7 @@ pub async fn events_stream(
                 SseStep::Rotate(event) => {
                     yield Ok(event);
                     // A planned end logs its own reason and disarms the
-                    // disconnect guard before the stream returns.
+                    // disconnect guard before the stream returns
                     exit.planned = true;
                     tracing::debug!(
                         conn = %stream_conn,
@@ -796,7 +791,7 @@ pub async fn events_stream(
     Sse::new(PolledInSpan {
         inner: Box::pin(stream),
         // Every warn inside the loop inherits the connection id, so a
-        // slow or wedged client is traceable to its socket in the log.
+        // slow or wedged client is traceable to its socket in the log
         span: tracing::info_span!("admin_sse", conn = %conn),
     })
     .keep_alive(
@@ -856,10 +851,9 @@ mod tests {
         }
     }
 
-    /// Regression: the RSS line is rendered through an escaping handle, so
-    /// it once shipped a `time` element inside and the reader saw literal
-    /// `<time class="ts" ...>` source in the card, wrapped over four lines.
-    /// The timestamp belongs to the template (`ts(..) | safe`); the line
+    /// Regression: the line once shipped a `time` element and the
+    /// escaping handle rendered its markup as literal source; the
+    /// timestamp belongs to the template (`ts(..) | safe`), the line
     /// stays plain text.
     #[test]
     fn rss_line_carries_no_markup() {
@@ -873,9 +867,9 @@ mod tests {
         assert!(!line.contains('>'), "markup leaked into the line: {line}");
         // The whole line, character for character: the card renders it
         // verbatim, so the exact shape (separators, one decimal, the
-        // gibibyte limit) is part of the contract.
+        // gibibyte limit) is part of the contract
         assert_eq!(line, "RSS 24.6 MiB · 1.2% / 2.0 GiB");
-        // A missing limit hides the share instead of dividing by zero.
+        // A missing limit hides the share instead of dividing by zero
         let no_limit = MeowMemory {
             os_limit_bytes: 0,
             ..mem
@@ -899,7 +893,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_connection_ends_at_the_lifetime_cap_with_an_advisory() {
         // The sender stays alive: a `Closed` verdict cannot masquerade as
-        // the cap firing.
+        // the cap firing
         let (_tx, mut rx) = tokio::sync::broadcast::channel::<crate::events::Event>(4);
         let lifetime = tokio::time::sleep(SSE_MAX_CONNECTION_LIFETIME);
         tokio::pin!(lifetime);
@@ -921,7 +915,7 @@ mod tests {
     async fn a_lagged_consumer_receives_the_next_retained_event() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::events::Event>(2);
         // Six events through two buffer slots: the receiver lags by four,
-        // keeps the last two, and the first step reports the lag.
+        // keeps the last two, and the first step reports the lag
         for i in 0..6 {
             tx.send(crate::events::Event {
                 name: "fetch.done",

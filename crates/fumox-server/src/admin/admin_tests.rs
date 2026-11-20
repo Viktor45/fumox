@@ -36,7 +36,7 @@ fn serve_base_uses_host_header_and_public_port() {
         "http://vpn.example.com:8080"
     );
 
-    // Host without a port.
+    // Host without a port
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     assert_eq!(
@@ -52,7 +52,7 @@ fn serve_base_uses_host_header_and_public_port() {
         "http://vpn.example.com:8080"
     );
 
-    // IPv6 keeps its brackets; the admin port is stripped.
+    // IPv6 keeps its brackets; the admin port is stripped
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "[::1]:8081".parse().unwrap());
     assert_eq!(
@@ -69,7 +69,7 @@ fn serve_base_uses_host_header_and_public_port() {
     );
 
     // No Host header: loopback for an unspecified bind address,
-    // the bound IP itself when it is specific.
+    // the bound IP itself when it is specific
     assert_eq!(
         serve_base(
             bind,
@@ -105,7 +105,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
     let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
 
     // No trusted proxies configured: the forwarded header is *always*
-    // ignored, even when the operator declared the header family.
+    // ignored, even when the operator declared the header family
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -128,7 +128,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
 
     // Trusted peer + X-Forwarded-Proto: https ⇒ https. The Host header
     // is the public authority and spells no port, so the scheme's
-    // default (443, omitted) applies — not the panel's bind port.
+    // default (443, omitted) applies — not the panel's bind port
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -149,7 +149,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "trusted peer + XFP=https ⇒ https on the Host authority's default port"
     );
 
-    // Untrusted peer: the forwarded header is dropped, scheme is http.
+    // Untrusted peer: the forwarded header is dropped, scheme is http
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -170,7 +170,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "untrusted peer + XFP=https ⇒ http (header dropped)"
     );
 
-    // Trusted peer + RFC 7239 Forwarded: proto=https ⇒ https.
+    // Trusted peer + RFC 7239 Forwarded: proto=https ⇒ https
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -193,7 +193,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
 
     // Trusted peer + explicit X-Forwarded-Proto: http ⇒ http wins; the
     // Host authority spells no port, so the default (80, omitted)
-    // applies.
+    // applies
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -215,7 +215,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
     );
 
     // Default-port strip on :443 still applies for the trusted-https
-    // branch.
+    // branch
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -237,7 +237,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "default-port strip on :443"
     );
 
-    // Allowlist set: non-matching host ⇒ Err.
+    // Allowlist set: non-matching host ⇒ Err
     let allowed = allowlist(&["vpn.example.com"]);
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "evil.example".parse().unwrap());
@@ -284,7 +284,7 @@ fn serve_base_ignores_forwarded_headers_without_a_declaration() {
     );
 
     // The same header the operator declared for the *other* family is
-    // still ignored.
+    // still ignored
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -306,12 +306,11 @@ fn serve_base_ignores_forwarded_headers_without_a_declaration() {
     );
 }
 
-/// M-158: the serve link points at the *public* listener, so its port
-/// is the one in `[server].bind` — the port the request carried is the
-/// panel's own. Behind a trusted proxy it is the other way round: there
-/// the `Host` header is the public authority the operator reached, and
-/// the public endpoint answers on that very authority. The port must
-/// not be dropped silently, the link would point at the wrong port.
+/// M-158: the serve link points at the *public* listener, so without a
+/// trusted proxy its port is `[server].bind`, not the port the request
+/// carried (the panel's own). Behind a trusted proxy the `Host` header is
+/// the public authority the operator reached, and its port must not be
+/// dropped silently, the link would point at the wrong port.
 #[test]
 fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
     let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -323,7 +322,7 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
     h.insert(header::HOST, "vpn.example.com:8443".parse().unwrap());
 
     // Behind the trusted proxy the request's authority is the public
-    // one, so its port is the port of the link.
+    // one, so its port is the port of the link
     assert_eq!(
         serve_base(
             bind,
@@ -339,7 +338,7 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
     );
 
     // An untrusted peer is just a client: its `Host` header is text the
-    // client wrote, so the bind port wins.
+    // client wrote, so the bind port wins
     assert_eq!(
         serve_base(
             bind,
@@ -356,7 +355,7 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
 
     // The same peer without a declared header family: the declaration
     // governs the *forwarded* headers (the scheme hint, the forwarded
-    // host), the `Host` header of the request is read either way.
+    // host), the `Host` header of the request is read either way
     assert_eq!(
         serve_base(
             bind,
@@ -375,9 +374,8 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
 /// The scheme and the port of a serve link describe one authority. Behind
 /// a trusted reverse proxy that authority is the `Host` header: a Host
 /// without a port is the scheme's default (80/443, omitted), not the
-/// panel's own `[server].bind` port — the old fallback produced
-/// `https://vpn.example.com:8080` for a TLS-terminated proxy, an
-/// authority nobody answers on.
+/// panel's own `[server].bind` port, an authority nobody answers on
+/// behind TLS termination.
 #[test]
 fn serve_base_scheme_and_port_come_from_one_authority() {
     let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -390,8 +388,6 @@ fn serve_base_scheme_and_port_come_from_one_authority() {
         h
     };
 
-    // Trusted proxy, https: the Host authority's default port (443) is
-    // omitted instead of the bind port appearing.
     let mut h = host_without_port();
     h.insert(
         header::HeaderName::from_static("x-forwarded-proto"),
@@ -411,7 +407,6 @@ fn serve_base_scheme_and_port_come_from_one_authority() {
         "a Host without a port behind a trusted proxy is the scheme default"
     );
 
-    // Same authority over plain http: default port 80, also omitted.
     assert_eq!(
         serve_base(
             bind,
@@ -427,7 +422,7 @@ fn serve_base_scheme_and_port_come_from_one_authority() {
     );
 
     // No Host header at all: the authority is the bound address itself,
-    // so the bind port applies even behind a trusted proxy.
+    // so the bind port applies even behind a trusted proxy
     assert_eq!(
         serve_base(
             bind,
@@ -442,7 +437,7 @@ fn serve_base_scheme_and_port_come_from_one_authority() {
         "the bind fallback keeps the bind port"
     );
 
-    // An untrusted peer cannot move the link: bind port, as before.
+    // An untrusted peer cannot move the link: bind port
     assert_eq!(
         serve_base(
             bind,
@@ -458,10 +453,9 @@ fn serve_base_scheme_and_port_come_from_one_authority() {
     );
 }
 
-/// Direct unit tests for `request_is_https`. These pin the trust gate
-/// without going through `serve_base` / host_header parsing, every
-/// assertion is "given this peer + these headers + this trust list +
-/// this declaration, `request_is_https` returns X".
+/// Direct unit tests for `request_is_https`: given this peer + headers +
+/// trust list + declaration, the function returns X. The trust gate is
+/// pinned without going through `serve_base` / host_header parsing.
 fn xfp_https() -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(
@@ -572,7 +566,7 @@ fn request_is_https_needs_a_declared_header_family() {
         &trusted_v4(),
         TrustedHeader::None
     ));
-    // A declaration for the other family does not cover this header.
+    // A declaration for the other family does not cover this header
     assert!(!request_is_https(
         trusted_peer(),
         &fwd_proto_https(),
@@ -589,17 +583,16 @@ fn request_is_https_needs_a_declared_header_family() {
 
 /// `parse_trusted_cidrs` builds the `X-Forwarded-For` / `Forwarded: for=`
 /// trust list that BOTH per-IP rate limiters (admin and public) and the
-/// `request_is_https` scheme detection key on. Its failure mode is
-/// deliberate fail-closed design: an unparsable entry is logged and
-/// dropped, never defaulted into trust. These tests pin that contract,
-/// because the failure is silent by construction: a dropped entry
-/// degrades per-IP rate limiting to peer-IP keying and turns the
-/// X-Forwarded-Proto scheme detection off, with no error beyond a
-/// startup log line.
+/// `request_is_https` scheme detection key on. Its failure is deliberate
+/// fail-closed design: an unparsable entry is logged and dropped, never
+/// defaulted into trust. These tests pin that contract because the
+/// failure is silent by construction: a dropped entry degrades per-IP
+/// rate limiting to peer-IP keying and turns the scheme detection off,
+/// with no error beyond a startup log line.
 #[test]
 fn parse_trusted_cidrs_keeps_valid_entries_including_bare_ips() {
     // A bare IP is a valid entry: `ipnet` reads it as a host prefix,
-    // and the settings form hint advertises "one CIDR or IP per line".
+    // and the settings form hint advertises "one CIDR or IP per line"
     let parsed = parse_trusted_cidrs(&[
         "10.0.0.0/8".to_string(),
         "192.168.1.1".to_string(),
@@ -632,10 +625,10 @@ fn parse_trusted_cidrs_drops_unparsable_entries_without_inventing_trust() {
 
 #[test]
 fn parse_trusted_cidrs_of_nothing_or_all_bad_is_an_empty_trust_list() {
-    // Empty config: never honor forwarded headers, the safe default.
+    // Empty config: never honor forwarded headers, the safe default
     assert!(parse_trusted_cidrs(&[]).is_empty());
     // Every entry unparsable: the trust list must come out empty (fail
-    // closed), not partially defaulted.
+    // closed), not partially defaulted
     assert!(
         parse_trusted_cidrs(&[
             "10.0.0.0/33".to_string(),
@@ -651,7 +644,7 @@ fn admin_config(admin_limit: u32) -> fumox_core::config::AdminConfig {
         enabled: true,
         token: TOKEN.to_string(),
         // Skip DNS vetting of source URLs in tests (no network needed);
-        // static URL validation still runs.
+        // static URL validation still runs
         allow_private_urls: true,
         rate_limit: fumox_core::config::RateLimit::new(
             admin_limit,
@@ -671,9 +664,9 @@ async fn test_state(admin_limit: u32) -> (fumox_core::tempdir_lite::TempDir, Adm
 
 /// The serve links are built against the same `[admin].allowed_hosts`
 /// the router gates the request with. The two lists are independent
-/// config, so validating the link against `[server].allowed_hosts` let a
-/// host that passed the edge gate reach the handler and be turned into
-/// a 500 by the three pages that render a serve link.
+/// config, so validating the link against `[server].allowed_hosts` would
+/// turn a host that passed the edge gate into a 500 in the pages that
+/// render a serve link.
 #[tokio::test]
 async fn serve_base_validates_against_the_admin_host_allowlist() {
     let mut admin = admin_config(10);
@@ -686,7 +679,7 @@ async fn serve_base_validates_against_the_admin_host_allowlist() {
     let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
 
     // The host the panel was opened on builds its serve link even when
-    // the public listener gates on a different list.
+    // the public listener gates on a different list
     let mut headers = HeaderMap::new();
     headers.insert(header::HOST, "panel.example.com".parse().unwrap());
     assert_eq!(
@@ -694,17 +687,16 @@ async fn serve_base_validates_against_the_admin_host_allowlist() {
         "http://panel.example.com:8080"
     );
 
-    // A host the panel does not allow builds nothing.
+    // A host the panel does not allow builds nothing
     let mut headers = HeaderMap::new();
     headers.insert(header::HOST, "vpn.example.com".parse().unwrap());
     assert!(state.serve_base(peer, &headers).is_err());
 }
 
 /// End to end through the router: a Host that passes the admin gate
-/// renders the serve-link pages instead of the 500 all three callers
-/// used to return from `build_serve_link_host`. Both allowlists
-/// configured, and pointing at different hosts, is the ordinary
-/// operator setup that made this the normal outcome.
+/// renders the serve-link pages instead of the 500 `build_serve_link_host`
+/// turns a mismatched host into. Both allowlists configured, and pointing
+/// at different hosts, is the ordinary operator setup.
 #[tokio::test]
 async fn serve_link_pages_render_for_an_admin_allowlisted_host() {
     let mut admin = admin_config(1000);
@@ -737,8 +729,8 @@ async fn serve_link_pages_render_for_an_admin_allowlisted_host() {
     );
     // The remaining tradeoff, recorded in `serve_base`: the link is not
     // rewritten to the host the public listener does allow, so with the
-    // two lists pointing at different hosts that link 404s on click.
-    // The page itself must render. That is the half this fixes.
+    // two lists pointing at different hosts that link 404s on click
+    // The page itself must render
     assert!(
         !html.contains("vpn.example.com"),
         "the link must not be silently swapped for another host: {html:.400}"
@@ -752,12 +744,11 @@ async fn test_state_with_admin(
 }
 
 /// M-101: the export link the panel renders must point at a host the
-/// public listener accepts. The link is built from the panel's own
-/// host, so the operator's two allowlists have to name it: the panel
-/// gates the request on `[admin].allowed_hosts`, the public listener
-/// gates the link on `[server].allowed_hosts`. The link only works
-/// when the host is on both lists, and the test says so instead of
-/// leaving the operator to discover it on click.
+/// public listener accepts. The link is built from the panel's own host,
+/// so the operator's two allowlists have to name it: the panel gates the
+/// request on `[admin].allowed_hosts`, the public listener gates the link
+/// on `[server].allowed_hosts`. The test says so instead of leaving the
+/// operator to discover it on click.
 #[tokio::test]
 async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
     let mut admin = admin_config(1000);
@@ -791,7 +782,7 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
 
-    // The link carries the panel's own host and the public port.
+    // The link carries the panel's own host and the public port
     assert!(
         html.contains("http://panel.example.com:8080/export/alive/"),
         "the export link must name the panel's host: {html:.400}"
@@ -801,7 +792,7 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
     let link = html[start..end].to_string();
 
     // The host of the link is on the public allowlist, so the public
-    // listener answers it.
+    // listener answers it
     let link_host = "panel.example.com";
     assert!(
         server.allowed_hosts.contains(&link_host.to_string()),
@@ -838,7 +829,7 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
 
     // The other half, pinned separately: the same link under a host the
     // public listener does not allow is a 404 ("link not found"), not a
-    // leaked capability.
+    // leaked capability
     let response = public
         .oneshot(
             Request::builder()
@@ -932,12 +923,10 @@ fn csrf_for(state: &AdminState, cookie: &str) -> String {
     auth::csrf_token(&state.csrf_key(), &session)
 }
 
-/// The toast a plain-browser action left for the session, decoded.
-///
-/// The message travels in an internal response header that the middleware
-/// parks in the session's slot (the browser never sees it), and the page
-/// picks it up once from `/admin/flash`. The answer is the message and its
-/// level; the second ask finds nothing.
+/// The toast a plain-browser action left for the session, decoded: it
+/// travels in an internal response header the middleware parks in the
+/// session's slot (the browser never sees it) and the page picks up once
+/// from `/admin/flash`.
 async fn pending_flash(app: &axum::Router, cookie: &str) -> Option<(String, String)> {
     let response = app
         .clone()
@@ -981,7 +970,7 @@ async fn the_placeholder_token_never_opens_a_session() {
     let app = router(state);
 
     // The placeholder is not a credential: submitting it must not mint a
-    // session, exactly like a wrong token.
+    // session, exactly like a wrong token
     let response = app
         .clone()
         .oneshot(request("POST", "/admin/login", "token=change-me", None))
@@ -1025,9 +1014,8 @@ struct ProxySeed {
 }
 
 /// One fixture proxy row: the base `INSERT INTO proxies` every fixture
-/// in this file repeats, returning the rowid the follow-up queries
-/// used to look up by fingerprint. The optional columns ride in
-/// [`ProxySeed`].
+/// in this file repeats, returning the rowid the follow-up queries look
+/// up by fingerprint. The optional columns ride in [`ProxySeed`].
 async fn insert_proxy(
     pool: &fumox_core::db::DbPool,
     fingerprint: &str,
@@ -1097,11 +1085,8 @@ async fn insert_proxy_seeded(
 }
 
 /// A row that is not there and a database that failed must not answer
-/// alike: the first is a 404, the second a 500.
-///
-/// The two used to travel as one (`Option::None` for both), so a broken
-/// database answered "not found" and a client could not tell a deleted
-/// row from a failed query.
+/// alike: the first is a 404, the second a 500, so a client can tell a
+/// deleted row from a failed query.
 ///
 /// The handler is called directly, not through the router: with the pool
 /// closed the authentication layer fails closed first (503, the epoch is
@@ -1111,7 +1096,7 @@ async fn insert_proxy_seeded(
 async fn a_missing_row_and_a_broken_database_answer_differently() {
     let (_dir, state) = test_state(1000).await;
 
-    // The row does not exist: the row is missing, the database is fine.
+    // The row does not exist: the row is missing, the database is fine
     let response = handlers::source_detail(
         State(state.clone()),
         Path("srcMissing00".to_string()),
@@ -1123,7 +1108,7 @@ async fn a_missing_row_and_a_broken_database_answer_differently() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // The database is gone: the same request cannot be answered with a
-    // "not found", the failure is on this side.
+    // "not found", the failure is on this side
     state.pool.close().await;
     let response = handlers::source_detail(
         State(state.clone()),
@@ -1150,7 +1135,7 @@ async fn the_source_page_shows_the_next_retry_next_to_the_last_error() {
         .await
         .unwrap();
     // Two failed attempts, journalled the way a failed fetch leaves its
-    // rows, with the row's own last_error mirroring the journal.
+    // rows, with the row's own last_error mirroring the journal
     for fetched_at in [now - 200, now - 100] {
         fumox_core::repo::fetch_log::insert(
             &pool,
@@ -1199,7 +1184,7 @@ async fn the_source_page_shows_the_next_retry_next_to_the_last_error() {
     );
 
     // A success newer than the failures resets the streak: no retry is
-    // pending, the hint disappears.
+    // pending, the hint disappears
     fumox_core::repo::fetch_log::insert(
         &pool,
         &fumox_core::repo::fetch_log::FetchLogEntry {
@@ -1250,7 +1235,7 @@ async fn login_flow_grants_access_and_wrong_token_does_not() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
 
-    // Wrong token: re-render the form with 422, no session.
+    // Wrong token: re-render the form with 422, no session
     let response = app
         .clone()
         .oneshot(request("POST", "/admin/login", "token=nope", None))
@@ -1259,7 +1244,7 @@ async fn login_flow_grants_access_and_wrong_token_does_not() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert!(response.headers().get(header::SET_COOKIE).is_none());
 
-    // Correct token: session cookie and access to the dashboard.
+    // Correct token: session cookie and access to the dashboard
     let cookie = login(&app).await;
     let response = app
         .clone()
@@ -1269,7 +1254,7 @@ async fn login_flow_grants_access_and_wrong_token_does_not() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     // The heading resolved from the locale the panel serves by default,
-    // not a string pinned in the test.
+    // not a string pinned in the test
     let lang = state.locales.resolve("ru");
     assert!(html.contains(lang.t("nav.dashboard")));
 }
@@ -1281,8 +1266,7 @@ async fn every_panel_page_carries_the_security_headers() {
     let cookie = login(&app).await;
 
     // The public login page and the protected pages behind it: the
-    // hardening must not stop at the login screen, a page that served
-    // the panel without the headers would be a hole in the policy.
+    // hardening must not stop at the login screen
     let pages: [(&str, Option<&str>); 4] = [
         ("/admin/login", None),
         ("/admin", Some(&cookie)),
@@ -1309,10 +1293,10 @@ async fn every_panel_page_carries_the_security_headers() {
         );
         // The referrer policy must stay off `no-referrer`: per Fetch, that
         // policy stamps `Origin: null` on the request, which
-        // `cross_site_context` rejects, so the login form's own navigation
-        // POST could never pass the gate (`403 err.cross_site`). `same-origin`
-        // keeps the panel URL from third-party origins and lets the browser
-        // send the real Origin.
+        // `cross_site_context` rejects, so the login form's own POST could
+        // never pass the gate (`403 err.cross_site`). `same-origin` keeps
+        // the panel URL from third-party origins and lets the browser send
+        // the real Origin
         assert_eq!(
             headers.get(header::REFERRER_POLICY).unwrap(),
             "same-origin",
@@ -1329,9 +1313,8 @@ async fn every_panel_page_carries_the_security_headers() {
             .to_str()
             .unwrap();
         assert_eq!(csp, security::CONTENT_SECURITY_POLICY, "{path}");
-        // The panel ships no inline script: the policy allows scripts
-        // from the origin only, so an inline block would be refused by
-        // the browser and the page would go dead.
+        // The panel ships no inline script, so an inline block would be
+        // refused and the page would go dead
         let script_src = csp
             .split(';')
             .map(str::trim)
@@ -1379,7 +1362,7 @@ async fn post_without_csrf_is_rejected() {
         .await
         .unwrap();
 
-    // No _csrf field at all.
+    // No _csrf field at all
     let response = app
         .clone()
         .oneshot(request(
@@ -1392,7 +1375,7 @@ async fn post_without_csrf_is_rejected() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    // A forged token does not pass either.
+    // A forged token does not pass either
     let response = app
         .clone()
         .oneshot(request(
@@ -1405,7 +1388,7 @@ async fn post_without_csrf_is_rejected() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    // The genuine token (derived from the session cookie) passes.
+    // The genuine token (derived from the session cookie) passes
     let csrf = csrf_for(&state, &cookie);
     let response = app
         .clone()
@@ -1436,7 +1419,7 @@ async fn logout_requires_session_and_csrf() {
     let cookie = login(&app).await;
 
     // A cross-site form POST: session cookie present, no _csrf, no
-    // Origin the server could check. Must not clear the session.
+    // Origin the server could check. Must not clear the session
     let response = app
         .clone()
         .oneshot(request("POST", "/admin/logout", "", Some(&cookie)))
@@ -1448,7 +1431,7 @@ async fn logout_requires_session_and_csrf() {
         "a CSRF-less logout must not send a cookie-clearing Set-Cookie"
     );
 
-    // Without a session the request never reaches the handler.
+    // Without a session the request never reaches the handler
     let response = app
         .clone()
         .oneshot(request("POST", "/admin/logout", "", None))
@@ -1461,7 +1444,7 @@ async fn logout_requires_session_and_csrf() {
     );
     assert!(response.headers().get(header::SET_COOKIE).is_none());
 
-    // The form in `base.html` ships the genuine token: it works.
+    // The form in `base.html` ships the genuine token: it works
     let csrf = csrf_for(&state, &cookie);
     let response = app
         .clone()
@@ -1479,22 +1462,19 @@ async fn logout_requires_session_and_csrf() {
     assert!(cleared.contains("Max-Age=0"), "cookie: {cleared}");
 }
 
-/// M3: an over-cap body must be rejected
-/// by the body-limit middleware before the CSRF layer runs. Anything
-/// from `DefaultBodyLimit::max(1 MiB)` (a `413 Payload Too Large`) is
-/// acceptable; a `400` from the CSRF layer's own `to_bytes` cap is
-/// also acceptable. What is *not* acceptable: the request slipping
-/// through to a `403` CSRF failure, that would mean the binary body
-/// was parsed as urlencoded and silently treated as a missing `_csrf`.
+/// M3: an over-cap body must be rejected before the CSRF layer runs. A
+/// `413 Payload Too Large` from `DefaultBodyLimit::max(1 MiB)` or a `400`
+/// from the CSRF layer's own `to_bytes` cap is acceptable. What is *not*
+/// acceptable: a `403` CSRF failure, that would mean the binary body was
+/// parsed as urlencoded and silently treated as a missing `_csrf`.
 #[tokio::test]
 async fn oversized_binary_body_is_rejected_before_csrf() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
     let cookie = login(&app).await;
 
-    // 1 MiB + 1 byte of arbitrary binary, invalid UTF-8 too: the body
-    // consists of binary bytes only, no CSRF token in it, so even if
-    // the CSRF layer ran, it could not match `_csrf` against it.
+    // 1 MiB + 1 byte of arbitrary binary: no CSRF token in it, so even
+    // if the CSRF layer ran, it could not match `_csrf` against it
     let mut body = Vec::with_capacity((1 << 20) + 1);
     body.extend_from_slice(&vec![0xFFu8; (1 << 20) + 1]);
 
@@ -1543,10 +1523,8 @@ async fn rate_limit_kicks_in_past_the_soft_limit() {
 /// fills its window while a different claim against the same peer stays
 /// unblocked. The claim that counts is the entry a trusted proxy
 /// appended (right-most), not the client-supplied left-most prefix.
-///
-/// The operator has to declare the header the proxy writes
-/// (`trust_proxy_header`); without the declaration the claim is the
-/// client's own text and the peer is the key.
+/// Without a declared `trust_proxy_header` the claim is the client's own
+/// text and the peer is the key.
 #[tokio::test]
 async fn rate_limit_uses_xff_ip_for_trusted_peer() {
     let (_dir, mut state) = test_state(1).await;
@@ -1559,28 +1537,28 @@ async fn rate_limit_uses_xff_ip_for_trusted_peer() {
         let mut r = request("GET", "/admin", "", Some(&cookie));
         r.headers_mut()
             .insert("x-forwarded-for", xff.parse().unwrap());
-        // Override the ConnectInfo peer to a trusted CIDR address.
+        // Override the ConnectInfo peer to a trusted CIDR address
         r.extensions_mut()
             .insert(ConnectInfo::<SocketAddr>("2.2.2.2:41000".parse().unwrap()));
         r
     };
 
-    // 1 of 1 window slots for claimed client 1.2.3.4.
+    // 1 of 1 window slots for claimed client 1.2.3.4
     let response = app.clone().oneshot(req_with_xff("1.2.3.4")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let response = app.clone().oneshot(req_with_xff("1.2.3.4")).await.unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // Same trusted peer, different claimed client: fresh window.
+    // Same trusted peer, different claimed client: fresh window
     let response = app.clone().oneshot(req_with_xff("5.5.5.5")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     // Append-mode proxy (security review f2): the client sends its own
     // XFF prefix and the trusted proxy appends the observed client IP,
-    // so the header is "<client-forged>, 9.9.9.9". The right-most
-    // non-trusted entry, what the proxy appended, must key the
-    // window, and re-forging the prefix must not open a new one.
+    // so the header is "<client-forged>, 9.9.9.9". The right-most entry,
+    // what the proxy appended, must key the window, and re-forging the
+    // prefix must not open a new one
     let response = app
         .clone()
         .oneshot(req_with_xff("1.2.3.4, 9.9.9.9"))
@@ -1595,9 +1573,8 @@ async fn rate_limit_uses_xff_ip_for_trusted_peer() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // The old left-to-right walk keyed on the forged left-most entry,
-    // every forged prefix got a fresh window and the login cap was
-    // void. The prefix is now ignored: same key, same exhausted window.
+    // The forged left-most prefix is ignored: same key, same exhausted
+    // window
     let response = app
         .clone()
         .oneshot(req_with_xff("6.6.6.6, 9.9.9.9"))
@@ -1639,7 +1616,7 @@ async fn admin_allowed_hosts_gates_every_route_at_the_edge() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // A missing Host header is rejected whenever an allowlist is set
-    // (deny by default), the gate's canonical empty host.
+    // (deny by default), the gate's canonical empty host
     let response = app
         .oneshot(request("GET", "/admin/login", "", None))
         .await
@@ -1686,7 +1663,7 @@ async fn the_host_allowlist_covers_every_panel_route() {
 
     // The same routes answer normally for an allowlisted host: the
     // protected ones redirect to the login screen, the login page
-    // renders.
+    // renders
     for uri in routes {
         let response = app
             .clone()
@@ -1700,7 +1677,7 @@ async fn the_host_allowlist_covers_every_panel_route() {
         );
     }
 
-    // And with a session they render for real.
+    // And with a session they render for real
     let response = app
         .clone()
         .oneshot(with_host(
@@ -1754,7 +1731,7 @@ async fn static_assets_bypass_the_rate_limit_but_a_head_counts() {
     let (_dir, state) = test_state(2).await;
     let app = router(state);
 
-    // Burn the window with plain GETs of the panel root.
+    // Burn the window with plain GETs of the panel root
     assert_eq!(
         app.clone()
             .oneshot(request("GET", "/admin/login", "", None))
@@ -1780,7 +1757,7 @@ async fn static_assets_bypass_the_rate_limit_but_a_head_counts() {
         StatusCode::TOO_MANY_REQUESTS
     );
 
-    // The window is exhausted, yet the assets still serve.
+    // The window is exhausted, yet the assets still serve
     for uri in ["/admin/static/app.css", "/admin/static/htmx.min.js"] {
         let response = app
             .clone()
@@ -1791,7 +1768,7 @@ async fn static_assets_bypass_the_rate_limit_but_a_head_counts() {
     }
 
     // A HEAD on an asset is exempt too: the exemption is the path, not
-    // the method.
+    // the method
     let response = app
         .clone()
         .oneshot(request("HEAD", "/admin/static/app.css", "", None))
@@ -1800,7 +1777,7 @@ async fn static_assets_bypass_the_rate_limit_but_a_head_counts() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // A HEAD on anything else counts against the window like the GET it
-    // shadows.
+    // shadows
     let response = app
         .clone()
         .oneshot(request("HEAD", "/admin/login", "", None))
@@ -1913,7 +1890,7 @@ async fn the_fetch_journal_pages_through_the_cursor_links() {
         .await
         .unwrap();
     // Five attempts a second apart, each named by its error (row 0 is the
-    // newest); two-digit names keep one from being a substring of another.
+    // newest); two-digit names keep one from being a substring of another
     for i in 0..5 {
         fumox_core::repo::fetch_log::insert(
             &pool,
@@ -1962,7 +1939,7 @@ async fn the_fetch_journal_pages_through_the_cursor_links() {
         Some(href[cur_at + "cur=".len()..].to_string())
     }
 
-    // Page 1 at two rows per page: the two newest attempts and a next link.
+    // Page 1 at two rows per page: the two newest attempts and a next link
     let first = fetch_page(&app, &cookie, "?per_page=2").await;
     assert!(first.contains("attempt 00"), "{first:.600}");
     assert!(first.contains("attempt 01"), "{first:.600}");
@@ -1971,7 +1948,7 @@ async fn the_fetch_journal_pages_through_the_cursor_links() {
     assert!(!first.contains("rel=\"prev\""), "{first:.600}");
 
     // The walk through the next links reaches the oldest row exactly at
-    // the end, where the strip offers no further page.
+    // the end, where the strip offers no further page
     let mut seen = vec![first.clone()];
     let mut token = next_token(&first);
     while let Some(cur) = token {
@@ -1984,7 +1961,7 @@ async fn the_fetch_journal_pages_through_the_cursor_links() {
     assert!(last.contains("attempt 04"), "{last:.600}");
     assert!(!last.contains("rel=\"next\""), "{last:.600}");
     // Every row renders on exactly one page of the walk: no gaps, no
-    // repeats — the tie-breaker by id holds the partition tight.
+    // repeats, the tie-breaker by id holds the partition tight
     for name in [
         "attempt 00",
         "attempt 01",
@@ -1997,12 +1974,12 @@ async fn the_fetch_journal_pages_through_the_cursor_links() {
         assert_eq!(pages_with, 1, "{name} must render on exactly one page");
     }
 
-    // Every cursor page offers the way back to the first one.
+    // Every cursor page offers the way back to the first one
     assert!(seen[1].contains("rel=\"prev\""), "{:#.400}", seen[1]);
 }
 
 /// The fetch journal's error-class select offers every class the schema
-/// records (`ErrorClass::all()`, storage included — a class the fetcher
+/// records (`ErrorClass::all()`, storage included: a class the fetcher
 /// can write must be filterable), and the `class` filter actually
 /// selects the rows recorded with it.
 #[tokio::test]
@@ -2048,14 +2025,14 @@ async fn the_fetch_journal_offers_and_filters_the_storage_error_class() {
         body_text(response).await
     }
 
-    // The class options are generated from the schema, storage included.
+    // The class options are generated from the schema, storage included
     let page = fetch_page(&app, &cookie, "").await;
     assert!(page.contains(r#"<option value="storage""#), "{page:.600}");
 
     // The recorded storage row answers to its own class filter…
     let filtered = fetch_page(&app, &cookie, "?class=storage").await;
     assert!(filtered.contains("database is locked"), "{filtered:.600}");
-    // …and to no other.
+    // …and to no other
     let other = fetch_page(&app, &cookie, "?class=network").await;
     assert!(!other.contains("database is locked"), "{other:.600}");
 }
@@ -2068,7 +2045,7 @@ async fn source_headers_with_control_characters_are_rejected() {
     let csrf = csrf_for(&state, &cookie);
 
     // A control byte inside a header value is refused by the HTTP layer;
-    // the form must reject it up front.
+    // the form must reject it up front
     let body = format!(
         "_csrf={csrf}&name=Hdr&url=https%3A%2F%2Fexample.com%2Fsub&cache_ttl_seconds=3600&headers=X-Token%3A%20abc%0Ddef"
     );
@@ -2094,7 +2071,7 @@ async fn source_form_validation_rejects_bad_input() {
 
     // L-102: one invalid field per request. A form that breaks on four
     // fields at once proves only that *something* was refused; these
-    // cases pin that each field refuses on its own.
+    // cases pin that each field refuses on its own
     for (case, fields) in [
         (
             "the TTL is out of range",
@@ -2156,7 +2133,7 @@ async fn source_form_validation_rejects_bad_input() {
         );
     }
 
-    // The empty name is reported as a missing field.
+    // The empty name is reported as a missing field
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", ""),
@@ -2172,7 +2149,7 @@ async fn source_form_validation_rejects_bad_input() {
     let html = body_text(response).await;
     assert!(html.contains("обязательное поле"), "{html:.400}");
 
-    // An unknown IP family is rejected as well.
+    // An unknown IP family is rejected as well
     let body = format!(
         "_csrf={csrf}&name=Family&url=https%3A%2F%2Fexample.com%2Fsub&ip_family=ipx6&cache_ttl_seconds=3600"
     );
@@ -2190,7 +2167,7 @@ async fn source_form_validation_rejects_bad_input() {
     );
 
     // A valid submission creates the source and redirects to the card;
-    // the pinned IP family is persisted.
+    // the pinned IP family is persisted
     let body = format!(
         "_csrf={csrf}&name=Test&slug=test&url=https%3A%2F%2Fexample.com%2Fsub&ip_family=ipv6&cache_ttl_seconds=3600&enabled=1"
     );
@@ -2211,8 +2188,7 @@ async fn source_form_validation_rejects_bad_input() {
 
 /// L-098: the SSRF guard on the source form must refuse the cloud
 /// metadata endpoint and the loopback, not only the RFC1918 space. The
-/// default test config switches the guard off (no DNS in tests), so the
-/// check was never exercised end to end.
+/// default test config switches the guard off (no DNS in tests).
 #[tokio::test]
 async fn private_source_urls_are_rejected_when_the_ssrf_guard_is_on() {
     let mut admin = admin_config(1000);
@@ -2223,9 +2199,9 @@ async fn private_source_urls_are_rejected_when_the_ssrf_guard_is_on() {
     let csrf = csrf_for(&state, &cookie);
 
     for url in [
-        // The metadata endpoint of every cloud provider.
+        // The metadata endpoint of every cloud provider
         "http://169.254.169.254/latest/meta-data/",
-        // The host's own services.
+        // The host's own services
         "http://127.0.0.1:8080/",
     ] {
         let body = urlencoded(&[
@@ -2254,9 +2230,8 @@ async fn private_source_urls_are_rejected_when_the_ssrf_guard_is_on() {
     }
 }
 
-/// F7: unbounded form fields used to be
-/// stored verbatim, a megabyte pipeline or a hundred tags degraded
-/// every later render. The caps reject the submission.
+/// F7: a megabyte pipeline or a hundred tags degrade
+/// every later render, so the caps reject the submission.
 #[tokio::test]
 async fn oversized_form_fields_are_rejected() {
     let (_dir, state) = test_state(1000).await;
@@ -2265,7 +2240,7 @@ async fn oversized_form_fields_are_rejected() {
     let csrf = csrf_for(&state, &cookie);
 
     // The test config allows private URLs, so vet_url short-circuits to
-    // static validation and the URL length cap is what fires here.
+    // static validation and the URL length cap is what fires here
     let long_url = format!("https://example.com/{}", "x".repeat(3000));
     let body = urlencoded(&[
         ("_csrf", &csrf),
@@ -2286,7 +2261,7 @@ async fn oversized_form_fields_are_rejected() {
             .is_empty()
     );
 
-    // A pipeline over the byte cap is rejected even when it is valid JSON.
+    // A pipeline over the byte cap is rejected even when it is valid JSON
     let huge_pipeline = format!(
         "{{\"version\":1,\"rename\":[{{\"match\":\"{}\",\"replace\":\"x\"}}]}}",
         "a".repeat(70_000)
@@ -2312,7 +2287,7 @@ async fn oversized_form_fields_are_rejected() {
             .is_empty()
     );
 
-    // Too many tags.
+    // Too many tags
     let tags: String = (0..30)
         .map(|i| format!("tag{i}"))
         .collect::<Vec<_>>()
@@ -2347,7 +2322,7 @@ async fn profile_token_validation_caps_and_charset() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // A token with spaces is not URL-safe: rejected.
+    // A token with spaces is not URL-safe: rejected
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "T"),
@@ -2367,7 +2342,7 @@ async fn profile_token_validation_caps_and_charset() {
             .is_empty()
     );
 
-    // A long but valid token passes the form (length capped at 128).
+    // A long but valid token passes the form (length capped at 128)
     let token = "a".repeat(128);
     let body = urlencoded(&[
         ("_csrf", &csrf),
@@ -2392,7 +2367,7 @@ async fn profile_token_validation_caps_and_charset() {
     );
 
     // L-103: one character over the cap is refused, and nothing is
-    // written.
+    // written
     for length in [129, 200] {
         let token = "a".repeat(length);
         let body = urlencoded(&[
@@ -2449,7 +2424,7 @@ async fn a_profile_token_is_stored_hashed_and_survives_the_placeholder() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-    // The row holds the hash, never the secret.
+    // The row holds the hash, never the secret
     let stored = fumox_core::repo::profiles::list(&state.pool, false)
         .await
         .unwrap()
@@ -2460,7 +2435,7 @@ async fn a_profile_token_is_stored_hashed_and_survives_the_placeholder() {
     assert!(fumox_core::token::is_hashed(&stored_token));
     assert!(fumox_core::token::verify(secret, &stored_token));
 
-    // The edit form hands out a placeholder, never the secret.
+    // The edit form hands out a placeholder, never the secret
     let response = app
         .clone()
         .oneshot(request(
@@ -2477,7 +2452,7 @@ async fn a_profile_token_is_stored_hashed_and_survives_the_placeholder() {
     assert!(html.contains("••••••"), "{html}");
 
     // Posting the form back unchanged keeps the token: the placeholder
-    // is not a token, and the stored one stays.
+    // is not a token, and the stored one stays
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "Protected"),
@@ -2522,7 +2497,7 @@ async fn url_validation_errors_follow_the_panel_language() {
     let body = format!("_csrf={csrf}&name=Bad&url=ftp://x&cache_ttl_seconds=3600");
 
     // Default UI language: the localized sentence wraps the offending
-    // scheme as a technical payload.
+    // scheme as a technical payload
     let response = app
         .clone()
         .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
@@ -2533,7 +2508,7 @@ async fn url_validation_errors_follow_the_panel_language() {
     assert!(html.contains("поддерживаются только http/https"), "{html}");
 
     // Same submission with the panel switched to English via the
-    // language cookie.
+    // language cookie
     let en_cookie = format!("{cookie}; {}=en", i18n::LANG_COOKIE);
     let response = app
         .oneshot(request(
@@ -2567,7 +2542,7 @@ async fn import_page_shows_alive_link_and_rotation_replaces_it() {
     let csrf = csrf_for(&state, &cookie);
 
     // The export screen displays the absolute alive-export link with
-    // its (first-visit generated) token.
+    // its (first-visit generated) token
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/import", "", Some(&cookie)))
@@ -2583,7 +2558,7 @@ async fn import_page_shows_alive_link_and_rotation_replaces_it() {
         .to_string();
     assert_eq!(token.len(), 12, "nanoid token, got {token:?}");
 
-    // Rotation issues a fresh token and returns to the screen.
+    // Rotation issues a fresh token and returns to the screen
     let body = format!("_csrf={csrf}");
     let response = app
         .oneshot(request(
@@ -2612,7 +2587,7 @@ async fn profile_form_persists_and_validates_country_filter() {
     let csrf = csrf_for(&state, &cookie);
 
     // "XX1" is not a 2-letter ISO code: the form re-renders with 422
-    // and nothing is written.
+    // and nothing is written
     let body = format!("_csrf={csrf}&name=Countries&countries=DE%2C%20XX1");
     let response = app
         .clone()
@@ -2629,7 +2604,7 @@ async fn profile_form_persists_and_validates_country_filter() {
             .is_empty()
     );
 
-    // A valid submission normalizes case and drops duplicates.
+    // A valid submission normalizes case and drops duplicates
     let body = format!(
         "_csrf={csrf}&name=Countries&output_format=uri_list&countries=de%2C%20US%2C%20de&enabled=1"
     );
@@ -2648,7 +2623,7 @@ async fn profile_form_persists_and_validates_country_filter() {
         vec!["DE".to_string(), "US".to_string()]
     );
 
-    // The card lists the active allowlist.
+    // The card lists the active allowlist
     let response = app
         .oneshot(request(
             "GET",
@@ -2693,7 +2668,7 @@ async fn ready_tier_surfaces_in_filter_dashboard_export_and_card_badge() {
     let app = router(state);
     let cookie = login(&app).await;
 
-    // The browser filter selects the ready tier only.
+    // The browser filter selects the ready tier only
     let response = app
         .clone()
         .oneshot(request(
@@ -2708,10 +2683,10 @@ async fn ready_tier_surfaces_in_filter_dashboard_export_and_card_badge() {
     let html = body_text(response).await;
     assert!(html.contains("verified-one"), "{html}");
     assert!(!html.contains("plain-one"), "{html}");
-    // The filter dropdown carries the ready checkbox.
+    // The filter dropdown carries the ready checkbox
     assert!(html.contains("value=\"ready\""), "{html}");
 
-    // The dashboard counts the ready bucket per scheme.
+    // The dashboard counts the ready bucket per scheme
     let response = app
         .clone()
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -2722,7 +2697,7 @@ async fn ready_tier_surfaces_in_filter_dashboard_export_and_card_badge() {
     assert!(html.contains("status=ready"), "{html}");
 
     // The export screen shows the ready link with the shared token and
-    // its own count.
+    // its own count
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/import", "", Some(&cookie)))
@@ -2734,7 +2709,7 @@ async fn ready_tier_surfaces_in_filter_dashboard_export_and_card_badge() {
     assert!(html.contains("готовые"), "the ready column title: {html}");
 
     // The card's own badge chain carries the ready tier too, so a
-    // T2-verified proxy does not render as «unknown».
+    // T2-verified proxy does not render as «unknown»
     let ready_id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE status = 'ready'")
         .fetch_one(&pool)
         .await
@@ -2759,9 +2734,9 @@ async fn ready_tier_surfaces_in_filter_dashboard_export_and_card_badge() {
 }
 
 /// The proxy browser's status filter keeps duplicates (`QueryPairs`, not
-/// a `HashMap`), so one request naming two statuses lists rows of both
-/// — a collapsing extractor used to keep only the last value and
-/// silently drop a whole tier from the answer.
+/// a `HashMap`), so one request naming two statuses lists rows of both;
+/// a collapsing extractor would keep only the last value and silently
+/// drop a whole tier from the answer.
 #[tokio::test]
 async fn the_proxy_browser_lists_two_statuses_in_one_request() {
     let (_dir, state) = test_state(1000).await;
@@ -2839,7 +2814,7 @@ async fn the_proxy_browser_pages_with_a_cursor() {
     let pool = state.pool.clone();
 
     // Seven rows with distinct update times: the default order shows
-    // them from the newest to the oldest.
+    // them from the newest to the oldest
     for index in 1..=7 {
         insert_proxy_seeded(
             &pool,
@@ -2873,7 +2848,7 @@ async fn the_proxy_browser_pages_with_a_cursor() {
     }
 
     // The first page holds the three newest rows and offers a way
-    // forward, but no way back.
+    // forward, but no way back
     let first = fetch(&app, &cookie, "/admin/proxies?per_page=3").await;
     for index in [7, 6, 5] {
         assert!(first.contains(&format!("row-{index}")), "{first}");
@@ -2885,7 +2860,7 @@ async fn the_proxy_browser_pages_with_a_cursor() {
     assert!(next.contains("cur="), "{next}");
 
     // The second page continues where the first one stopped: no row is
-    // shown twice and none is skipped.
+    // shown twice and none is skipped
     let second = fetch(&app, &cookie, &next).await;
     for index in [4, 3, 2] {
         assert!(second.contains(&format!("row-{index}")), "{second}");
@@ -2894,13 +2869,13 @@ async fn the_proxy_browser_pages_with_a_cursor() {
     assert!(pagination_link(&second, "prev").is_some(), "{second}");
     let second_next = pagination_link(&second, "next").expect("the second page has a next page");
 
-    // The last page holds the oldest row and offers no way forward.
+    // The last page holds the oldest row and offers no way forward
     let third = fetch(&app, &cookie, &second_next).await;
     assert!(third.contains("row-1"), "{third}");
     assert!(!third.contains("row-2"), "{third}");
     assert!(pagination_link(&third, "next").is_none(), "{third}");
 
-    // Going back returns to the page the browser came from.
+    // Going back returns to the page the browser came from
     let back = pagination_link(&third, "prev").expect("the last page has a previous page");
     let again = fetch(&app, &cookie, &back).await;
     for index in [4, 3, 2] {
@@ -2909,7 +2884,7 @@ async fn the_proxy_browser_pages_with_a_cursor() {
     assert!(!again.contains("row-1"), "{again}");
 
     // A cursor of another sort is not a position in this one: the list
-    // falls back to the first page of the new sort instead of failing.
+    // falls back to the first page of the new sort instead of failing
     let foreign = pagination_link(&first, "next").expect("a cursor to walk with");
     let by_name = fetch(&app, &cookie, &format!("{foreign}&sort=name")).await;
     assert!(by_name.contains("row-1"), "{by_name}");
@@ -2950,7 +2925,7 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
 
     // Profile with one source. A second source exists in the DB but
     // is not attached to the profile, proxies reachable only through
-    // that source must not show up in the count.
+    // that source must not show up in the count
     sqlx::query(
         "INSERT INTO profiles (id, name, output_format, enabled, created_at, updated_at)
              VALUES ('p-ready', 'ready-count', 'uri_list', 1, ?, ?)",
@@ -2981,7 +2956,7 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
 
     // Proxies reachable through `s-in` (in the profile): two ready,
     // one alive, one quarantine, one unknown, one removed. Only the
-    // two ready rows contribute to the count.
+    // two ready rows contribute to the count
     for (fp, host_no, status) in [
         ("fp-r1", 1i64, "ready"),
         ("fp-r2", 2, "ready"),
@@ -2990,7 +2965,7 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
         ("fp-u1", 5, "unknown"),
         ("fp-m1", 6, "removed"),
     ] {
-        // The name reuses the fingerprint for the row label.
+        // The name reuses the fingerprint for the row label
         insert_proxy_seeded(
             &pool,
             fp,
@@ -3010,7 +2985,7 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
     }
 
     // One extra ready proxy reachable only through `s-out` (not in the
-    // profile). Must not count toward the profile's total.
+    // profile). Must not count toward the profile's total
     insert_proxy_seeded(
         &pool,
         "fp-x1",
@@ -3029,7 +3004,7 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
     .unwrap();
 
     // And one ready proxy reachable through **both** sources, it must
-    // be counted once (DISTINCT px.id).
+    // be counted once (DISTINCT px.id)
     insert_proxy_seeded(
         &pool,
         "fp-both",
@@ -3075,14 +3050,14 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
 
     // Profile "ready-count" row: 2 ready + 1 ready (in both sources,
     // counted once) = 3. The alive/quarantine/unknown/removed rows
-    // and the proxy reachable only through `s-out` are excluded.
+    // and the proxy reachable only through `s-out` are excluded
     assert!(
         html.contains(">ready-count<"),
         "profile row missing: {html}"
     );
     // Sources count is 1 (only `s-in` is attached). Proxies count is
     // 3 (the ready-only count). The row is read cell by cell, not
-    // matched against a whitespace-exact HTML fragment.
+    // matched against a whitespace-exact HTML fragment
     let row = html
         .split("<tr")
         .find(|row| row.contains(">ready-count<"))
@@ -3113,7 +3088,7 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
 
-    // Daemon heartbeat and meow contact stamps from meta.
+    // Daemon heartbeat and meow contact stamps from meta
     fumox_core::repo::meta_set(
         &pool,
         "probe_heartbeat",
@@ -3127,7 +3102,7 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
 
     // One quarantined proxy with a scheduled second chance: the
     // ladder stamp is `quarantined_at + 12 h + [0, 4 h) jitter`
-    // (proxies.rs), so 1 h in quarantine puts it ~13 h out.
+    // (proxies.rs), so 1 h in quarantine puts it ~13 h out
     insert_proxy_seeded(
         &pool,
         "fp-q1",
@@ -3158,13 +3133,13 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
     assert!(html.contains("q.example.com"));
     // Every timestamp renders as a <time> element: RFC 3339 UTC in the
     // datetime attribute, the UTC text as the no-JS fallback (the admin
-    // JS in base.html rewrites it into the user's timezone).
+    // JS in base.html rewrites it into the user's timezone)
     assert!(html.contains("<time class=\"ts\" datetime=\""), "{html}");
     assert!(html.contains("Z\">"), "{html}");
     assert!(html.contains("</time>"), "{html}");
     // The "Quarantined (queue)" card uses the real status breakdown,
     // not the truncated 50-row queue: with one quarantined proxy the
-    // number is 1.
+    // number is 1
     assert!(
         html.contains("\"num\">1</div>\n    <div class=\"label\">"),
         "expected quarantine_count=1 to be rendered as the card number: {html}"
@@ -3172,12 +3147,12 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
 }
 
 /// The alive verdicts read the periods the daemon publishes in its own
-/// heartbeat, not this server's `[probe]` config copy. Seeded: beat
-/// interval 60 s, cycle 300 s. The config copy would say 30 s and 60 s,
-/// so the two windows disagree on both cards: a beat 120 s old is alive
-/// against the reported 180 s window and dead against the config copy's
-/// 90 s one, a meow contact 300 s old is alive against the reported
-/// 900 s window and dead against the config copy's 180 s one.
+/// heartbeat (seeded here: beat 60 s, cycle 300 s), not this server's
+/// `[probe]` config copy, whose defaults (30 s and 60 s) would read both
+/// cards dead: a beat 120 s old is alive against the reported 180 s
+/// window and dead against the config copy's 90 s one, a meow contact
+/// 300 s old is alive against the reported 900 s window and dead against
+/// the config copy's 180 s one.
 ///
 /// The ages sit inside their windows rather than on their edges: the
 /// handler reads the wall clock when it renders, so a stamp seeded
@@ -3190,7 +3165,7 @@ async fn probe_alive_verdicts_use_the_reported_periods() {
     let now = fumox_core::models::now_ts();
 
     // Beat 120 s old against the reported 60 s period: alive inside the
-    // reported 3 × 60 s window.
+    // reported 3 × 60 s window
     fumox_core::repo::meta_set(
         &pool,
         "probe_heartbeat",
@@ -3202,7 +3177,7 @@ async fn probe_alive_verdicts_use_the_reported_periods() {
     .await
     .unwrap();
     // Meow contact 300 s old against the reported 300 s cycle: alive
-    // inside the reported 3 × 300 s window.
+    // inside the reported 3 × 300 s window
     fumox_core::repo::meta_set(&pool, "meow_last_ok", &(now - 300).to_string())
         .await
         .unwrap();
@@ -3217,7 +3192,7 @@ async fn probe_alive_verdicts_use_the_reported_periods() {
     let html = body_text(response).await;
     // Exactly the two alive badges the page can carry: the daemon's and
     // the meow contact's. A threshold taken from the config copy would
-    // have called both of them dead.
+    // have called both of them dead
     assert_eq!(
         html.matches(r#"<span class="badge alive">"#).count(),
         2,
@@ -3229,10 +3204,9 @@ async fn probe_alive_verdicts_use_the_reported_periods() {
     );
 }
 
-/// Regression: the quarantine card must show the true population count
-/// even when the on-screen queue is truncated to 50 rows. Previously
-/// the card showed `queue.len()` (always <= 50), which underreported
-/// the population.
+/// The quarantine card must show the true population count even when the
+/// on-screen queue is truncated to 50 rows: `queue.len()` (always <= 50)
+/// underreports the population.
 #[tokio::test]
 async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
     let (_dir, state) = test_state(1000).await;
@@ -3240,7 +3214,7 @@ async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
     let now = fumox_core::models::now_ts();
 
     // 60 quarantined proxies, enough to overflow the LIMIT 50 on the
-    // queue view. The card must still read 60.
+    // queue view. The card must still read 60
     for i in 0..60 {
         insert_proxy_seeded(
             &pool,
@@ -3267,7 +3241,7 @@ async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // True population (60) wins over the truncated queue (50).
+    // True population (60) wins over the truncated queue (50)
     assert!(
         html.contains("\"num\">60</div>"),
         "expected quarantine card to render the true count of 60: {html}"
@@ -3276,11 +3250,9 @@ async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
         !html.contains("\"num\">50</div>"),
         "card must not render the truncated queue length 50: {html}"
     );
-    // The truncation hint is shown only when the count overflows 50.
-    // The default language in tests is Russian, so look for the
-    // translated substring; either locale would be acceptable. The hint
-    // names the shown rows and the total, so it cannot be read as
-    // "50 of 50" next to a card that counts 60.
+    // The truncation hint is shown only when the count overflows 50;
+    // either locale would be acceptable, and it must name the shown rows
+    // and the total, not read as "50 of 50" next to a card that counts 60
     assert!(
         html.contains("ближайшие 50 из 60") || html.contains("nearest 50 of 60"),
         "expected truncation hint when quarantine_count > 50: {html}"
@@ -3299,7 +3271,7 @@ async fn probe_screen_shows_check_coverage() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
 
-    // Rowid order matters: the probe attempt below keys on it.
+    // Rowid order matters: the probe attempt below keys on it
     for (fp, name, host, status) in [
         ("fp-cv-none", "never-probed", "h0.example.com", "unknown"),
         ("fp-cv-t1", "tcp-only", "h1.example.com", "alive"),
@@ -3320,7 +3292,7 @@ async fn probe_screen_shows_check_coverage() {
         .unwrap();
     }
     // One T1 attempt for tcp-only, T1 + T2 for fully-checked; a probe
-    // attempt needs its proxy id (rowid order of the insert above).
+    // attempt needs its proxy id (rowid order of the insert above)
     sqlx::query(
         "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
              SELECT id, 1, 1, 10, NULL, 'tcp' FROM proxies WHERE fingerprint = 'fp-cv-t1'",
@@ -3347,7 +3319,7 @@ async fn probe_screen_shows_check_coverage() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // Panel title, bucket labels and one link per bucket.
+    // Panel title, bucket labels and one link per bucket
     assert!(html.contains("Покрытие проверками"), "{html}");
     for label in ["Без проверок", "Только T1", "Только T2", "T1 и T2"] {
         assert!(html.contains(label), "missing bucket label {label}: {html}");
@@ -3370,12 +3342,11 @@ async fn probe_screen_shows_ok_banner_when_queue_fits_target() {
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
 
-    // The rows are due for a check, so the cycle can retire them,
-    // and a row is only due that early if it has been in quarantine
-    // at least the second-chance window: the stamp is
-    // `quarantined_at + 12 h + [0, 4 h) jitter` (proxies.rs), so
-    // 15 h in quarantine with the check just past is a pair the
-    // daemon produces, where `now - 3600` / `now - 1` is not.
+    // The rows must be due for a check, and a row is only due that early
+    // if it has been in quarantine at least the second-chance window: the
+    // stamp is `quarantined_at + 12 h + [0, 4 h) jitter` (proxies.rs), so
+    // 15 h in quarantine with the check just past is a pair the daemon
+    // produces, where `now - 3600` / `now - 1` is not
     for i in 0..5 {
         insert_proxy_seeded(
             &pool,
@@ -3409,7 +3380,7 @@ async fn probe_screen_shows_ok_banner_when_queue_fits_target() {
     // 5 quarantined and 5 due: retire = min(50, 5) = 5 per cycle,
     // lane = ceil(5/8) x 20s = 20s <= the 60s interval, so one
     // cycle drains the queue - 1 min, well inside the 60-min
-    // default target.
+    // default target
     assert!(
         html.contains("осушение за ~1 мин"),
         "current drain not mentioned: {html}"
@@ -3418,7 +3389,7 @@ async fn probe_screen_shows_ok_banner_when_queue_fits_target() {
         html.contains("цель: 60 мин"),
         "target not mentioned: {html}"
     );
-    // No warning or danger variants on this page.
+    // No warning or danger variants on this page
     assert!(
         !html.contains("flash warning") && !html.contains("flash danger"),
         "no warning/danger expected: {html}"
@@ -3436,12 +3407,11 @@ async fn probe_screen_shows_ok_banner_when_queue_fits_target() {
 #[tokio::test]
 async fn probe_screen_warns_when_drain_exceeds_target() {
     let (_dir, state) = test_state(1000).await;
-    // The backlog target now lives in the single live config view:
-    // write a file that tightens it and refresh, the same path a
-    // settings save takes. The login check reads the live config, so
-    // the refreshed file must carry the test token: a config file
-    // without `[admin]` loads the built-in default and the login below
-    // would 422.
+    // The backlog target lives in the single live config view: write a
+    // file that tightens it and refresh, the same path a settings save
+    // takes. The refreshed file must carry the test token, because a
+    // config file without `[admin]` loads the built-in default and the
+    // login below would 422
     let _config_dir = refresh_from_written_config(
         &state,
         "probe-drain",
@@ -3452,10 +3422,10 @@ async fn probe_screen_warns_when_drain_exceeds_target() {
 
     // 151 rows *due*: retire = min(50, 151) = 50, lane =
     // ceil(50/8) x 20s = 140s > the 60s interval, so the period
-    // is 140s and 4 cycles take 10 min against the 5-min target.
+    // is 140s and 4 cycles take 10 min against the 5-min target
     // None of the hard heuristic thresholds fire at this size (151 is
     // below 50x20 and below 50x5), so the banner is driven by the soft
-    // drain-vs-target check.
+    // drain-vs-target check
     for i in 0..151 {
         insert_proxy_seeded(
             &pool,
@@ -3513,7 +3483,7 @@ async fn probe_screen_warns_on_deep_queue_with_recommendation() {
     // concurrency=8, connect+tls=20s) the quarantine lane takes
     // ceil(50/8) x 20s = 140s, past the 60s interval, so the period
     // is 140s and 80 cycles take 187 min - over the 60-min target,
-    // so recommendations show.
+    // so recommendations show
     sqlx::query(
         "INSERT INTO proxies
                  (fingerprint, scheme, name, host, port, credential, status,
@@ -3547,7 +3517,7 @@ async fn probe_screen_warns_on_deep_queue_with_recommendation() {
         "recs head missing: {html}"
     );
     // required_sample = ceil(4000 × 140 / 3600) = 156, capped by the
-    // 4000 rows that can be due. The label is localized.
+    // 4000 rows that can be due. The label is localized
     assert!(
         html.contains("[probe].sample_size = 156"),
         "sample_size recommendation missing or wrong: {html}"
@@ -3558,7 +3528,7 @@ async fn probe_screen_warns_on_deep_queue_with_recommendation() {
     );
     // Chained on that sample: ceil(156/52) x 20s = 60s, which fits
     // the 60s period, so applying both recs keeps the cycle on
-    // schedule.
+    // schedule
     assert!(
         html.contains("[probe].concurrency = 52"),
         "concurrency recommendation missing or wrong: {html}"
@@ -3582,7 +3552,7 @@ async fn probe_screen_danger_on_stale_oldest_row() {
         ProxySeed {
             host: Some("s.example".to_string()),
             // 30 days ago; its check came due long ago, the ladder
-            // re-stamps it.
+            // re-stamps it
             quarantined_at: Some(now - 30 * 86_400),
             ladder_at: Some(now - 1),
             ..Default::default()
@@ -3647,7 +3617,7 @@ async fn probe_screen_warns_on_due_overflow() {
     // stretches to 140s too. The hard due_overflow factor suppresses
     // the drain-bearing banner wordings (all_ok / drain_over_target),
     // so the concrete figure is asserted on the model the page reads
-    // it from, not on the page text.
+    // it from, not on the page text
     let backlog = fumox_core::probe_backlog::compute_backlog(
         &fumox_core::probe_backlog::BacklogInputs {
             quarantine_count: 300,
@@ -3671,13 +3641,13 @@ async fn probe_screen_warns_on_due_overflow() {
     );
 }
 
-/// A queue the ladder has not released yet is not a queue that
-/// needs draining. 800 quarantined rows whose `ladder_at` is in the
-/// future (a fresh quarantine is stamped 12-16 h out) make the
-/// cycle pick up nothing, so the banner says so instead of
-/// estimating a drain it cannot support or recommending a knob
-/// that would change nothing. 800 rows is under the `deep_queue`
-/// threshold, so the idle wording is the only state on offer.
+/// A queue the ladder has not released yet is not a queue that needs
+/// draining. 800 quarantined rows whose `ladder_at` is in the future (a
+/// fresh quarantine is stamped 12-16 h out) make the cycle pick up
+/// nothing, so the banner says so instead of estimating a drain it
+/// cannot support or recommending a knob that would change nothing.
+/// 800 rows is under the `deep_queue` threshold, so the idle wording is
+/// the only state on offer.
 #[tokio::test]
 async fn probe_screen_drain_figure_ignores_rows_that_are_not_due() {
     let (_dir, state) = test_state(1000).await;
@@ -3747,7 +3717,7 @@ async fn probe_screen_warns_on_dead_heartbeat() {
         "danger banner expected: {html}"
     );
     // The age is recomputed from the wall clock at render time
-    // (handlers/probe.rs), so assert a range, not an exact string.
+    // (handlers/probe.rs), so assert a range, not an exact string
     let secs = regex::Regex::new(r"Heartbeat тестера отсутствует (\d+) с")
         .expect("valid regex")
         .captures(&html)
@@ -3760,10 +3730,8 @@ async fn probe_screen_warns_on_dead_heartbeat() {
     );
 }
 
-/// GET helper, runs a request through the router and returns the
-/// collected body as a UTF-8 string. The probe tests only need the
-/// body, so this trims the boilerplate around `oneshot` /
-/// `into_body().collect()`.
+/// GET helper for the probe tests: runs the request through the router
+/// and returns the collected body as a UTF-8 string.
 async fn render_get_html(app: &axum::Router, uri: &str, cookie: &str) -> String {
     let response = app
         .clone()
@@ -3781,7 +3749,7 @@ async fn proxies_list_filters_by_check_coverage() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
 
-    // Four proxies, one per bucket.
+    // Four proxies, one per bucket
     for (fp, name) in [
         ("fp-l-none", "untouched"),
         ("fp-l-t1", "tcp-only"),
@@ -3813,7 +3781,7 @@ async fn proxies_list_filters_by_check_coverage() {
     let cookie = login(&app).await;
 
     // Every bucket selects exactly its proxy; a garbage bucket value is
-    // tolerated (no filter, all four rows).
+    // tolerated (no filter, all four rows)
     for (query, expect, absent) in [
         ("?coverage=none", "untouched", "tcp-only"),
         ("?coverage=t1_only", "tcp-only", "untouched"),
@@ -3837,7 +3805,7 @@ async fn proxies_list_filters_by_check_coverage() {
         assert!(!html.contains(absent), "{absent} leaked into {query}");
     }
 
-    // The Checks column marks a proxy with both tiers in its history.
+    // The Checks column marks a proxy with both tiers in its history
     let response = app
         .oneshot(request(
             "GET",
@@ -3872,17 +3840,16 @@ async fn settings_screen_shows_effective_config_sections() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // Owner-process badges and the config-file banner.
+    // Owner-process badges and the config-file banner
     assert!(html.contains("config/app.toml"), "{html}");
     assert!(html.contains("probe"), "{html}");
     assert!(html.contains("server"), "{html}");
     // The configured ladder renders as the localized sentence (the
     // default UI language is Russian), including the second chance, the
-    // first delay and the terminal removal step.
+    // first delay and the terminal removal step
     assert!(html.contains("Второй шанс"), "{html}");
     assert!(html.contains("15 мин"), "{html}");
     assert!(html.contains("удаление"), "{html}");
-    // Sections exist.
     for key_value in [
         probe.fail_limit.to_string(),
         probe.sample_size.to_string(),
@@ -3893,7 +3860,7 @@ async fn settings_screen_shows_effective_config_sections() {
         assert!(html.contains(&key_value), "missing {key_value}: {html}");
     }
     // The full `[ingest]` trio: the revived-row toggle is shown with its
-    // localized label next to the effective value.
+    // localized label next to the effective value
     assert!(
         html.contains("Возвращать удаленные прокси"),
         "the removed_as_unknown label: {html}"
@@ -3903,13 +3870,13 @@ async fn settings_screen_shows_effective_config_sections() {
         "{html}"
     );
     // The `[fetch]` panel: the localized title, the User-Agent and the
-    // human-readable response cap.
+    // human-readable response cap
     assert!(html.contains("Загрузка по HTTP"), "the fetch panel: {html}");
     assert!(html.contains(fetch.user_agent.as_str()), "{html}");
     assert!(html.contains(fetch.ip_family.as_str()), "{html}");
     assert!(html.contains("10 MiB"), "{html}");
     // The remaining sections render with their localized titles; the
-    // rate limits come back in the canonical config form.
+    // rate limits come back in the canonical config form
     for title in [
         "Публичный слушатель",
         "База данных",
@@ -3929,16 +3896,15 @@ async fn settings_screen_shows_effective_config_sections() {
         "{html}"
     );
     assert!(html.contains(log.server.as_str()), "{html}");
-    // The admin token is a secret, it must never reach the page.
+    // The admin token is a secret, it must never reach the page
     assert!(!html.contains(&admin.token), "token leaked: {html}");
 }
 
 /// Two sources with proxies in every status plus probe history; the
-/// dashboard (the former stats screen merged in) must render the
-/// per-source health counters, the
+/// dashboard must render the per-source health counters, the
 /// longest-living top and the 24h probe success rate, with the
 /// source-errors block above everything else and no "recent fetches"
-/// table anymore.
+/// table.
 #[tokio::test]
 async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
     let (_dir, state) = test_state(1000).await;
@@ -3971,7 +3937,7 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
             "ready",
             // 1000 s older than the alive veteran: the top list orders
             // by created_at, and two same-aged rows would order by
-            // rowid, a detail no assertion should lean on.
+            // rowid, a detail no assertion should lean on
             501_000,
             Some(80),
             Some("DE"),
@@ -4032,7 +3998,7 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
         .unwrap();
     }
 
-    // Probe history: 2 ok + 1 fail over the last hour.
+    // Probe history: 2 ok + 1 fail over the last hour
     for (ok, latency) in [(1, Some(90)), (1, Some(120)), (0, None)] {
         let proxy_id: i64 =
             sqlx::query_scalar("SELECT id FROM proxies WHERE fingerprint = 'fp-veteran'")
@@ -4062,34 +4028,34 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
 
-    // The merged page renders every former stats panel.
+    // The merged page renders every stats panel
     assert!(html.contains("Обзор"), "{html}");
     assert!(html.contains("Прокси по источникам"), "{html}");
     assert!(html.contains("Самые готовые прокси"), "{html}");
-    // The per-source table follows the status machine (unknown first) and
-    // the oldest-ready column replaced "oldest alive"; the protocol and
-    // country columns are gone.
+    // The per-source table follows the status machine (unknown first);
+    // the oldest-ready column stands where "oldest alive" was, and the
+    // protocol and country columns are gone
     assert!(html.contains("Старейший готовый"), "{html}");
     assert!(!html.contains("Старейший живой"), "{html}");
-    // The new Top-N picker renders the default 10 selected.
+    // The Top-N picker renders the default 10 selected
     assert!(html.contains("Показать топ:"), "{html}");
-    // The new Top Failure Reasons panel renders even when empty.
+    // The Top Failure Reasons panel renders even when empty
     assert!(html.contains("Топ причин отказов"), "{html}");
     // The "recent fetches" table is gone from the dashboard; the
-    // source-errors block leads the screen.
+    // source-errors block leads the screen
     let errors_at = html.find("Источники с ошибками").expect("errors block");
     let stats_at = html.find("Прокси по источникам").expect("per-source block");
     assert!(errors_at < stats_at, "source errors must render first");
     assert!(!html.contains("Последние загрузки"), "{html}");
-    // Per-source counters: source 1 has 2 alive, source 2 has 1 unknown.
+    // Per-source counters: source 1 has 2 alive, source 2 has 1 unknown
     assert!(html.contains("source srcS0000001"), "{html}");
     assert!(html.contains("source srcS0000002"), "{html}");
-    // Probe success rate: 2/3.
+    // Probe success rate: 2/3
     assert!(html.contains("2 / 3"), "{html}");
     // The oldest ready proxy tops the longevity list: the panel's first
     // rank cell and the row's name sit in one `<tr>`, the ready veteran
     // 1000 s older than every other row. An assertion on the bare
-    // `fp-veteran` substring would also match `fp-veteran-ready`.
+    // `fp-veteran` substring would also match `fp-veteran-ready`
     let top_at = html.find("Самые готовые прокси").expect("top panel");
     let panel = &html[top_at..];
     let rank_at = panel
@@ -4099,10 +4065,10 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
         .find("fp-veteran-ready")
         .expect("the veteran ready row in the top list");
     assert!(rank_at < ready_at, "fp-veteran-ready must hold rank 1");
-    // Unprobeable counter includes the tuic proxy.
+    // Unprobeable counter includes the tuic proxy
     assert!(html.contains("непроверяемых (tuic/mieru): 1"), "{html}");
     // The latency card covers the live pool (`alive` and `ready`): the
-    // three measured proxies feed the min/avg card (90, 80 and 15).
+    // three measured proxies feed the min/avg card (90, 80 and 15)
     assert!(html.contains("мин: 15"), "{html}");
     assert!(html.contains("ср: 61"), "{html}");
 }
@@ -4110,26 +4076,26 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
 /// Proxy-card geo refresh: opening the
 /// card resolves the host against every GeoLite2 database in the
 /// workspace `config/` and stores the country/city/ASN facts plus the
-/// resolved IP; without them the card renders the stored facts as-is
-/// (and never wipes them). Skipped in CI (no .mmdb files there).
+/// resolved IP; without databases (CI has no .mmdb files) the card
+/// renders the stored facts as-is and never wipes them.
 #[tokio::test]
 async fn proxy_card_refreshes_geo_facts_on_open() {
     // The workspace config/ directory with the gitignored .mmdb files;
-    // when absent (CI) the test exercises the no-databases degradation.
+    // when absent (CI) the test exercises the no-databases degradation
     let db_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../config")
         .canonicalize()
         .unwrap();
     // The shared fixture wiring with the card resolver pointed at the
-    // workspace directory (`test_state` pins db_dir to "config"
-    // relative to the crate working directory).
+    // workspace directory (the default `db_dir` is a crate-relative
+    // "config" the workspace .mmdb files do not land in)
     let (_dir, state) =
         test_admin_state_with_geo(admin_config(1000), Default::default(), Some(db_dir)).await;
     let pool = state.pool.clone();
     let has_dbs = state.geo_full.is_active();
 
     let now = fumox_core::models::now_ts();
-    // Stored facts the card must keep when nothing better arrives.
+    // Stored facts the card must keep when nothing better arrives
     let id = insert_proxy_seeded(
         &pool,
         "fp-geo-8.8.8.8",
@@ -4149,7 +4115,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
     .await
     .unwrap();
 
-    // Opening the card is the whole interaction, no button, no POST.
+    // Opening the card is the whole interaction, no button, no POST
     let app = router(state);
     let cookie = login(&app).await;
     let response = app
@@ -4164,7 +4130,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // The geography block renders (the card, not a swap fragment).
+    // The geography block renders (the card, not a swap fragment)
     assert!(
         html.contains("px.geography") || html.contains("География"),
         "{html}"
@@ -4173,7 +4139,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
 
     if has_dbs {
         // The refresh runs in the background (the card must not wait for
-        // the resolver), so the facts land a moment after the response.
+        // the resolver), so the facts land a moment after the response
         let row = wait_for_geo_facts(&pool, id).await;
         assert_eq!(row.geo_country.as_deref(), Some("US"));
         assert_eq!(row.resolved_ip.as_deref(), Some("8.8.8.8"));
@@ -4184,7 +4150,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
         assert!(asn.starts_with("AS"), "asn format: {asn}");
 
         // The next open of the card shows the fresh facts: the card
-        // renders the stored values, not the ones of a pending lookup.
+        // renders the stored values, not the ones of a pending lookup
         let response = app
             .clone()
             .oneshot(request(
@@ -4202,7 +4168,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
     } else {
         // Without the databases the card renders the stored facts and
         // never wipes anything: all three seeded values survive the
-        // open, a lookup that yields nothing erases nothing.
+        // open, a lookup that yields nothing erases nothing
         let row = fumox_core::repo::proxies::get_by_id(&pool, id)
             .await
             .unwrap()
@@ -4351,17 +4317,16 @@ async fn quarantine_to_removed_moves_only_quarantined_rows() {
 }
 
 /// A reconcile-retired row is refused by the repo (no source link,
-/// so no probe lane can reach it), and the answer used to be a 404
-/// telling the operator the proxy does not exist. It exists: it is
-/// on the screen the click came from. The refusal is reported as a
-/// rejected action, the row is left exactly as it was, and a row that
-/// really is gone still 404s.
+/// so no probe lane can reach it), yet the row is on the screen the
+/// click came from. The refusal is reported as a rejected action, the
+/// row is left exactly as it was, and a row that really is gone still
+/// 404s.
 #[tokio::test]
 async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     // No proxy_source_links row: reconciliation retired it, so every
-    // lane's link predicate filters it out.
+    // lane's link predicate filters it out
     let id = insert_proxy_seeded(
         &pool,
         "fp-orphan",
@@ -4399,12 +4364,12 @@ async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing()
         .to_string();
     assert!(trigger.contains("\"level\": \"error\""), "{trigger}");
     // The toast rides percent-encoded, so compare on the decoded text:
-    // the message must be the refusal, not `proxy not found`.
+    // the message must be the refusal, not `proxy not found`
     let toast = percent_decode(&trigger);
     let en = state.locales.resolve("en");
     assert!(toast.contains(en.t("px.reset_unreachable")), "{toast}");
     assert!(!toast.contains("proxy not found"), "{toast}");
-    // The status the click was refused for is the one that stays.
+    // The status the click was refused for is the one that stays
     let body = body_text(response).await;
     assert!(body.contains("badge quarantine"), "{body}");
     let (status, quarantined_at): (String, Option<i64>) =
@@ -4416,7 +4381,7 @@ async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing()
     assert_eq!(status, "quarantine");
     assert_eq!(quarantined_at, Some(111), "the row must be untouched");
 
-    // A row that is genuinely gone is still a 404.
+    // A row that is genuinely gone is still a 404
     let mut req = request(
         "POST",
         &format!("/admin/proxies/{}/reset", id + 1000),
@@ -4488,7 +4453,7 @@ async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Invalid input: nothing changes, the HTMX toast reports the error.
+    // Invalid input: nothing changes, the HTMX toast reports the error
     let mut req = request(
         "POST",
         "/admin/proxies/remove-alive-by-asn",
@@ -4510,7 +4475,7 @@ async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
 
     // Bare number and AS prefix both work: each spelling is checked
     // against its own proxy, so a spelling that silently matched
-    // nothing cannot ride on the other's success.
+    // nothing cannot ride on the other's success
     seed_cleanup_proxy(
         &pool,
         "fp-asbare",
@@ -4545,11 +4510,11 @@ async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
     }
     // The transition is per ASN, not per row: the bare-number request
     // removed both AS24940 rows (the earlier fixture shares the ASN),
-    // and the AS9009 row is untouched by both requests.
+    // and the AS9009 row is untouched by both requests
     assert_eq!(status_by_fp(&pool, "fp-ashet").await, "removed");
     assert_eq!(status_by_fp(&pool, "fp-asno").await, "alive");
 
-    // The badge fragment must substitute the catalog's {asn} into "AS{asn}".
+    // The badge fragment must substitute the catalog's {asn} into "AS{asn}"
     seed_cleanup_proxy(
         &pool,
         "fp-asfrag",
@@ -4589,7 +4554,7 @@ async fn cleanup_by_country_validates_input_and_targets_alive_only() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Invalid input (empty country from the dropdown's placeholder).
+    // Invalid input (empty country from the dropdown's placeholder)
     let response = app
         .clone()
         .oneshot(request(
@@ -4629,7 +4594,7 @@ async fn cleanup_no_country_and_unprobeable_target_their_groups() {
     seed_cleanup_proxy(&pool, "fp-mieru", "mieru", "unknown", None, None).await;
     seed_cleanup_proxy(&pool, "fp-vlessu", "vless", "unknown", None, None).await;
     // tuic-alive carries a country so the no-country action above
-    // cannot touch it, it must survive both actions.
+    // cannot touch it, it must survive both actions
     seed_cleanup_proxy(&pool, "fp-tuica", "tuic", "alive", Some("US"), None).await;
 
     let app = router(state.clone());
@@ -4670,7 +4635,7 @@ async fn cleanup_no_country_and_unprobeable_target_their_groups() {
 async fn dry_run_parses_source_without_writing_anything() {
     use axum::routing::get;
 
-    // Mock subscription endpoint.
+    // Mock subscription endpoint
     let mock = axum::Router::new().route(
         "/sub",
         get(|| async { "vless://uuid@1.2.3.4:443?security=reality#A\ntrojan://pw@h:443#B\n" }),
@@ -4684,7 +4649,7 @@ async fn dry_run_parses_source_without_writing_anything() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     // The shared source fixture, only the URL points at the mock (and
-    // the dry-run row carries no slug).
+    // the dry-run row carries no slug)
     let mut source = test_source("srcD0000000", "dry");
     source.slug = None;
     source.url = format!("http://{addr}/sub");
@@ -4697,7 +4662,7 @@ async fn dry_run_parses_source_without_writing_anything() {
     let csrf = csrf_for(&state, &cookie);
 
     // HTMX path (HX-Request header): the result panel is swapped into
-    // #dryrun-target as before.
+    // #dryrun-target
     let htmx_response = app
         .clone()
         .oneshot(
@@ -4722,7 +4687,7 @@ async fn dry_run_parses_source_without_writing_anything() {
 
     // Plain-browser path (no HX-Request header): the bare fragment would
     // be a chrome-less page, so the action redirects back to the source
-    // card and carries the outcome in a header, not in the URL.
+    // card and carries the outcome in a header, not in the URL
     let response = app
         .clone()
         .oneshot(request(
@@ -4746,13 +4711,13 @@ async fn dry_run_parses_source_without_writing_anything() {
         .expect("the action must leave a toast");
     assert_eq!(level, "ok");
     assert!(!message.is_empty());
-    // The toast is handed out once.
+    // The toast is handed out once
     assert!(
         pending_flash(&app, &cookie).await.is_none(),
         "the toast must not be replayed"
     );
 
-    // Nothing was written: no proxies, no fetch_log entries.
+    // Nothing was written: no proxies, no fetch_log entries
     let (proxy_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
         .fetch_one(&pool)
         .await
@@ -4766,11 +4731,10 @@ async fn dry_run_parses_source_without_writing_anything() {
 }
 
 /// The `/admin/flash` payload must stay valid JSON whatever a producer
-/// parked in the store. Today's only producer percent-encodes the message
+/// parked in the store. The only producer percent-encodes the message
 /// (`header_safe`), so the quote-free guarantee lives in that discipline
-/// alone; the store itself accepts anything, and a message that bypassed
-/// the encoding (parked here directly) must not hand the client a body
-/// its `response.json()` cannot read.
+/// alone; a message parked directly, bypassing the encoding, must still
+/// not hand the client a body its `response.json()` cannot read.
 #[tokio::test]
 async fn a_flash_message_with_quotes_still_answers_valid_json() {
     let (_dir, state) = test_state(1000).await;
@@ -4782,7 +4746,7 @@ async fn a_flash_message_with_quotes_still_answers_valid_json() {
         .unwrap_or_default();
 
     // A producer that skipped `header_safe`: the message carries the very
-    // characters a hand-built JSON envelope cannot survive.
+    // characters a hand-built JSON envelope cannot survive
     let message = r#"He said "hi" \ done"#.to_string();
     state
         .flashes
@@ -4802,8 +4766,8 @@ async fn a_flash_message_with_quotes_still_answers_valid_json() {
 
 /// The stream forwards bus events verbatim: publishing a fetch event
 /// after the connection opens must reach it. The endpoint renders no
-/// periodic database snapshots any more (nothing consumed them), so
-/// the bus event is the only payload asserted here.
+/// periodic database snapshots (nothing consumed them), so the bus event
+/// is the only payload asserted here.
 #[tokio::test]
 async fn sse_stream_forwards_bus_events() {
     let (_dir, state) = test_state(1000).await;
@@ -4832,7 +4796,7 @@ async fn sse_stream_forwards_bus_events() {
     let mut buf = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
-    // A published fetch event reaches the open stream.
+    // A published fetch event reaches the open stream
     events.publish(
         crate::events::FETCH_DONE,
         serde_json::json!({"source_id": "srcA0000000", "ok": true}),
@@ -4853,15 +4817,13 @@ async fn sse_stream_forwards_bus_events() {
     }
 }
 
-// Interface language (i18n)
-
 #[tokio::test]
 async fn dashboard_defaults_to_russian_and_follows_the_language_cookie() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state);
     let cookie = login(&app).await;
 
-    // No language cookie: Russian, the default.
+    // No language cookie: Russian, the default
     let response = app
         .clone()
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -4872,7 +4834,7 @@ async fn dashboard_defaults_to_russian_and_follows_the_language_cookie() {
     assert!(html.contains("lang=\"ru\""));
     assert!(html.contains("Обзор"));
 
-    // With fumox_lang=en the same page renders in English.
+    // With fumox_lang=en the same page renders in English
     let response = app
         .oneshot(request(
             "GET",
@@ -4894,7 +4856,7 @@ async fn login_screen_language_selection_sets_the_cookie() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state);
 
-    // ?lang=en renders English and persists the choice.
+    // ?lang=en renders English and persists the choice
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/login?lang=en", "", None))
@@ -4914,7 +4876,7 @@ async fn login_screen_language_selection_sets_the_cookie() {
     assert!(html.contains("lang=\"en\""));
     assert!(html.contains("Access token"));
 
-    // ?lang=ru switches back to Russian.
+    // ?lang=ru switches back to Russian
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/login?lang=ru", "", None))
@@ -4933,7 +4895,7 @@ async fn login_screen_language_selection_sets_the_cookie() {
     assert!(html.contains("Токен доступа"));
 
     // Without a parameter or cookie the screen stays Russian and sets
-    // no language cookie.
+    // no language cookie
     let response = app
         .oneshot(request("GET", "/admin/login", "", None))
         .await
@@ -4951,7 +4913,7 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Valid next: back to the requested admin page with the new cookie.
+    // Valid next: back to the requested admin page with the new cookie
     let response = app
         .clone()
         .oneshot(request(
@@ -4977,7 +4939,7 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
             .starts_with("fumox_lang=en;")
     );
 
-    // External next values are dropped: the redirect stays inside /admin.
+    // External next values are dropped: the redirect stays inside /admin
     let response = app
         .clone()
         .oneshot(request(
@@ -4991,7 +4953,7 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
 
-    // Unknown language values fall back to Russian.
+    // Unknown language values fall back to Russian
     let response = app
         .oneshot(request(
             "POST",
@@ -5016,7 +4978,7 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
 /// H4: an attacker-controlled `lang=`
 /// must never reach `Set-Cookie`, `Location`, or any other header. The
 /// `lang_cookie` builder only ever sees a code that came out of
-/// `Locales::resolve`, which falls back to the default catalog code ,
+/// `Locales::resolve`, which falls back to the default catalog code,
 /// a fixed literal in the locales TOML, never the raw input.
 #[tokio::test]
 async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
@@ -5027,7 +4989,7 @@ async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
 
     // Every value is percent-encoded so the form body stays valid; the
     // server still sees the raw bytes after decoding. The setter is an
-    // authenticated POST now, so the hostile value rides in its body.
+    // authenticated POST, so the hostile value rides in its body
     for body in [
         "lang=%3Cscript%3Ealert(1)%3C%2Fscript%3E".to_string(),
         "lang=foo%0D%0ASet-Cookie:%20pwned".to_string(),
@@ -5045,7 +5007,7 @@ async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
             .unwrap();
         // The cookie must always be a fixed catalog code with the
         // standard attributes; the Location is constrained to /admin or
-        // to an absolute internal path from `next`.
+        // to an absolute internal path from `next`
         let set_cookie = response
             .headers()
             .get(header::SET_COOKIE)
@@ -5075,7 +5037,7 @@ async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
     }
 
     // The same hostile shapes against the login screen's `?lang=` (the
-    // pre-auth path): the rendered language stays the catalog code.
+    // pre-auth path): the rendered language stays the catalog code
     for uri in [
         "/admin/login?lang=en%00%2Fadmin%2Fexport",
         "/admin/login?lang=..%2F..%2Fetc%2Fpasswd",
@@ -5099,8 +5061,6 @@ async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
     }
 }
 
-// Interface theme (day/night/auto)
-
 /// No theme cookie means `auto` (the OS preference, rendered as
 /// `data-theme="auto"`); an explicit cookie choice pins the palette.
 #[tokio::test]
@@ -5109,7 +5069,7 @@ async fn pages_default_to_auto_and_follow_the_theme_cookie() {
     let app = router(state);
     let cookie = login(&app).await;
 
-    // No theme cookie: the system preference.
+    // No theme cookie: the system preference
     let response = app
         .clone()
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -5119,7 +5079,7 @@ async fn pages_default_to_auto_and_follow_the_theme_cookie() {
     let html = body_text(response).await;
     assert!(html.contains("data-theme=\"auto\""));
 
-    // With fumox_theme=dark the same page renders the night theme.
+    // With fumox_theme=dark the same page renders the night theme
     let response = app
         .clone()
         .oneshot(request(
@@ -5134,7 +5094,7 @@ async fn pages_default_to_auto_and_follow_the_theme_cookie() {
     let html = body_text(response).await;
     assert!(html.contains("data-theme=\"dark\""));
 
-    // An explicit light choice pins the day theme over the OS setting.
+    // An explicit light choice pins the day theme over the OS setting
     let response = app
         .clone()
         .oneshot(request(
@@ -5149,7 +5109,7 @@ async fn pages_default_to_auto_and_follow_the_theme_cookie() {
     let html = body_text(response).await;
     assert!(html.contains("data-theme=\"light\""));
 
-    // The login screen honors the same cookie.
+    // The login screen honors the same cookie
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/login", "", Some("fumox_theme=dark")))
@@ -5160,7 +5120,7 @@ async fn pages_default_to_auto_and_follow_the_theme_cookie() {
     assert!(html.contains("data-theme=\"dark\""));
 
     // The login screen's pre-auth switcher: `?theme=` pins the choice in
-    // the cookie (the server-side equivalent of the topbar's POST).
+    // the cookie (the server-side equivalent of the topbar's POST)
     let response = app
         .oneshot(request("GET", "/admin/login?theme=dark", "", None))
         .await
@@ -5182,7 +5142,7 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Valid next: back to the requested admin page with the new cookie.
+    // Valid next: back to the requested admin page with the new cookie
     let response = app
         .clone()
         .oneshot(request(
@@ -5208,7 +5168,7 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
             .starts_with("fumox_theme=dark;")
     );
 
-    // External next values are dropped: the redirect stays inside /admin.
+    // External next values are dropped: the redirect stays inside /admin
     let response = app
         .clone()
         .oneshot(request(
@@ -5222,7 +5182,7 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
 
-    // Unknown theme values fall back to the system preference.
+    // Unknown theme values fall back to the system preference
     let response = app
         .clone()
         .oneshot(request(
@@ -5244,7 +5204,7 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
             .starts_with("fumox_theme=auto;")
     );
 
-    // A submit without the value pins nothing at all.
+    // A submit without the value pins nothing at all
     let response = app
         .oneshot(request(
             "POST",
@@ -5314,7 +5274,7 @@ async fn the_next_parameter_stays_inside_the_panel() {
 
     // Everything else falls back to the panel root: an absolute URL, a
     // protocol-relative one, a path outside the panel, and an empty
-    // value.
+    // value
     for (path, body) in [
         ("/admin/set-lang", "lang=en&next=https://evil.example.com"),
         ("/admin/set-lang", "lang=en&next=//evil.example.com"),
@@ -5386,7 +5346,7 @@ async fn a_control_character_in_next_reaches_no_header() {
     }
 
     // The language the login screen renders is the catalog code, never
-    // the raw input, so a hostile `lang` stays out of the body too.
+    // the raw input, so a hostile `lang` stays out of the body too
     let response = app
         .clone()
         .oneshot(request(
@@ -5405,8 +5365,6 @@ async fn a_control_character_in_next_reaches_no_header() {
     );
 }
 
-// Dashboard Top-N picker
-
 #[tokio::test]
 async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
     let (_dir, state) = test_state(1000).await;
@@ -5414,7 +5372,7 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Valid next: back to the requested admin page with the new cookie.
+    // Valid next: back to the requested admin page with the new cookie
     let response = app
         .clone()
         .oneshot(request(
@@ -5439,7 +5397,7 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
         "cookie: {cookie_value}"
     );
 
-    // External `next` values are dropped: redirect stays inside /admin.
+    // External `next` values are dropped: redirect stays inside /admin
     let response = app
         .clone()
         .oneshot(request(
@@ -5454,7 +5412,7 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
 
     // A percent-decoded CR/LF inside `next` (invalid Location header
-    // value, axum would answer 500) falls back to /admin as well.
+    // value, axum would answer 500) falls back to /admin as well
     let response = app
         .clone()
         .oneshot(request(
@@ -5468,7 +5426,7 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
 
-    // Out-of-list values fall back to the default 10.
+    // Out-of-list values fall back to the default 10
     for bad in ["999", "0", "-5", "abc"] {
         let response = app
             .clone()
@@ -5494,7 +5452,7 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
         );
     }
 
-    // A submit without the `n` field pins nothing at all.
+    // A submit without the `n` field pins nothing at all
     let response = app
         .oneshot(request(
             "POST",
@@ -5511,14 +5469,14 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
 /// The preference setters are state-changing POSTs under the auth+CSRF
 /// nest like every other route: an unauthenticated request is bounced to
 /// the login screen, and an authenticated POST without (or with a wrong)
-/// CSRF token is refused — a cross-site page must not be able to make
-/// the browser store a preference cookie.
+/// CSRF token is refused; a cross-site page must not be able to make the
+/// browser store a preference cookie.
 #[tokio::test]
 async fn the_preference_setters_are_authenticated_posts_with_csrf() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
 
-    // Unauthenticated: the auth layer answers before any cookie is set.
+    // Unauthenticated: the auth layer answers before any cookie is set
     for path in [
         "/admin/set-lang",
         "/admin/set-theme",
@@ -5541,7 +5499,7 @@ async fn the_preference_setters_are_authenticated_posts_with_csrf() {
         );
     }
 
-    // Authenticated but without the CSRF field: refused, no cookie.
+    // Authenticated but without the CSRF field: refused, no cookie
     let cookie = login(&app).await;
     for (path, body) in [
         ("/admin/set-lang", "lang=en"),
@@ -5560,7 +5518,7 @@ async fn the_preference_setters_are_authenticated_posts_with_csrf() {
         );
     }
 
-    // With the token the panel's own forms ship, the same POST succeeds.
+    // With the token the panel's own forms ship, the same POST succeeds
     let csrf = csrf_for(&state, &cookie);
     let response = app
         .oneshot(request(
@@ -5629,7 +5587,7 @@ async fn static_assets_are_privately_cacheable_and_pages_stay_no_store() {
 async fn dashboard_top_n_cookie_is_respected_by_widgets() {
     // Seed enough source errors (12) and alive proxies (12) that top_n=5
     // truncates both lists, proving the cookie flows through the handler
-    // into the SQL LIMIT parameters.
+    // into the SQL LIMIT parameters
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
@@ -5651,7 +5609,7 @@ async fn dashboard_top_n_cookie_is_respected_by_widgets() {
 
     // With top_n=5, the source-errors block must show exactly 5 rows
     // and the picker selects "5". Scope the count to the recent-errors
-    // panel because src IDs also appear in the per-source table.
+    // panel because src IDs also appear in the per-source table
     let response = app
         .clone()
         .oneshot(request(
@@ -5673,7 +5631,7 @@ async fn dashboard_top_n_cookie_is_respected_by_widgets() {
     // top 5, they MUST show up in the errors panel; the remaining
     // IDs MUST NOT show up here. The seed assigns `last_fetched_at =
     // now - idx`, so the most recent is srcT0000000 (idx=0),
-    // descending to srcT0000011 (idx=11).
+    // descending to srcT0000011 (idx=11)
     for idx in 0..5 {
         assert!(
             errors_html.contains(&format!("srcT{idx:07}")),
@@ -5686,14 +5644,14 @@ async fn dashboard_top_n_cookie_is_respected_by_widgets() {
             "errors panel should NOT include srcT{idx:07}"
         );
     }
-    // The picker selects the current value.
+    // The picker selects the current value
     assert!(
         html.contains(r#"<option value="5" selected"#),
         "5 should be the selected option"
     );
 
     // Default behaviour (no top-n cookie): top_n=10, the picker
-    // shows "10" selected and the errors panel renders ≤10 rows.
+    // shows "10" selected and the errors panel renders ≤10 rows
     let response = app
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
         .await
@@ -5708,7 +5666,7 @@ async fn dashboard_top_n_cookie_is_respected_by_widgets() {
 
 #[tokio::test]
 async fn dashboard_renders_top_failures_panel() {
-    // Empty repo: the panel renders an "no failures" placeholder.
+    // Empty repo: the panel renders an "no failures" placeholder
     let (_dir, state) = test_state(1000).await;
     let app = router(state);
     let cookie = login(&app).await;
@@ -5740,8 +5698,8 @@ fn failure_hits(panel: &str, reason: &str) -> Option<i64> {
 /// L-107: the panel aggregates the failed checks of the last 24 hours.
 /// The rows outside the window are not counted, every reason carries its
 /// own number of hits, and the list is ordered by that number, descending.
-/// On an empty repository any query returns nothing, so none of the three
-/// properties was actually pinned.
+/// None of the three properties is observable on an empty repository,
+/// hence the seeds.
 #[tokio::test]
 async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
     let (_dir, state) = test_state(1000).await;
@@ -5750,7 +5708,7 @@ async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
     let now = fumox_core::models::now_ts();
 
     // Three reasons inside the 24 h window with 5, 3 and 1 failures, plus
-    // one reason that only ever failed before the window opened.
+    // one reason that only ever failed before the window opened
     let cases: &[(&str, i64, usize)] = &[
         ("tls handshake failed", now - 60, 5),
         ("timeout", now - 120, 3),
@@ -5783,10 +5741,10 @@ async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
         .unwrap();
     let html = body_text(response).await;
 
-    // The panel's own rows alone: the rest of the page repeats names.
+    // The panel's own rows alone: the rest of the page repeats names
     // The section is bounded by the failures table the panel renders
     // (the only one on the page), not by the header of whatever panel
-    // happens to follow it.
+    // happens to follow it
     let panel = html
         .split(r#"table class="data failures""#)
         .nth(1)
@@ -5795,12 +5753,12 @@ async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
         .next()
         .expect("the failures table closes");
 
-    // The failures older than the window the panel names do not count.
+    // The failures older than the window the panel names do not count
     assert!(
         !panel.contains("ancient outage"),
         "the failures older than 24 h must not be counted: {panel}"
     );
-    // The fresh ones are counted, each with its own number of hits.
+    // The fresh ones are counted, each with its own number of hits
     assert_eq!(
         failure_hits(panel, "tls handshake failed"),
         Some(5),
@@ -5808,14 +5766,12 @@ async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
     );
     assert_eq!(failure_hits(panel, "timeout"), Some(3), "{panel}");
     assert_eq!(failure_hits(panel, "reset by peer"), Some(1), "{panel}");
-    // Descending by the number of hits.
+    // Descending by the number of hits
     let tls = panel.find("tls handshake failed").unwrap();
     let timeout = panel.find("timeout").unwrap();
     let reset = panel.find("reset by peer").unwrap();
     assert!(tls < timeout && timeout < reset, "{panel}");
 }
-
-// Configuration import/export (Phase 4)
 
 /// A minimal enabled source fixture for repo writes.
 fn test_source(id: &str, slug: &str) -> fumox_core::models::Source {
@@ -5846,7 +5802,7 @@ fn urlencoded(pairs: &[(&str, &str)]) -> String {
 async fn io_fixture(state: &AdminState) {
     let now = fumox_core::models::now_ts();
     // The shared source fixture; the export asserts on its tags, so
-    // only that difference rides on top of the base row.
+    // only that difference rides on top of the base row
     let mut source = test_source("srcX0000000", "exp-src");
     source.name = "export source".into();
     source.tags = Some(vec!["tag1".into()]);
@@ -5926,7 +5882,7 @@ async fn export_downloads_configuration_as_attachment() {
     );
 
     // One response carries both the headers and the payload: the body of
-    // the request above is parsed, no second download.
+    // the request above is parsed, no second download
     let payload = body_text(response).await;
     let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(parsed["version"], 1);
@@ -5934,7 +5890,7 @@ async fn export_downloads_configuration_as_attachment() {
     assert_eq!(parsed["sources"][0]["slug"], "exp-src");
     assert_eq!(parsed["profiles"][0]["slug"], "exp-prof");
     assert_eq!(parsed["profiles"][0]["output_format"], "clash");
-    // The export carries the stored hash, never the secret itself.
+    // The export carries the stored hash, never the secret itself
     let exported_token = parsed["profiles"][0]["access_token"]
         .as_str()
         .expect("the token is exported");
@@ -5958,7 +5914,7 @@ async fn import_creates_new_objects_and_remaps_composition() {
     let export_cookie = login(&export_app).await;
     let payload = export_body(&export_app, &export_cookie).await;
 
-    // …and import it into a fresh one.
+    // …and import it into a fresh one
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     let app = router(state.clone());
@@ -5971,7 +5927,7 @@ async fn import_creates_new_objects_and_remaps_composition() {
         .await
         .unwrap();
     // A successful import answers with a redirect to the import screen;
-    // the totals ride along in the toast message, not in the URL.
+    // the totals ride along in the toast message, not in the URL
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     let location = response
         .headers()
@@ -5990,7 +5946,7 @@ async fn import_creates_new_objects_and_remaps_composition() {
     );
     assert!(!message.contains("предупреждений"), "{message}");
 
-    // Fresh ids, slugs preserved (clean DB), composition remapped.
+    // Fresh ids, slugs preserved (clean DB), composition remapped
     let sources = fumox_core::repo::sources::list(&pool, false).await.unwrap();
     assert_eq!(sources.len(), 1);
     let new_source = &sources[0];
@@ -6006,7 +5962,7 @@ async fn import_creates_new_objects_and_remaps_composition() {
     assert_ne!(new_profile.id, "profX0000000");
     assert_eq!(new_profile.slug.as_deref(), Some("exp-prof"));
     // The imported profile keeps the hash the export carried, so the same
-    // secret still opens the endpoint on the target deployment.
+    // secret still opens the endpoint on the target deployment
     let imported_token = new_profile
         .access_token
         .as_deref()
@@ -6042,7 +5998,7 @@ async fn import_slug_collision_creates_objects_without_slug() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    // The dropped slugs are warnings: the toast counts them.
+    // The dropped slugs are warnings: the toast counts them
     let (message, _level) = pending_flash(&app, &cookie)
         .await
         .expect("the import must leave a toast");
@@ -6051,7 +6007,7 @@ async fn import_slug_collision_creates_objects_without_slug() {
         "the warnings must be counted in the flash: {message}"
     );
 
-    // Two sources now; the imported one lost its slug to the collision.
+    // Two sources now; the imported one lost its slug to the collision
     let sources = fumox_core::repo::sources::list(&pool, false).await.unwrap();
     assert_eq!(sources.len(), 2);
     let imported = sources.iter().find(|s| s.id != "srcX0000000").unwrap();
@@ -6065,14 +6021,14 @@ async fn import_slug_collision_creates_objects_without_slug() {
 
     // The composition of the imported profile points at the *imported*
     // source (the fresh id), not at the row it was exported from: a
-    // profile bound to the original source would serve the old feed.
+    // profile bound to the original source would serve the old feed
     let composition = fumox_core::repo::profiles::get_sources(&pool, &imported_profile.id)
         .await
         .unwrap();
     assert_eq!(composition, vec![(imported.id.clone(), 0)]);
 
     // The stored objects are untouched: the collision costs the imported
-    // copies their slug, never the originals.
+    // copies their slug, never the originals
     let original_source = sources.iter().find(|s| s.id == "srcX0000000").unwrap();
     assert_eq!(original_source.slug.as_deref(), Some("exp-src"));
     let original_profile = profiles.iter().find(|p| p.id == "profX0000000").unwrap();
@@ -6093,7 +6049,7 @@ async fn import_rejects_a_malformed_body_and_a_document_without_a_version() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Not JSON at all.
+    // Not JSON at all
     let body = urlencoded(&[("_csrf", &csrf), ("payload", "not json")]);
     let response = app
         .clone()
@@ -6104,7 +6060,7 @@ async fn import_rejects_a_malformed_body_and_a_document_without_a_version() {
     let html = body_text(response).await;
     assert!(html.contains("ошибка разбора JSON"), "{html}");
 
-    // Valid JSON, but the required `version` field is missing.
+    // Valid JSON, but the required `version` field is missing
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("payload", r#"{"exported_at":0,"sources":[],"profiles":[]}"#),
@@ -6121,7 +6077,7 @@ async fn import_rejects_a_malformed_body_and_a_document_without_a_version() {
         "the missing field is named: {html}"
     );
 
-    // Neither attempt wrote anything.
+    // Neither attempt wrote anything
     assert!(
         fumox_core::repo::sources::list(&pool, false)
             .await
@@ -6146,7 +6102,7 @@ async fn import_refuses_a_document_over_the_size_cap() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // A valid document padded past the cap.
+    // A valid document padded past the cap
     let padding = "x".repeat(256 * 1024);
     let payload =
         format!(r#"{{"version":1,"exported_at":0,"sources":[],"profiles":[],"note":"{padding}"}}"#);
@@ -6176,7 +6132,7 @@ async fn import_rejects_bad_version_and_invalid_fields_without_writes() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Unsupported version → 422.
+    // Unsupported version → 422
     let v2 = r#"{"version":2,"exported_at":0,"sources":[],"profiles":[]}"#;
     let body = urlencoded(&[("_csrf", &csrf), ("payload", v2)]);
     let response = app
@@ -6186,7 +6142,7 @@ async fn import_rejects_bad_version_and_invalid_fields_without_writes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // Non-http(s) URL → 422.
+    // Non-http(s) URL → 422
     let bad_url = r#"{"version":1,"exported_at":0,"sources":[{"ref":"r1","name":"s","url":"ftp://x","enabled":true,"encoding":"auto","cache_ttl_seconds":3600}],"profiles":[]}"#;
     let body = urlencoded(&[("_csrf", &csrf), ("payload", bad_url)]);
     let response = app
@@ -6196,7 +6152,7 @@ async fn import_rejects_bad_version_and_invalid_fields_without_writes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // TTL out of range → 422.
+    // TTL out of range → 422
     let bad_ttl = r#"{"version":1,"exported_at":0,"sources":[{"ref":"r1","name":"s","url":"https://example.com","enabled":true,"encoding":"auto","cache_ttl_seconds":5}],"profiles":[]}"#;
     let body = urlencoded(&[("_csrf", &csrf), ("payload", bad_ttl)]);
     let response = app
@@ -6206,7 +6162,7 @@ async fn import_rejects_bad_version_and_invalid_fields_without_writes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // All-or-nothing: nothing was written by any of the attempts.
+    // All-or-nothing: nothing was written by any of the attempts
     assert!(
         fumox_core::repo::sources::list(&pool, false)
             .await
@@ -6229,7 +6185,7 @@ async fn import_requires_auth_and_csrf() {
     let payload = r#"{"version":1,"exported_at":0,"sources":[],"profiles":[]}"#;
     let body = urlencoded(&[("payload", payload)]);
 
-    // Missing CSRF token → 403.
+    // Missing CSRF token → 403
     let response = app
         .clone()
         .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
@@ -6237,7 +6193,7 @@ async fn import_requires_auth_and_csrf() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    // Unauthenticated browser POST → redirected to the login screen.
+    // Unauthenticated browser POST → redirected to the login screen
     let response = app
         .oneshot(request("POST", "/admin/import", &body, None))
         .await
@@ -6248,8 +6204,6 @@ async fn import_requires_auth_and_csrf() {
         "/admin/login"
     );
 }
-
-// Pipeline builder
 
 #[tokio::test]
 async fn pipeline_builder_endpoints_require_auth_and_csrf() {
@@ -6264,7 +6218,7 @@ async fn pipeline_builder_endpoints_require_auth_and_csrf() {
         "/admin/pipeline/preset",
         "/admin/pipeline/rows",
     ] {
-        // Missing CSRF token → 403.
+        // Missing CSRF token → 403
         let response = app
             .clone()
             .oneshot(request("POST", uri, &body, Some(&cookie)))
@@ -6272,7 +6226,7 @@ async fn pipeline_builder_endpoints_require_auth_and_csrf() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
 
-        // Unauthenticated browser POST → redirected to the login screen.
+        // Unauthenticated browser POST → redirected to the login screen
         let response = app
             .clone()
             .oneshot(request("POST", uri, &body, None))
@@ -6290,7 +6244,7 @@ async fn pipeline_preview_generates_and_validates_json() {
     let csrf = csrf_for(&state, &cookie);
 
     // A valid configuration: the fragment carries the generated JSON and
-    // the ok badge.
+    // the ok badge
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_filter", "set"),
@@ -6318,7 +6272,7 @@ async fn pipeline_preview_generates_and_validates_json() {
     assert!(html.contains("&#34;latency&#34;"), "{html}");
     assert!(html.contains("JSON валиден"), "{html}");
 
-    // A bad regex: the error is localized (default language is Russian).
+    // A bad regex: the error is localized (default language is Russian)
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_rename_0_match", "("),
@@ -6339,7 +6293,7 @@ async fn pipeline_preview_generates_and_validates_json() {
     assert!(html.contains("некорректный regex"), "{html}");
     assert!(!html.contains("JSON валиден"), "{html}");
 
-    // The English panel gets English text.
+    // The English panel gets English text
     let en_cookie = format!("{cookie}; {}=en", i18n::LANG_COOKIE);
     let response = app
         .oneshot(request(
@@ -6385,7 +6339,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
     let csrf = csrf_for(&state, &cookie);
 
     // Builder → raw: the generated JSON lands in the textarea; the mode
-    // field flips to "raw" so the save reads the textarea.
+    // field flips to "raw" so the save reads the textarea
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_filter", "set"),
@@ -6412,7 +6366,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
     assert!(!html.contains("ped_filter_protocols"), "{html}");
 
     // Raw → builder with a representable JSON: prefilled fields, no
-    // warning.
+    // warning
     let body = urlencoded(&[
         ("_csrf", &csrf),
         (
@@ -6442,7 +6396,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
         "{html}"
     );
 
-    // Raw → builder with an unparseable JSON: stays raw with the warning.
+    // Raw → builder with an unparseable JSON: stays raw with the warning
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("pipeline", "{ \"version\": 1, \"bogus\": true }"),
@@ -6477,7 +6431,7 @@ async fn pipeline_preset_renders_the_ready_made_state() {
     let body = urlencoded(&[("_csrf", &csrf)]);
 
     // "Only verified": unknown excluded, builder mode with a valid
-    // preview of the preset.
+    // preview of the preset
     let response = app
         .clone()
         .oneshot(request(
@@ -6502,7 +6456,7 @@ async fn pipeline_preset_renders_the_ready_made_state() {
     assert!(!html.contains(r#"id="ped-status-alive" checked"#), "{html}");
     assert!(html.contains("JSON валиден"), "{html}");
 
-    // "Blank": nothing checked, the NULL preview.
+    // "Blank": nothing checked, the NULL preview
     let response = app
         .clone()
         .oneshot(request(
@@ -6516,7 +6470,7 @@ async fn pipeline_preset_renders_the_ready_made_state() {
     let html = body_text(response).await;
     assert!(html.contains("конвейер останется пустым"), "{html}");
 
-    // The profile flavor keeps the tri-state radios.
+    // The profile flavor keeps the tri-state radios
     let response = app
         .clone()
         .oneshot(request(
@@ -6539,7 +6493,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // A fresh widget shows one empty typing line.
+    // A fresh widget shows one empty typing line
     let body = urlencoded(&[("_csrf", &csrf)]);
     let response = app
         .clone()
@@ -6555,7 +6509,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
     assert!(html.contains("ped_rename_0_match"), "{html}");
 
     // Adding a line re-renders both; dropping the first renumbers the
-    // second to index 0 with its value intact.
+    // second to index 0 with its value intact
     let two_rows = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_rename_0_match", "first"),
@@ -6577,7 +6531,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
 
     // Dropping the first line renumbers the second to index 0 with its
     // value intact; `remove` travels in the query string exactly like
-    // the htmx button's hx-post URL.
+    // the htmx button's hx-post URL
     let response = app
         .clone()
         .oneshot(request(
@@ -6594,7 +6548,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
     assert!(html.contains(r#"value="second""#), "{html}");
 
     // The drop section has its own container: adding a discard line
-    // re-renders only `ped_drop_*` rows and never touches rename ones.
+    // re-renders only `ped_drop_*` rows and never touches rename ones
     let drop_row = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_rename_0_match", "keepme"),
@@ -6622,13 +6576,13 @@ async fn pipeline_rows_renders_asn_mode_when_target_changes() {
     // re-renders that row in ASN-mode (only the `asns` input, no
     // `match`/`flags`/`key`); reverting flips the row back. This is
     // the endpoint every `hx-trigger="change"` on a target select
-    // fires, the round-trip must produce the right row layout.
+    // fires, the round-trip must produce the right row layout
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // Start in regex mode (target=host, match=\\.ua).
+    // Start in regex mode (target=host, match=\\.ua)
     let regex_form = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_drop_0_match", "\\.ua"),
@@ -6649,7 +6603,7 @@ async fn pipeline_rows_renders_asn_mode_when_target_changes() {
     assert!(!html.contains(r#"name="ped_drop_0_asns""#), "{html}");
 
     // Switch the same row to target=asn with asns=24940, the
-    // response must carry only the ASN-mode row (no `match` field).
+    // response must carry only the ASN-mode row (no `match` field)
     let asn_form = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_drop_0_match", "\\.ua"),
@@ -6684,8 +6638,8 @@ async fn pipeline_rows_renders_asn_mode_when_target_changes() {
         "ASN-mode row must not carry a param key: {html}"
     );
 
-    // The same round-trip preserves a sibling row in regex mode ,
-    // changing one row's target must not silently rewrite others.
+    // The same round-trip preserves a sibling row in regex mode:
+    // changing one row's target must not silently rewrite others
     let mixed_form = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_drop_0_target", "asn"),
@@ -6717,19 +6671,19 @@ async fn pipeline_rows_render_query_does_not_append() {
     // The change-trigger on a target select calls the rows endpoint
     // with `?render=1`, the round-trip must NOT append a fresh empty
     // row, otherwise every target switch would grow the row count by
-    // one. The explicit `+` button keeps its append behaviour.
+    // one. The explicit `+` button keeps its append behaviour
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // One existing drop row.
+    // One existing drop row
     let form = urlencoded(&[
         ("_csrf", &csrf),
         ("ped_drop_0_match", "\\.ua"),
         ("ped_drop_0_target", "host"),
     ]);
-    // No `?render=1`, the legacy `+`-button semantics: append.
+    // No `?render=1`, the legacy `+`-button semantics: append
     let response = app
         .clone()
         .oneshot(request(
@@ -6746,7 +6700,7 @@ async fn pipeline_rows_render_query_does_not_append() {
         "expected an appended row: {html}"
     );
 
-    // With `?render=1`, round-trip without append.
+    // With `?render=1`, round-trip without append
     let response = app
         .clone()
         .oneshot(request(
@@ -6773,9 +6727,9 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
     let csrf = csrf_for(&state, &cookie);
 
     // Builder mode on the source form: the JSON is generated from the
-    // widget fields server-side; a stale `pipeline` field is ignored.
+    // widget fields server-side; a stale `pipeline` field is ignored
     // `ped_forbid_insecure`/`ped_geo_enabled` ride along exactly as a
-    // browser submits the rendered widget (every checkbox present).
+    // browser submits the rendered widget (every checkbox present)
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "Builder"),
@@ -6812,7 +6766,7 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
         })
     );
 
-    // Builder mode with nothing configured → NULL (not `{}`).
+    // Builder mode with nothing configured → NULL (not `{}`)
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "Empty builder"),
@@ -6836,7 +6790,7 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
     assert!(created.pipeline.is_none());
 
     // Builder mode with a bad field: 422 with the localized error and
-    // the widget reopened in builder mode with the typed values.
+    // the widget reopened in builder mode with the typed values
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "Bad builder"),
@@ -6876,7 +6830,7 @@ async fn profile_form_saves_tri_state_sections() {
     let csrf = csrf_for(&state, &cookie);
 
     // Profile flavor of the widget: "set" on health with its values,
-    // "defaults" on geo (an explicit reset), everything else inherited.
+    // "defaults" on geo (an explicit reset), everything else inherited
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "TriState"),
@@ -6911,7 +6865,7 @@ async fn profile_form_saves_tri_state_sections() {
     );
 
     // The tri-state survives a reopen: the edit form carries the radios
-    // in their saved positions.
+    // in their saved positions
     let response = app
         .clone()
         .oneshot(request(
@@ -6932,7 +6886,7 @@ async fn profile_form_saves_tri_state_sections() {
     );
     assert!(html.contains("переопределяет разделы"), "{html}");
 
-    // Rename "defaults" is the explicit `[]` reset.
+    // Rename "defaults" is the explicit `[]` reset
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "Rename reset"),
@@ -6966,7 +6920,7 @@ async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
     let app = router(state.clone());
     let cookie = login(&app).await;
 
-    // A source whose pipeline the builder fully understands.
+    // A source whose pipeline the builder fully understands
     let source = fumox_core::models::Source {
         pipeline: Some(serde_json::json!({
             "version": 1,
@@ -6992,9 +6946,9 @@ async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     // Builder mode by default, filter section set, vless selected (but
-    // not trojan), sort by name descending. The filter section now uses
-    // the tri-state radios (post-fix); `ped-filter-set` carries the
-    // checked marker for the source form.
+    // not trojan), sort by name descending. The filter section uses the
+    // tri-state radios; `ped-filter-set` carries the checked marker for
+    // the source form
     assert!(
         html.contains(r#"name="pipeline_mode" value="builder""#),
         "{html}"
@@ -7007,14 +6961,14 @@ async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
     assert!(!html.contains("ped-proto-trojan\" checked"), "{html}");
     assert!(html.contains(r#"<option value="name" selected>"#), "{html}");
     assert!(html.contains(r#"id="ped-sort-desc" checked"#), "{html}");
-    // No raw-mode warning: the pipeline is fully representable.
+    // No raw-mode warning: the pipeline is fully representable
     assert!(
         !html.contains("невозможно представить в конструкторе"),
         "{html}"
     );
 
     // A pipeline the builder cannot represent: raw-mode warning instead
-    // of a prefill, the JSON itself kept in the textarea.
+    // of a prefill, the JSON itself kept in the textarea
     let source = fumox_core::models::Source {
         pipeline: Some(serde_json::json!({ "version": 1, "bogus": true })),
         ..test_source("srcBuilder0002", "builder-raw")
@@ -7043,8 +6997,8 @@ async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
     assert!(html.contains("&#34;bogus&#34;"), "{html}");
 }
 
-/// The fetch journal tables (full page, source-card fragment and the
-/// dashboard's recent fetches) carry the `journal` class: their columns
+/// The fetch journal tables (full page, source card and its log
+/// fragment) carry the `journal` class: their columns
 /// stay single-line while the error column keeps wrapping via
 /// `.cell-wrap` (a long error message must not re-flow the row).
 #[tokio::test]
@@ -7093,7 +7047,7 @@ async fn fetch_journal_tables_keep_columns_single_line() {
 
     let app = router(state.clone());
     let cookie = login(&app).await;
-    // Every page below renders the journal table, so the wrapping error cell is asserted on each.
+    // Every page below renders the journal table, so the wrapping error cell is asserted on each
     for path in [
         "/admin/logs/fetch",
         &format!("/admin/sources/{}/log", source.id),
@@ -7111,13 +7065,13 @@ async fn fetch_journal_tables_keep_columns_single_line() {
             "journal table missing on {path}"
         );
         // Every data table sits in a horizontal scroll container so a
-        // narrow viewport scrolls the table, never the page.
+        // narrow viewport scrolls the table, never the page
         assert!(
             html.contains(r#"<div class="table-scroll">"#),
             "table-scroll wrapper missing on {path}"
         );
         // The error column keeps its wrapping cell; other columns are
-        // single-line through the table class.
+        // single-line through the table class
         assert!(
             html.contains(r#"<span class="cell-wrap">"#),
             "wrapping error cell missing on {path}"
@@ -7125,7 +7079,7 @@ async fn fetch_journal_tables_keep_columns_single_line() {
     }
 
     // The source card's log is live: it polls the same fragment the
-    // page renders inline and refreshes on fetch.done/fetch.failed.
+    // page renders inline and refreshes on fetch.done/fetch.failed
     let response = app
         .oneshot(request(
             "GET",
@@ -7156,7 +7110,7 @@ async fn the_source_card_log_pages_through_the_cursor() {
         .await
         .unwrap();
     // 25 attempts a second apart against the 20-row page; two-digit error
-    // names keep one from being a substring of another.
+    // names keep one from being a substring of another
     for i in 0..25 {
         fumox_core::repo::fetch_log::insert(
             &pool,
@@ -7189,7 +7143,7 @@ async fn the_source_card_log_pages_through_the_cursor() {
     }
 
     // The first page: the newest twenty attempts and the way to the next
-    // one — there is nothing before it, so no prev and no first link.
+    // one; there is nothing before it, so no prev and no first link
     let first = get(&app, &cookie, &format!("/admin/sources/{}", source.id)).await;
     assert!(first.contains("attempt 00"), "{first:.600}");
     assert!(first.contains("attempt 19"), "{first:.600}");
@@ -7198,14 +7152,14 @@ async fn the_source_card_log_pages_through_the_cursor() {
     assert!(!first.contains("rel=\"prev\""), "{first:.600}");
 
     // A cursor token this browser did not write (`?cur=`, an empty one)
-    // renders exactly the first page, broken link or not.
+    // renders exactly the first page, broken link or not
     let empty = get(&app, &cookie, &format!("/admin/sources/{}?cur=", source.id)).await;
     assert_eq!(
         empty, first,
         "a broken cursor renders exactly the first page"
     );
 
-    // The next page: the five oldest attempts, the way back to the first.
+    // The next page: the five oldest attempts, the way back to the first
     use base64::Engine as _;
     let newest = fumox_core::repo::fetch_log::recent_for_source(&pool, "srcCardLog0", 20)
         .await
@@ -7224,7 +7178,7 @@ async fn the_source_card_log_pages_through_the_cursor() {
     assert!(second.contains("rel=\"prev\""), "{second:.600}");
 
     // The live fragment stays on the newest page: the poll does not
-    // travel with the card's cursor.
+    // travel with the card's cursor
     let fragment = get(&app, &cookie, &format!("/admin/sources/{}/log", source.id)).await;
     assert!(fragment.contains("attempt 00"), "{fragment:.600}");
     assert!(!fragment.contains("rel=\"next\""), "{fragment:.600}");
@@ -7238,9 +7192,8 @@ async fn the_source_card_log_pages_through_the_cursor() {
 async fn live_config_refresh_picks_up_post_save_state() {
     let (_dir, state) = test_state(1000).await;
 
-    // The starting snapshot reflects `AppConfig::default()`; the
-    // toggle is *on* (the drop gate is the default since the wave-B
-    // change) and the public listener sits on 8080.
+    // The starting snapshot reflects `AppConfig::default()`: the
+    // toggle is *on* and the public listener sits on 8080
     assert!(state.live().ingest.drop_gate);
     assert!(state.ingest().drop_gate);
     assert_eq!(state.server().bind.port(), 8080);
@@ -7248,14 +7201,14 @@ async fn live_config_refresh_picks_up_post_save_state() {
     // Drop a config file on disk that flips the bool and rebinds
     // the public listener. The file is missing fields the defaults
     // supply (`probe.*`, `meow.*`, `database.*`, …), `figment`
-    // fills them in via the `Serialized::defaults` layer.
+    // fills them in via the `Serialized::defaults` layer
     let _config_dir = refresh_from_written_config(
         &state,
         "live-refresh",
         "[ingest]\ndrop_gate = false\n[server]\nbind = \"127.0.0.1:9999\"\n",
     );
 
-    // The live figment-merged view reflects the file.
+    // The live figment-merged view reflects the file
     let live = state.live();
     assert!(
         !live.ingest.drop_gate,
@@ -7266,7 +7219,7 @@ async fn live_config_refresh_picks_up_post_save_state() {
         "127.0.0.1:9999".parse().unwrap(),
         "live.server.bind must be 127.0.0.1:9999 after refresh"
     );
-    // Figment-merged defaults are written back into the in-memory view.
+    // Figment-merged defaults are written back into the in-memory view
     assert_eq!(
         live.probe.fail_limit,
         fumox_core::config::ProbeConfig::default().fail_limit,
@@ -7280,7 +7233,7 @@ async fn live_config_refresh_picks_up_post_save_state() {
 
     // The typed accessors read the same live view: there is no
     // second, frozen copy for a handler to read by mistake, so every
-    // consumer sees the post-save state.
+    // consumer sees the post-save state
     assert!(
         !state.ingest().drop_gate,
         "state.ingest().drop_gate must be false after refresh"
@@ -7313,9 +7266,9 @@ async fn live_config_refresh_picks_up_post_save_state() {
 
     // The genuinely startup-frozen value stays put: the public socket
     // is still the one bound at startup (8080) even though the
-    // refreshed live config now names 9999 — the listener cannot be
+    // refreshed live config now names 9999; the listener cannot be
     // rebound mid-run, which is why `server_bind` is an explicit
-    // startup field and the only assertion here.
+    // startup field and the only assertion here
     assert_eq!(
         state.server_bind.port(),
         8080,
@@ -7377,11 +7330,11 @@ async fn a_settings_save_over_a_file_that_changed_is_refused() {
     let csrf = csrf_for(&state, &cookie);
 
     // The fingerprint the browser carries: the file as it is when the
-    // form is rendered.
+    // form is rendered
     let rendered = fumox_core::config_writer::fingerprint(&path);
 
     // The operator edits the file outside the panel while the form is
-    // open.
+    // open
     std::fs::write(
         &path,
         "[ingest]\ndrop_gate = false\n[probe]\nfail_limit = 7\n",
@@ -7407,14 +7360,14 @@ async fn a_settings_save_over_a_file_that_changed_is_refused() {
     );
     let html = body_text(response).await;
     // The panel answers in the operator's language, so the message is
-    // looked up in the catalog rather than spelled out here.
+    // looked up in the catalog rather than spelled out here
     let lang = state.locales.default_lang();
     assert!(
         html.contains(lang.t("err.config_conflict")),
         "the conflict must be explained to the operator: {html:.400}"
     );
 
-    // The hand edit survives, and the stale form wrote nothing.
+    // The hand edit survives, and the stale form wrote nothing
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(
         on_disk.contains("fail_limit = 7"),
@@ -7427,7 +7380,7 @@ async fn a_settings_save_over_a_file_that_changed_is_refused() {
 }
 
 /// The refusal above must not break the ordinary save: a form whose
-/// fingerprint still matches the file writes as it always did.
+/// fingerprint still matches the file writes normally.
 #[tokio::test]
 async fn a_settings_save_over_an_unchanged_file_still_writes() {
     let (_dir, _cfg_dir, path, state) =
@@ -7469,14 +7422,14 @@ async fn a_settings_save_over_an_unchanged_file_still_writes() {
 async fn a_settings_save_refreshes_the_live_view_and_leaves_the_frozen_values_alone() {
     // The file carries the token, like a real deployment: the live view
     // is reloaded from the file after a save, so a file without the
-    // token would drop it out of the running view.
+    // token would drop it out of the running view
     let (_dir, _cfg_dir, path, state) = state_with_config_file(
         "settings-refresh",
         &format!("[ingest]\ndrop_gate = false\n[admin]\ntoken = \"{TOKEN}\"\n"),
     )
     .await;
 
-    // The startup-frozen values, captured before the save.
+    // The startup-frozen values, captured before the save
     let session_key = state.session_key();
     let csrf_key = state.csrf_key();
     let admin_limiter = state.admin_limiter.clone();
@@ -7485,7 +7438,7 @@ async fn a_settings_save_refreshes_the_live_view_and_leaves_the_frozen_values_al
     // The login limiter's own window, seen through a key of its own:
     // the test config allows 100 hits a minute, so the hit past that
     // must be refused. A refresh that swapped the limiter would hand
-    // back a fresh counter and let the hit through.
+    // back a fresh counter and let the hit through
     let window_key = "9.9.9.9";
     for _ in 0..100 {
         assert!(
@@ -7515,7 +7468,7 @@ async fn a_settings_save_refreshes_the_live_view_and_leaves_the_frozen_values_al
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-    // The file carries the new values.
+    // The file carries the new values
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(
         on_disk.contains("drop_gate = true"),
@@ -7527,13 +7480,13 @@ async fn a_settings_save_refreshes_the_live_view_and_leaves_the_frozen_values_al
     );
 
     // The live view carries them too: there is no second, frozen copy
-    // a handler could read by mistake.
+    // a handler could read by mistake
     assert!(state.live().ingest.drop_gate, "live.ingest.drop_gate");
     assert!(state.ingest().drop_gate, "state.ingest().drop_gate");
     assert_eq!(state.server().bind.port(), 9999, "state.server().bind");
 
     // The keys follow the live token, not a startup snapshot: a save
-    // that leaves the token alone must not move them.
+    // that leaves the token alone must not move them
     assert_eq!(
         state.session_key(),
         session_key,
@@ -7553,7 +7506,7 @@ async fn a_settings_save_refreshes_the_live_view_and_leaves_the_frozen_values_al
         "the bound socket is startup-frozen: the listener is already bound"
     );
 
-    // The rate limiter's window survived the refresh.
+    // The rate limiter's window survived the refresh
     assert!(
         !state.login_limiter.allow(window_key).await,
         "the limiter's window must survive the refresh"
@@ -7581,7 +7534,7 @@ async fn the_edit_page_explains_a_config_it_could_not_read() {
     // The banner names the file and the reason. The template is
     // looked up in the catalog, so the assertion compares against the
     // rendered prefix of the same message rather than an English
-    // sentence of its own.
+    // sentence of its own
     let lang = state.locales.default_lang();
     let template = lang.t("set.edit_load_failed");
     let prefix = template.split("{reason}").next().unwrap_or_default();
@@ -7600,7 +7553,7 @@ async fn the_edit_page_explains_a_config_it_could_not_read() {
 async fn a_config_the_loader_refuses_is_not_written() {
     // A section the loader does not know. The panel only rewrites the
     // settings it owns, so the section survives every save, and the
-    // file stays one the binaries refuse.
+    // file stays one the binaries refuse
     let (_dir, _cfg_dir, path, state) = state_with_config_file(
         "settings-unknown-section",
         "[ingest]\ndrop_gate = false\n[nonexistent]\nfoo = 1\n",
@@ -7640,7 +7593,7 @@ async fn a_config_the_loader_refuses_is_not_written() {
 /// directory that cannot be written to is refused.
 #[tokio::test]
 async fn the_create_from_defaults_button_creates_a_missing_config_only() {
-    // An existing config is never overwritten.
+    // An existing config is never overwritten
     let (_dir, _cfg_dir, path, state) =
         state_with_config_file("settings-create-existing", "[ingest]\ndrop_gate = false\n").await;
     let before = std::fs::read(&path).unwrap();
@@ -7694,7 +7647,7 @@ async fn the_create_from_defaults_button_writes_the_reference_copy() {
     // The path the panel edits, with no file behind it yet. The
     // startup path only reaches `Loaded` for a file that exists, but
     // the button's own branch is the one under test: the target does
-    // not exist and the directory can be written to.
+    // not exist and the directory can be written to
     state.config_path = ResolvedConfigPath::Loaded(path.clone());
     state.config_writable = true;
 
@@ -7719,7 +7672,7 @@ async fn the_create_from_defaults_button_writes_the_reference_copy() {
         created.contains("[server]"),
         "the reference copy must be written: {created}"
     );
-    // The created file is a config the binaries can start from.
+    // The created file is a config the binaries can start from
     fumox_core::config::load_config(Some(&path)).expect("the created config must load");
 }
 
@@ -7774,7 +7727,7 @@ async fn the_create_from_defaults_button_refuses_a_read_only_directory() {
             "no config must be written into a read-only directory"
         );
 
-        // Restore the mode so the temp directory can be cleaned up.
+        // Restore the mode so the temp directory can be cleaned up
         std::fs::set_permissions(cfg_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
@@ -7800,7 +7753,7 @@ async fn the_edit_page_renders_the_values_of_the_config_file() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
 
-    // The inputs of the two file values carry what the file says.
+    // The inputs of the two file values carry what the file says
     let bind_input = html
         .lines()
         .find(|line| line.contains(r#"name="server.bind""#))
@@ -7837,7 +7790,7 @@ async fn the_settings_pages_report_a_read_only_deployment() {
     let banner = askama_html_escape(&banner);
 
     // The overview: the banner the editor shows appears here too
-    // (USERGUIDE: "the same banner appears on the overview").
+    // (USERGUIDE: "the same banner appears on the overview")
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/settings", "", Some(&cookie)))
@@ -7854,7 +7807,7 @@ async fn the_settings_pages_report_a_read_only_deployment() {
         "the banner must be announced as an alert: {html:.400}"
     );
 
-    // The edit page: the banner and the disabled form.
+    // The edit page: the banner and the disabled form
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/settings/edit", "", Some(&cookie)))
@@ -7916,7 +7869,7 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
     .await
     .unwrap();
 
-    // The public listener and the panel share one cache instance.
+    // The public listener and the panel share one cache instance
     let public_state = crate::serve::AppState::new(
         state.pool.clone(),
         state.caches.clone(),
@@ -7947,10 +7900,10 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
         title.expect("the subscription must carry a title header")
     };
 
-    // The first request renders the subscription and caches it.
+    // The first request renders the subscription and caches it
     assert_eq!(title("/sub/profS0000000").await, "old name");
 
-    // The panel saves the profile under a new name.
+    // The panel saves the profile under a new name
     let app = router(state.clone());
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
@@ -7969,11 +7922,9 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     // The next public request serves the saved profile: the save route
-    // invalidated the cached rendering.
+    // invalidated the cached rendering
     assert_eq!(title("/sub/profS0000000").await, "new name");
 }
-
-// Source handler contracts (WP-19)
 
 /// Flip the live `[ingest] drop_gate` flag. The delete path reads the
 /// flag per request, so a test can switch the policy between two deletes.
@@ -8050,7 +8001,7 @@ async fn source_mutations_drop_the_cached_rendered_output() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // The toggle drops the entry.
+    // The toggle drops the entry
     warm_processed_cache(&state, &source.id).await;
     assert!(
         state
@@ -8080,7 +8031,7 @@ async fn source_mutations_drop_the_cached_rendered_output() {
         "the toggle must drop the cached rendering while it is still fresh"
     );
 
-    // The edit drops it too.
+    // The edit drops it too
     warm_processed_cache(&state, &source.id).await;
     let body = urlencoded(&[
         ("_csrf", &csrf),
@@ -8108,7 +8059,7 @@ async fn source_mutations_drop_the_cached_rendered_output() {
         "the edit must drop the cached rendering while it is still fresh"
     );
 
-    // And the delete: the entry is gone and the source answers nothing.
+    // And the delete: the entry is gone and the source answers nothing
     warm_processed_cache(&state, &source.id).await;
     let response = app
         .clone()
@@ -8158,7 +8109,7 @@ async fn source_update_redirects_an_htmx_call_and_a_browser_differently() {
         ("cache_ttl_seconds", "3600"),
     ]);
 
-    // HTMX path: 303 plus HX-Redirect at the source card.
+    // HTMX path: 303 plus HX-Redirect at the source card
     let mut req = request(
         "POST",
         "/admin/sources/srcR0000000/edit",
@@ -8178,7 +8129,7 @@ async fn source_update_redirects_an_htmx_call_and_a_browser_differently() {
         "the HTMX answer must carry the redirect target"
     );
 
-    // Plain-browser path: the bare 303, no HX-Redirect.
+    // Plain-browser path: the bare 303, no HX-Redirect
     let response = app
         .clone()
         .oneshot(request(
@@ -8218,7 +8169,7 @@ async fn a_failed_source_update_renders_the_mask_notes_from_the_stored_row() {
     fumox_core::repo::sources::create(&state.pool, &masked)
         .await
         .unwrap();
-    // The stored token is the hashed form the repo keeps on write.
+    // The stored token is the hashed form the repo keeps on write
     let stored_token = fumox_core::repo::sources::get(&state.pool, "srcNote0001")
         .await
         .unwrap()
@@ -8232,7 +8183,7 @@ async fn a_failed_source_update_renders_the_mask_notes_from_the_stored_row() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // The TTL is out of range: the edit comes back with 422.
+    // The TTL is out of range: the edit comes back with 422
     for (source, masked_row) in [(&masked, true), (&plain, false)] {
         let body = urlencoded(&[
             ("_csrf", &csrf),
@@ -8267,7 +8218,7 @@ async fn a_failed_source_update_renders_the_mask_notes_from_the_stored_row() {
         );
     }
 
-    // Neither rejected attempt touched the rows.
+    // Neither rejected attempt touched the rows
     let stored = fumox_core::repo::sources::get(&state.pool, "srcNote0001")
         .await
         .unwrap()
@@ -8309,7 +8260,7 @@ async fn deleting_a_source_leaves_the_verified_proxies_alone_under_the_conservat
             .unwrap()
             .is_none()
     );
-    // ... but its proxies keep their state.
+    // ... but its proxies keep their state
     assert_eq!(status_by_fp(&pool, "fp-c-ready").await, "ready");
     assert_eq!(status_by_fp(&pool, "fp-c-unknown").await, "unknown");
 }
@@ -8370,11 +8321,11 @@ async fn deleting_one_source_leaves_the_orphans_of_another_alone() {
         StatusCode::SEE_OTHER
     );
 
-    // The proxy only the deleted source fed is an orphan now.
+    // The proxy only the deleted source fed is an orphan now
     assert_eq!(status_by_fp(&pool, "fp-m-mine").await, "removed");
     // The other source still feeds its own proxy ...
     assert_eq!(status_by_fp(&pool, "fp-m-theirs").await, "alive");
-    // ... and the shared one.
+    // ... and the shared one
     assert_eq!(status_by_fp(&pool, "fp-m-both").await, "alive");
 }
 
@@ -8446,7 +8397,7 @@ async fn the_url_password_is_masked_on_the_screens_and_restored_on_save() {
         );
     }
 
-    // The stored URL keeps the password: the fetcher needs it.
+    // The stored URL keeps the password: the fetcher needs it
     let stored = fumox_core::repo::sources::get(&pool, &source.id)
         .await
         .unwrap()
@@ -8454,7 +8405,7 @@ async fn the_url_password_is_masked_on_the_screens_and_restored_on_save() {
     assert_eq!(stored.url, "https://user:secret123@example.com/sub");
 
     // The form comes back with the mask: the save restores the password
-    // under it instead of storing the mask as the credential.
+    // under it instead of storing the mask as the credential
     let csrf = csrf_for(&state, &cookie);
     let body = urlencoded(&[
         ("_csrf", &csrf),
@@ -8515,11 +8466,11 @@ async fn the_url_token_is_redacted_on_the_screens_and_restored_on_save() {
             !html.contains("SECRET-TOKEN"),
             "{uri}: the token must not reach the DOM"
         );
-        // The harmless pair survives: it is the diagnostic.
+        // The harmless pair survives: it is the diagnostic
         assert!(html.contains("page=2"), "{uri}: {html:.400}");
     }
 
-    // The stored URL keeps the token: the fetcher needs it.
+    // The stored URL keeps the token: the fetcher needs it
     let stored = fumox_core::repo::sources::get(&pool, &source.id)
         .await
         .unwrap()
@@ -8530,7 +8481,7 @@ async fn the_url_token_is_redacted_on_the_screens_and_restored_on_save() {
     );
 
     // The form comes back with the marker: the save puts the stored
-    // token under it.
+    // token under it
     let csrf = csrf_for(&state, &cookie);
     let body = urlencoded(&[
         ("_csrf", &csrf),
@@ -8571,7 +8522,7 @@ async fn the_token_rotation_is_confirmed_on_a_page_of_its_own() {
     let cookie = login(&app).await;
 
     // The import screen links to the confirmation page instead of
-    // posting straight away.
+    // posting straight away
     let response = app
         .clone()
         .oneshot(request("GET", "/admin/import", "", Some(&cookie)))
@@ -8588,7 +8539,7 @@ async fn the_token_rotation_is_confirmed_on_a_page_of_its_own() {
         "the import screen must not rotate the token on the first click: {html:.400}"
     );
 
-    // The confirmation page states the consequences and carries the form.
+    // The confirmation page states the consequences and carries the form
     let response = app
         .clone()
         .oneshot(request(
@@ -8607,7 +8558,7 @@ async fn the_token_rotation_is_confirmed_on_a_page_of_its_own() {
     );
     assert!(html.contains("/export/alive"), "{html:.400}");
     assert!(html.contains("name=\"_csrf\""), "{html:.400}");
-    // The way back does not rotate anything.
+    // The way back does not rotate anything
     assert!(html.contains(r#"href="/admin/import""#), "{html:.400}");
 }
 
@@ -8634,7 +8585,7 @@ async fn an_admin_save_leaves_the_fetch_columns_alone() {
     let cookie = login(&app).await;
     let csrf = csrf_for(&state, &cookie);
 
-    // A cosmetic save (the name) keeps every column of the last fetch.
+    // A cosmetic save (the name) keeps every column of the last fetch
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "renamed"),
@@ -8669,7 +8620,7 @@ async fn an_admin_save_leaves_the_fetch_columns_alone() {
 
     // A fetch-relevant save resets the freshness stamp (the payload was
     // reconciled under the old settings) but keeps the error the last
-    // fetch left behind: the save does not write that column either.
+    // fetch left behind: the save does not write that column either
     let body = urlencoded(&[
         ("_csrf", &csrf),
         ("name", "renamed"),
@@ -8744,7 +8695,7 @@ async fn the_refresh_answer_renders_the_polled_status_fragment() {
     let html = body_text(response).await;
     // The fragment carries the content only: the `#refresh-status` live
     // region is owned by detail.html and the swaps target it from
-    // inside (innerHTML), so it is never torn down and re-created.
+    // inside (innerHTML), so it is never torn down and re-created
     assert!(!html.contains(r#"id="refresh-status""#), "{html}");
     assert!(html.contains(r#"data-busy="1""#), "{html}");
     assert!(
@@ -8774,7 +8725,7 @@ async fn a_refused_settings_save_marks_the_field_it_refuses() {
     let rendered = fumox_core::config_writer::fingerprint(&path);
 
     // `server.bind` is not a socket address: the save is refused and
-    // the page comes back with the message for that field.
+    // the page comes back with the message for that field
     let body = format!(
         "_csrf={csrf}&cfg_fingerprint={rendered}&server.bind=not-an-address&ingest.drop_gate=on"
     );
@@ -8812,7 +8763,7 @@ async fn a_refused_settings_save_marks_the_field_it_refuses() {
         html.contains(r#"aria-invalid="true""#),
         "the refused control must be marked invalid: {html:.400}"
     );
-    // The control the message belongs to is the one that is marked.
+    // The control the message belongs to is the one that is marked
     let marked = html
         .split("<input")
         .find(|chunk| chunk.contains(r#"aria-invalid="true""#))
@@ -8838,7 +8789,7 @@ async fn a_refused_settings_save_does_not_echo_the_submitted_token() {
     let rendered = fumox_core::config_writer::fingerprint(&path);
 
     // `server.bind` is invalid, and a fresh token travels along: the
-    // save is refused as a whole, so the token was never applied.
+    // save is refused as a whole, so the token was never applied
     let submitted_token = "typed-secret-422";
     let body = format!(
         "_csrf={csrf}&cfg_fingerprint={rendered}&server.bind=not-an-address&ingest.drop_gate=on&admin.token={submitted_token}"
@@ -8862,7 +8813,7 @@ async fn a_refused_settings_save_does_not_echo_the_submitted_token() {
 
     // The operator is told the token was not applied, next to an empty
     // field: without the message the emptied input looks like the panel
-    // lost the value silently.
+    // lost the value silently
     let lang = state.locales.default_lang();
     assert!(
         html.contains(lang.t("set.edit_token_not_saved")),
@@ -8902,7 +8853,7 @@ async fn a_refused_settings_save_opens_the_tab_that_holds_the_error() {
     };
 
     // `probe.fail_limit` lives in the Probe pane and its only error is
-    // there, so that pane opens.
+    // there, so that pane opens
     let body =
         format!("_csrf={csrf}&cfg_fingerprint={rendered}&probe.fail_limit=0&ingest.drop_gate=on");
     let response = app
@@ -8927,7 +8878,7 @@ async fn a_refused_settings_save_opens_the_tab_that_holds_the_error() {
     );
 
     // Two panes broken: the first error decides which one opens, and
-    // the other is marked, so it does not look clean.
+    // the other is marked, so it does not look clean
     let body = format!(
         "_csrf={csrf}&cfg_fingerprint={rendered}&probe.fail_limit=0&server.bind=not-an-address&ingest.drop_gate=on"
     );

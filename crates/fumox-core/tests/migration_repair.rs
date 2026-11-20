@@ -8,12 +8,10 @@ use fumox_core::tempdir_lite::TempDir;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-/// The versions named by the `meta.migrations_repaired` breadcrumb.
-///
-/// The value is written as `versions=[1,2,3] at <unix time>`. The test
-/// compares the *list* it names, not the text: a substring check would
-/// accept `1` for a breadcrumb that names `11`, and would accept a
-/// breadcrumb that names the right versions twice.
+/// The versions named by the `meta.migrations_repaired` breadcrumb
+/// (`versions=[1,2,3] at <unix time>`). The test compares the *list* it
+/// names, not the text: a substring check would accept `1` for a
+/// breadcrumb that names `11`.
 fn parse_repaired_versions(value: &str) -> Vec<i64> {
     let start = value
         .find('[')
@@ -74,7 +72,7 @@ async fn migrate_refuses_a_checksum_mismatch_by_default() {
     db::migrate(&pool).await.unwrap();
 
     // Corrupt every stored checksum to force a `VersionMismatch` on the
-    // next migrate.
+    // next migrate
     sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE success = 1")
         .execute(&pool)
         .await
@@ -98,7 +96,7 @@ async fn migrate_refuses_a_checksum_mismatch_by_default() {
     );
 
     // Refused means untouched: the checksums stay broken and no
-    // breadcrumb claims a repair that did not happen.
+    // breadcrumb claims a repair that did not happen
     let stored = stored_checksums(&pool).await;
     let broken = stored.values().filter(|c| c.as_slice() == [0u8]).count();
     assert!(broken > 0, "the refusal must not re-stamp anything");
@@ -122,11 +120,11 @@ async fn migrate_recovers_from_a_checksum_mismatch_when_the_operator_opts_in() {
     };
     let pool = db::connect_pool(&cfg).await.unwrap();
     // Initial apply: sqlx seeds `_sqlx_migrations` with the SHA-384 of
-    // the current files.
+    // the current files
     db::migrate(&pool).await.unwrap();
 
     // Corrupt every stored checksum to force a `VersionMismatch` on the
-    // next migrate.
+    // next migrate
     sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE success = 1")
         .execute(&pool)
         .await
@@ -136,7 +134,6 @@ async fn migrate_recovers_from_a_checksum_mismatch_when_the_operator_opts_in() {
         .await
         .expect("the opt-in must recover from a checksum mismatch");
 
-    // A subsequent run with no corruption is a clean no-op.
     db::migrate(&pool)
         .await
         .expect("migrate must stay clean after the repair");
@@ -205,12 +202,10 @@ async fn repair_migration_checksums_is_a_noop_on_clean_db() {
 /// The self-heal must leave a durable trace. sqlx hashes the whole
 /// migration file, so a comment edit and a DDL edit are indistinguishable
 /// at the re-stamp: a schema that fell behind the files would otherwise be
-/// discovered only by noticing a missing column. `migrate()` therefore
-/// records the versions it re-stamped under `meta.migrations_repaired`,
-/// which survives the boot log that announced it.
-///
-/// The comparison is on the exact set of versions, not on a substring of
-/// the text: a breadcrumb that named `11` would satisfy a check for `1`.
+/// discovered only by noticing a missing column. `migrate()` records the
+/// versions it re-stamped under `meta.migrations_repaired`, which
+/// survives the boot log that announced it. The comparison is on the
+/// exact set of versions, not on a substring of the text.
 #[tokio::test]
 async fn migrate_records_the_repaired_versions_in_meta() {
     let dir = TempDir::new("recorded");
@@ -256,7 +251,7 @@ async fn migrate_records_the_repaired_versions_in_meta() {
         "the breadcrumb must name every version once: {recorded:?}"
     );
 
-    // A clean run must not keep re-announcing a repair that did not happen.
+    // A clean run must not keep re-announcing a repair that did not happen
     db::migrate(&pool).await.unwrap();
     let after = repaired_versions(&pool)
         .await
@@ -310,7 +305,6 @@ async fn migrate_records_only_the_versions_it_repaired() {
         "exactly the repaired version must be named"
     );
 
-    // The other rows were already correct and stay untouched.
     let stored = stored_checksums(&pool).await;
     let expected = expected_checksums();
     for (version, checksum) in &stored {
@@ -374,11 +368,10 @@ async fn repair_leaves_migrations_this_build_does_not_embed_alone() {
 /// `meta.migrations_repaired` breadcrumb).
 ///
 /// The repair's UPDATE is scoped to `success = 1` rows while sqlx's
-/// mismatch check compares the version and checksum of every row in
-/// `_sqlx_migrations` (the pre-flight dirty check only rejects
-/// `success = false`). A row outside that overlap therefore produces a
-/// mismatch the repair cannot rewrite, the deterministic stand-in for the
-/// concurrent-repair race this arm guards.
+/// mismatch check compares every row in `_sqlx_migrations` (the pre-flight
+/// dirty check only rejects `success = false`). A row outside that overlap
+/// is the deterministic stand-in for the concurrent-repair race this arm
+/// guards.
 #[tokio::test]
 async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
     let dir = TempDir::new("empty-repair");
@@ -395,7 +388,7 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
         .await
         .unwrap();
     // `success = 2` is neither the dirty check's `false` nor the repair's
-    // `1`: the mismatch is visible to sqlx, untouchable by the repair.
+    // `1`: the mismatch is visible to sqlx, untouchable by the repair
     sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00', success = 2 WHERE version = ?")
         .bind(version)
         .execute(&pool)
@@ -407,7 +400,7 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
         .expect_err("a mismatch the repair cannot rewrite must surface");
     // The variant, not the message text: sqlx's wording is not a
     // contract, the variant is what a caller classifies on. The re-raise
-    // must name the very version whose stored row disagrees.
+    // must name the very version whose stored row disagrees
     match err {
         fumox_core::error::Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(
             mismatched,
@@ -420,9 +413,8 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
         other => panic!("the original VersionMismatch must be re-raised, got: {other:?}"),
     }
 
-    // No repair was performed: the bad checksum survives and the durable
-    // breadcrumb must not exist (nothing may claim a repair that did not
-    // happen).
+    // No repair was performed: the bad checksum survives and the
+    // breadcrumb must not exist
     let stored: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
             .bind(version)
@@ -441,11 +433,9 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
 /// A failed migration is a different failure than a checksum mismatch, and
 /// the repair must not touch it: sqlx refuses to start on a dirty row
 /// (`success = 0`), because the schema on disk is half-applied and no
-/// re-stamp of a checksum can finish it.
-///
-/// The assertion is on the error variant, not on the message text: the
-/// dirty state has to be distinguishable from every other database
-/// failure.
+/// re-stamp of a checksum can finish it. The assertion is on the error
+/// variant, not on the message text: the dirty state has to be
+/// distinguishable from every other database failure.
 #[tokio::test]
 async fn migrate_refuses_a_dirty_migration_without_repairing_it() {
     let dir = TempDir::new("dirty");
@@ -476,7 +466,6 @@ async fn migrate_refuses_a_dirty_migration_without_repairing_it() {
         other => panic!("a dirty migration must surface as Dirty, got: {other:?}"),
     }
 
-    // The failed row stays exactly as it was, and no repair is claimed.
     let row: (i64, i64) =
         sqlx::query_as("SELECT success, length(checksum) FROM _sqlx_migrations WHERE version = 99")
             .fetch_one(&pool)
@@ -495,12 +484,8 @@ async fn migrate_refuses_a_dirty_migration_without_repairing_it() {
 /// Two processes that start at the same moment must not apply the same
 /// migration twice. sqlx does not lock a SQLite database while it
 /// migrates, so the serialisation is Fumox's own: an exclusive lock on a
-/// sidecar next to the database file.
-///
-/// The outcome has to be deterministic — both pools end up migrated, or
-/// one of them reports the mismatch it refused to repair — and the
-/// bookkeeping must survive it: the checksums are the ones the files
-/// hash to, and the breadcrumb names no version twice.
+/// sidecar next to the database file. The outcome has to be deterministic
+/// and the bookkeeping must survive it.
 #[tokio::test]
 async fn two_pools_migrating_at_once_converge() {
     let dir = TempDir::new("concurrent");
@@ -523,11 +508,10 @@ async fn two_pools_migrating_at_once_converge() {
         db::migrate_with(&pool_b, db::ChecksumRepair::Allow),
     );
 
-    // Every applied checksum was corrupted, so a migrator that lost the
-    // race must surface sqlx's own mismatch — the variant, not the message
-    // text — naming one of the applied versions. Which version exactly
-    // depends on how far the winner got with its re-stamp when the loser
-    // re-read the table, so the assertion is on the set, not one value.
+    // A migrator that lost the race must surface sqlx's own mismatch —
+    // the variant, not the message text — naming an applied version
+    // Which version depends on how far the winner got when the loser
+    // re-read the table, so the assertion is on the set
     let applied: BTreeSet<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1")
             .fetch_all(&pool_a)
@@ -555,7 +539,7 @@ async fn two_pools_migrating_at_once_converge() {
     );
 
     // Whatever the race decided, the checksums on disk are the ones the
-    // files hash to.
+    // files hash to
     let expected = expected_checksums();
     let stored = stored_checksums(&pool_a).await;
     for (version, checksum) in &stored {
@@ -566,7 +550,7 @@ async fn two_pools_migrating_at_once_converge() {
         );
     }
 
-    // The breadcrumb names the repaired versions, and each of them once.
+    // The breadcrumb names the repaired versions, and each of them once
     let recorded = repaired_versions(&pool_a)
         .await
         .expect("the breadcrumb must exist");
@@ -586,12 +570,11 @@ async fn two_pools_migrating_at_once_converge() {
     drop(pool_b);
 }
 
-/// The compiled `repair_migration_checksums` utility. It is a declared
-/// `[[bin]]` target of the crate: cargo builds bin targets before it
-/// compiles the integration tests and hands the path over at compile time
-/// (`CARGO_BIN_EXE_…`), so even a targeted
-/// `cargo test --test migration_repair` from a clean tree has the binary
-/// ready — no explicit `cargo build` of the tool, and no skip.
+/// The compiled `repair_migration_checksums` utility, a declared `[[bin]]`
+/// target of the crate: cargo builds bin targets before the integration
+/// tests and hands the path over at compile time (`CARGO_BIN_EXE_…`), so
+/// even a targeted `cargo test --test migration_repair` from a clean tree
+/// has the binary ready.
 fn repair_example_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_repair_migration_checksums"))
 }
@@ -608,12 +591,9 @@ fn run_repair_tool(bin: &Path, db_path: &Path) -> std::process::Output {
 /// build does not embed was migrated by a *newer* Fumox, and re-stamping
 /// the versions we do know would leave sqlx refusing to start with
 /// `VersionMissing(99)` anyway. The tool must refuse, name the version,
-/// and touch nothing, or it silently "repairs" a half-understood
-/// database.
-///
-/// The first run over the pristine database is the control: exit 0 there
-/// proves the refusal below comes from the extra version, not from the
-/// tool failing outright.
+/// and touch nothing. The first run over the pristine database is the
+/// control: exit 0 there proves the refusal below comes from the extra
+/// version, not from the tool failing outright.
 #[tokio::test]
 async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
     let bin = repair_example_bin();
@@ -626,7 +606,7 @@ async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
     let pool = db::connect_pool(&cfg).await.unwrap();
     db::migrate(&pool).await.unwrap();
 
-    // Control: the database is exactly what this build migrates.
+    // Control: the database is exactly what this build migrates
     drop(pool);
     let control = run_repair_tool(&bin, &path);
     assert!(
@@ -660,7 +640,6 @@ async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
         "the message must name the unknown version, got: {stderr}"
     );
 
-    // Refused means untouched: the unknown row still carries its checksum.
     let pool = db::connect_pool(&cfg).await.unwrap();
     let stored: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 99")
@@ -692,7 +671,7 @@ async fn the_repair_tool_refuses_a_database_with_an_unapplied_migration() {
     db::migrate(&pool).await.unwrap();
 
     // Drop the row of the last applied migration: the database now sits
-    // one migration behind the files.
+    // one migration behind the files
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await
@@ -718,8 +697,6 @@ async fn the_repair_tool_refuses_a_database_with_an_unapplied_migration() {
         "the message must say the migration was never applied, got: {stderr}"
     );
 
-    // Refused means untouched: the remaining checksums are the ones the
-    // files hash to.
     let pool = db::connect_pool(&cfg).await.unwrap();
     let after = stored_checksums(&pool).await;
     let expected = expected_checksums();
@@ -784,8 +761,7 @@ async fn the_repair_tool_accepts_the_default_database_next_to_the_working_direct
     );
 
     // Repaired the seeded database, not a fresh one: exactly one database
-    // file next to the working directory, still carrying the applied
-    // migrations a fresh database would not have.
+    // file, still carrying the applied migrations
     let databases = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(Result::ok)

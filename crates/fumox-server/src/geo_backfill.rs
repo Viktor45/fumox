@@ -1,26 +1,22 @@
 //! Backfill of the `proxies.geo_*` columns.
 //!
 //! Ingestion resolves geo facts for every proxy it upserts, but a row can
-//! still end up without them: it entered the database before a geo
-//! database was available (or while the server ran with
-//! `[geo].enabled = false`), or its host lookup failed once and the stamp
-//! it got back was partial. This module walks such rows, oldest id first,
-//! resolves each host and stores what came back.
+//! still end up without them: it predates a geo database (or the server
+//! ran with `[geo].enabled = false`), or its host lookup failed once and
+//! the stamp came back partial. This module walks such rows, oldest id
+//! first, resolves each host and stores what came back. The criterion is
+//! per fact (see [`proxies::list_missing_geo`]), so a row holding a
+//! country but no ASN gets another chance, and a fact no loaded database
+//! can answer is never asked for.
 //!
-//! The criterion is per fact (see [`proxies::list_missing_geo`]), so a row
-//! holding a country but no ASN gets another chance instead of being
-//! retired as "already filled". A fact no loaded database can answer is
-//! never asked for.
-//!
-//! Host lookups run with the same bounded concurrency as the ingest path
-//! and the whole pass is bounded by a wall-clock budget, so a hopeless set
-//! cannot hammer the resolver. A row whose lookup failed is marked, and
-//! the next passes leave it alone until the retry window
+//! Lookups run with the same bounded concurrency as the ingest path, the
+//! pass bounded by a wall-clock budget. A row whose lookup failed is
+//! marked and the next passes leave it alone until the retry window
 //! ([`proxies::GEO_RETRY_WINDOW_SECS`]) passed: a host no database knows
-//! must not take the budget away from the rows that were never tried.
-//! Rows the budget did not reach stay missing and are retried by the next
-//! pass: the startup one ([`backfill_missing_geo_within_budget`]) and the
-//! periodic one the scheduler runs.
+//! must not take the budget away from rows that were never tried. Rows
+//! the budget did not reach stay missing and are retried by the next pass
+//! (the startup one ([`backfill_missing_geo_within_budget`]) and the
+//! periodic one the scheduler runs).
 
 use fumox_core::db::DbPool;
 use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoFactMask, GeoInfo, GeoResolver};
@@ -70,10 +66,9 @@ async fn count_remaining(pool: &DbPool, mask: GeoFactMask) -> Option<i64> {
     }
 }
 
-/// The pass summary. Rows the resolver could not answer (or the budget did
-/// not reach) stay missing; the summary names how many, so a directory
-/// without a usable database is visible instead of only the rows that
-/// happened to resolve.
+/// The pass summary. Rows the resolver could not answer (or the budget
+/// did not reach) stay missing; the summary names how many, so a
+/// directory without a usable database is visible.
 fn log_pass_summary(started: std::time::Instant, updated: usize, remaining: Option<i64>) {
     if updated > 0 || remaining != Some(0) {
         tracing::info!(
@@ -89,9 +84,8 @@ fn log_pass_summary(started: std::time::Instant, updated: usize, remaining: Opti
 
 /// The one [`GeoResolver`] call the backfill makes. The real resolver
 /// implements it as-is; the seam exists so the lookup *shape* (concurrent,
-/// capped, budget-bounded, id-ordered) can be observed without a MaxMind
-/// database and a slow DNS server on the test machine, like the seam
-/// ingest resolves its stamps through.
+/// capped, budget-bounded, id-ordered) is observable in tests without a
+/// MaxMind database, like the seam ingest resolves its stamps through.
 trait GeoLookup {
     /// Resolve one host, `None` when nothing is known about it.
     fn resolve_host(
@@ -132,7 +126,7 @@ async fn run_backfill<G: GeoLookup>(
             break;
         }
         // Both dead ends below are logged where they happen; the walk just
-        // ends, the next pass retries what is left.
+        // ends, the next pass retries what is left
         let Some(page) = fetch_page(pool, cursor, mask).await else {
             break;
         };
@@ -173,7 +167,7 @@ struct Page {
 /// failed (already logged) or there is nothing more to fill.
 async fn fetch_page(pool: &DbPool, cursor: i64, mask: GeoFactMask) -> Option<Page> {
     // One row over the batch size: a short page no longer means "the
-    // table is exhausted", the retry window can leave holes in it.
+    // table is exhausted", the retry window can leave holes in it
     let mut rows = match proxies::list_missing_geo(pool, cursor, BATCH + 1, mask, now()).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -201,7 +195,7 @@ async fn resolve_page<G: GeoLookup>(
     use futures_util::StreamExt;
     // `buffered` (not `buffer_unordered`) keeps the id order the
     // cursor pagination walks, holding at most `GEO_LOOKUP_CONCURRENCY`
-    // lookups in flight.
+    // lookups in flight
     futures_util::stream::iter(
         rows.iter()
             .map(|(_, host)| async move {
@@ -272,11 +266,11 @@ async fn apply_lookup(
 ) -> bool {
     match stamp {
         // Past the budget: the row was not looked up, so it is not
-        // marked; it stays missing and the next pass tries it.
+        // marked; it stays missing and the next pass tries it
         Lookup::Skipped => false,
         // The resolver answered, but it knows nothing about this
         // address: remember the attempt so the next pass leaves the
-        // row alone for a while.
+        // row alone for a while
         Lookup::NoFacts => {
             if let Err(err) = proxies::mark_geo_attempt_tx(tx, id, now()).await {
                 tracing::warn!(proxy = id, error = %err, "geo backfill: cannot record the attempt");
@@ -488,7 +482,7 @@ mod tests {
         assert!(second.geo_country.is_some());
 
         // A second run is a no-op: the rows no longer count as missing, and
-        // the facts the first pass stored are not touched.
+        // the facts the first pass stored are not touched
         backfill_pass(&geo, &pool, BOTH_FACTS, Duration::from_secs(60)).await;
 
         assert_eq!(
@@ -648,7 +642,7 @@ mod tests {
 
         // Every fake lookup takes ≥50 ms and at most 32 run at once, so
         // the 300 ms budget can complete at most 32 × (300 / 50 + 1) = 224
-        // of the 400 rows, no matter how loaded the machine is.
+        // of the 400 rows, no matter how loaded the machine is
         assert!(updated > 0, "the first lookup wave must land in the budget");
         assert!(
             updated < 400,
@@ -704,7 +698,7 @@ mod tests {
         assert_eq!(geo.calls.load(Ordering::SeqCst), 500);
 
         // The second pass leaves the marked rows alone: they do not take
-        // the budget away from the fresh rows.
+        // the budget away from the fresh rows
         let updated = run_backfill(&geo, &pool, Duration::from_secs(60), BOTH_FACTS).await;
         assert_eq!(updated, 0);
         assert_eq!(
@@ -713,7 +707,7 @@ mod tests {
             "a marked row must not be looked up again"
         );
 
-        // The rows are still missing, the count does not hide the backlog.
+        // The rows are still missing, the count does not hide the backlog
         assert_eq!(
             proxies::count_missing_geo(&pool, BOTH_FACTS).await.unwrap(),
             500

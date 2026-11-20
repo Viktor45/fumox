@@ -1,21 +1,16 @@
-//! Response-hardening middleware for the admin listener:
-//! clickjacking, MIME sniffing and referrer leakage protection, plus a
-//! Content-Security-Policy. The panel renders with server-side askama
-//! escaping and ships its script (`/admin/static/app.js`) as a file, so
-//! the policy allows scripts from the origin only: no inline script and
-//! no inline event handler. Inline styles stay allowed, the templates
-//! still carry a `<noscript>` block and a few style attributes.
+//! Response-hardening middleware for the admin listener: clickjacking,
+//! MIME-sniffing and referrer-leak protection plus a Content-Security-Policy
+//! (see [`CONTENT_SECURITY_POLICY`]).
 
 use axum::extract::Request;
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
 
-/// CSP for the admin panel: everything comes from itself. The panel's
-/// script is a file (`/admin/static/app.js`) and every handler is
-/// delegated from it, so no inline script and no inline event handler
-/// has to be allowed. Inline styles stay for now: the templates still
-/// carry a `<noscript>` block and a few style attributes.
+/// CSP for the admin panel: everything comes from itself. The script is a
+/// file (`/admin/static/app.js`) and every handler is delegated from it, so
+/// no inline script or event handler has to be allowed; inline styles stay
+/// (the templates carry a `<noscript>` block and a few style attributes).
 pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
      script-src 'self'; \
      style-src 'self' 'unsafe-inline'; \
@@ -41,12 +36,12 @@ pub async fn headers(req: Request, next: Next) -> Response {
         // `same-origin`, not `no-referrer`: per Fetch, a request whose
         // referrer policy resolves to `no-referrer` is stamped with
         // `Origin: null`, and the panel's own cross-site gate
-        // (`admin::auth::cross_site_context`) rejects that before auth.
+        // (`admin::auth::cross_site_context`) rejects that before auth
         // `no-referrer` on the login page therefore locked the operator
         // out of every browser: the form's own navigation POST came back
         // `403 err.cross_site`. `same-origin` still withholds the panel
         // URL from third-party origins, which is the leak this header
-        // exists to stop.
+        // exists to stop
         HeaderValue::from_static("same-origin"),
     );
     headers.insert(
@@ -58,7 +53,7 @@ pub async fn headers(req: Request, next: Next) -> Response {
     // intermediary cache. A handler that answers with a genuinely
     // cacheable asset (the vendored `/admin/static/*` files) sets its own,
     // narrower `private, max-age=…`, and it wins: the insert below only
-    // fills the default, it does not overwrite.
+    // fills the default, it does not overwrite
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
@@ -118,7 +113,7 @@ mod tests {
             .expect("the policy is ASCII");
         assert_eq!(csp, CONTENT_SECURITY_POLICY);
         // Inline scripts are not allowed: the panel's script is a file and
-        // every handler is delegated from it. Inline styles still are.
+        // every handler is delegated from it. Inline styles still are
         let script_src = csp
             .split(';')
             .map(str::trim)

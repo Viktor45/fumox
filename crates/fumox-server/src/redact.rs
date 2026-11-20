@@ -6,13 +6,10 @@
 //! panel, so the rules live here and every caller uses them: the log
 //! line, `sources.last_error` and the panel cannot drift apart.
 //!
-//! Two audiences, two shapes:
-//!
-//! * the log line and the persisted error keep nothing: the userinfo is
-//!   dropped whole and the secret query values are replaced by
-//!   [`REDACTED`];
-//! * the panel keeps the username of a URL (it tells the operator which
-//!   account the feed belongs to) and masks the password instead.
+//! Two audiences, two shapes: the log line and the persisted error keep
+//! nothing (the userinfo dropped whole, the secret query values replaced
+//! by [`REDACTED`]); the panel keeps the username (it tells the operator
+//! which account the feed belongs to) and masks the password instead.
 
 use url::Url;
 
@@ -54,7 +51,7 @@ pub fn redact_query(query: &str) -> String {
     query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            // A bare name (`?token` without `=`) carries no value to leak.
+            // A bare name (`?token` without `=`) carries no value to leak
             Some((name, _)) if is_sensitive_param(name) => format!("{name}={REDACTED}"),
             _ => pair.to_string(),
         })
@@ -76,7 +73,7 @@ pub fn redact_url(url: &str) -> String {
             }
             parsed.to_string()
         }
-        // Not a URL (the error text embedded something else), nothing to leak.
+        // Not a URL (the error text embedded something else), nothing to leak
         Err(_) => url.to_string(),
     }
 }
@@ -131,23 +128,23 @@ mod tests {
             redact_url("http://user@example.com/"),
             "http://example.com/"
         );
-        // Without userinfo the URL is untouched; non-URLs pass through.
+        // Without userinfo the URL is untouched; non-URLs pass through
         assert_eq!(redact_url("https://example.com/"), "https://example.com/");
         assert_eq!(redact_url("not a url"), "not a url");
 
         // Credential-bearing query pairs are masked, benign pairs survive:
         // the query is where a subscription token travels, and the
-        // redacted URL reaches tracing output and fetch_log verbatim.
+        // redacted URL reaches tracing output and fetch_log verbatim
         assert_eq!(
             redact_url("https://example.com/sub?token=SECRET&page=2"),
             "https://example.com/sub?token=[redacted]&page=2"
         );
-        // Case-insensitive, and the stem match covers compound names.
+        // Case-insensitive, and the stem match covers compound names
         assert_eq!(
             redact_url("https://example.com/sub?API_KEY=x&ok=1"),
             "https://example.com/sub?API_KEY=[redacted]&ok=1"
         );
-        // A bare name carries no value, so it survives untouched.
+        // A bare name carries no value, so it survives untouched
         assert_eq!(
             redact_url("https://example.com/sub?token&ok=1"),
             "https://example.com/sub?token&ok=1"
@@ -165,7 +162,7 @@ mod tests {
         let (start, end) = query_span(url).unwrap();
         assert_eq!(&url[start..end], "token=x");
 
-        // No query, no userinfo: nothing to splice on.
+        // No query, no userinfo: nothing to splice on
         assert!(query_span("https://example.com/sub").is_none());
         assert!(userinfo_span("https://example.com/sub").is_none());
     }

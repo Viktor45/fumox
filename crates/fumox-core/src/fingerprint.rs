@@ -7,44 +7,28 @@
 //! )
 //! ```
 //!
-//! Every attacker-controlled field is escaped: the host, the credential and
-//! the parameter keys and values, so a separator byte coming from feed text
-//! cannot move a field boundary inside the pre-image. The scheme and the port
-//! are written as they are: a fixed enum literal and a number.
-//!
-//! The parameters enter the pre-image in their canonical form
-//! ([`crate::params::canonical`]): one value per canonical key, the
-//! structured blocks expanded into the scalars they carry, the cosmetic
-//! names dropped. The display name and the cosmetic parameters
-//! (advertising tags, bandwidth caps, timestamps) are deliberately
-//! excluded, so the same server advertised under different names collapses
-//! into a single row. `fingerprint` is UNIQUE in the schema, which makes
-//! reconciliation a natural upsert.
-//!
-//! The version is part of the pre-image: a change of the canonical form
-//! changes every key, so the stored rows are recomputed on the first start
-//! after the upgrade (see [`crate::repo::proxies::refingerprint`]).
+//! Every attacker-controlled field (host, credential, parameter keys and
+//! values) is escaped, so a separator byte from feed text cannot move a field
+//! boundary inside the pre-image; the scheme and the port need no escaping (a
+//! fixed enum literal and a number). The display name and the cosmetic
+//! parameters are deliberately excluded, so the same server advertised under
+//! different names collapses into a single row; `fingerprint` is UNIQUE in the
+//! schema, which makes reconciliation a natural upsert. The version is hashed
+//! in: a change of the canonical form changes every key, and stored rows are
+//! recomputed on the first start after the upgrade (see
+//! [`crate::repo::proxies::refingerprint`]).
 
 use crate::models::ProxyEntry;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-/// The version of the fingerprint pre-image.
-///
-/// It is hashed into the key, so the keys of two versions never collide and
-/// a change of the canonical form is visible as a new set of keys rather
-/// than as a silent re-mapping of the old ones. Bump it whenever the
-/// pre-image changes, and recompute the stored keys.
+/// Hashed into the key: a change of the canonical form is visible as a new set
+/// of keys rather than a silent re-mapping of the old ones. Bump on every
+/// pre-image change and recompute the stored keys.
 pub const FINGERPRINT_VERSION: &str = "fp2";
 
 /// Compute the stable deduplication fingerprint of a proxy entry.
-///
-/// Every attacker-controlled field that reaches the pre-image: the host, the
-/// credential and the parameter keys and values, is escaped, so a separator
-/// byte inside one of them can never be read as a boundary. The scheme and
-/// the port need no escaping: the scheme is a closed enum written as a fixed
-/// literal, the port a number by type.
 pub fn fingerprint(entry: &ProxyEntry) -> String {
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_VERSION.as_bytes());
@@ -61,19 +45,13 @@ pub fn fingerprint(entry: &ProxyEntry) -> String {
     to_hex(&hasher.finalize())
 }
 
-/// Host normalization: URI decorations stripped, lower-case, trailing
-/// dots stripped, an IP literal in its canonical spelling.
-///
 /// DNS names are case-insensitive and a trailing dot is the same zone, so
-/// `Example.COM.` and `example.com` must deduplicate. An IPv6 literal
-/// loses the URI brackets and the `%zone` scope id through
-/// [`crate::ssrf::strip_host_decorations`] — neither parses as an
-/// address, so a bracketed host would otherwise never merge with its
-/// plain spelling — and a host that parses as an address is written back
-/// in `IpAddr`'s canonical form, so `2001:0DB8::0001` and `2001:db8::1`
-/// are one host. The normalization mirrors what the dial path does with
-/// the same string (`ssrf::parse_ip_literal`), so rows the fingerprint
-/// merges are rows the probe dials identically.
+/// `Example.COM.` and `example.com` must deduplicate. An IPv6 literal loses
+/// its URI brackets and `%zone` scope id (neither parses as an address, so a
+/// bracketed host would otherwise never merge with its plain spelling) and an
+/// address is written back in `IpAddr`'s canonical form. Mirrors the dial path
+/// (`ssrf::parse_ip_literal`), so rows the fingerprint merges are rows the
+/// probe dials identically.
 pub fn normalize_host(host: &str) -> String {
     let stripped = crate::ssrf::strip_host_decorations(host);
     if let Ok(ip) = stripped.parse::<IpAddr>() {
@@ -85,12 +63,8 @@ pub fn normalize_host(host: &str) -> String {
         .to_string()
 }
 
-/// Canonical form of the connection parameters: keys and values escaped,
-/// sorted and joined with `&`.
-///
-/// The canonical form holds one value per key already, so the pairs are
-/// unique; the sort makes the order independent of the order the
-/// parameters were parsed in.
+/// Escaped `key=value` pairs, sorted for parse-order independence, joined
+/// with `&`.
 fn canonical_params(entry: &ProxyEntry) -> String {
     crate::params::canonical(entry)
         .iter()
@@ -99,16 +73,11 @@ fn canonical_params(entry: &ProxyEntry) -> String {
         .join("&")
 }
 
-/// Escape a key or value so the separators around it cannot be forged from
-/// inside it.
-///
 /// Feed text is attacker-controlled and the values reach the pre-image
-/// verbatim, so a raw separator byte would move a field boundary:
-/// `path=/search` + `host=evil` and the single parameter `host=evil&path=/search`
-/// would otherwise produce the same pre-image and the same fingerprint, and a
-/// `|` inside a host or a credential would shift the top-level fields the same
-/// way. Only bytes outside printable ASCII and the separators (plus `%`, so
-/// escaping is reversible) are rewritten.
+/// verbatim: a raw separator byte would move a field boundary (`path=/search`
+/// + `host=evil` and the single parameter `host=evil&path=/search` would
+/// produce the same pre-image). Only bytes outside printable ASCII and the
+/// separators (plus `%`, so escaping is reversible) are rewritten.
 fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -118,8 +87,8 @@ fn escape(value: &str) -> String {
             b'=' => out.push_str("%3D"),
             b'|' => out.push_str("%7C"),
             0x21..=0x7e => out.push(byte as char),
-            // `String: fmt::Write` appends infallibly; the `Err` arm is
-            // unreachable for an owned buffer.
+            // `fmt::Write` into an owned `String` appends infallibly, `Err` is
+            // unreachable
             _ => {
                 let _ = write!(out, "%{byte:02X}");
             }
@@ -128,9 +97,8 @@ fn escape(value: &str) -> String {
     out
 }
 
-/// The inverse of [`escape`]: every `%XX` escape decodes back into its
-/// byte. Test-only, kept next to `escape` so the pair cannot drift apart
-/// and the round-trip test stays honest.
+/// The inverse of [`escape`]. Test-only, kept next to it so the pair cannot
+/// drift apart and the round-trip test stays honest.
 #[cfg(test)]
 fn unescape(value: &str) -> String {
     let bytes = value.as_bytes();
@@ -224,9 +192,6 @@ mod tests {
         assert_eq!(fingerprint(&a), fingerprint(&b));
     }
 
-    /// An IPv6 literal loses its URI brackets and its scope id, and an
-    /// address is written back in `IpAddr`'s canonical form, so the
-    /// spellings of one server deduplicate onto one row.
     #[test]
     fn ipv6_literal_hosts_normalize_to_the_canonical_address() {
         assert_eq!(
@@ -235,7 +200,7 @@ mod tests {
         );
         assert_eq!(normalize_host("fe80::1%eth0"), "fe80::1");
         assert_eq!(normalize_host("2001:0DB8::0001"), "2001:db8::1");
-        // The trailing dot and the case rules still hold for names.
+        // The trailing dot and the case rules still hold for names
         assert_eq!(normalize_host("Example.COM."), "example.com");
         assert_eq!(
             normalize_host("[2606:4700:4700::1111]"),
@@ -247,21 +212,15 @@ mod tests {
         assert_eq!(fingerprint(&bracketed), fingerprint(&plain));
     }
 
-    /// The escape table: the separators and the out-of-printable-ASCII
-    /// bytes are rewritten, printable text passes through untouched, and
-    /// the transform is reversible — `unescape(escape(v)) == v` — so the
-    /// pre-image stays byte-comparable with the documented formula.
     #[test]
     fn escape_encodes_separators_control_and_non_ascii_bytes() {
         assert_eq!(escape("%"), "%25");
         assert_eq!(escape("&"), "%26");
         assert_eq!(escape("="), "%3D");
         assert_eq!(escape("|"), "%7C");
-        // Control and non-printable bytes, byte-wise.
         assert_eq!(escape("\u{0}"), "%00");
         assert_eq!(escape(" "), "%20");
         assert_eq!(escape("\u{7f}"), "%7F");
-        // UTF-8 escapes bytewise: é is U+00E9 = C3 A9.
         assert_eq!(escape("é"), "%C3%A9");
         assert_eq!(escape("h.example.com"), "h.example.com");
 
@@ -306,12 +265,10 @@ mod tests {
         let d = entry("n", "h", vec![param("allow_insecure", "1")]);
         assert_eq!(fingerprint(&a), fingerprint(&b));
         assert_eq!(fingerprint(&b), fingerprint(&c));
-        // The underscore spelling of sing-box / tuic links dedupes with the
-        // rest instead of contributing its own pre-image pair.
+        // The underscore spelling of sing-box / tuic links
         assert_eq!(fingerprint(&c), fingerprint(&d));
-        // The yes/on spellings share the one toggle vocabulary too: a `yes`
-        // row must merge with the `1` row, not sit beside it waiting for a
-        // refresh to flip the stored row between insecure and secure.
+        // `yes`/`on` share the toggle vocabulary: a `yes` row must merge with
+        // the `1` row, not sit beside it
         let yes = entry("n", "h", vec![param("allowInsecure", "yes")]);
         let on = entry("n", "h", vec![param("skip-cert-verify", "on")]);
         assert_eq!(fingerprint(&a), fingerprint(&yes));
@@ -328,7 +285,7 @@ mod tests {
         assert_eq!(fingerprint(&absent), fingerprint(&false_));
         assert_eq!(fingerprint(&absent), fingerprint(&underscore));
         // `no`/`off` are outside the shared truthy vocabulary: a falsy
-        // toggle means verification on, i.e. nothing in the pre-image.
+        // toggle means verification on, i.e. nothing in the pre-image
         let no = entry("n", "h", vec![param("allowInsecure", "no")]);
         let off = entry("n", "h", vec![param("skip-cert-verify", "off")]);
         assert_eq!(fingerprint(&absent), fingerprint(&no));
@@ -355,7 +312,6 @@ mod tests {
 
     #[test]
     fn canonical_order_is_stable() {
-        // Different input order must not change the fingerprint.
         let a = entry(
             "n",
             "h",
@@ -371,9 +327,8 @@ mod tests {
 
     #[test]
     fn a_duplicated_parameter_keeps_its_first_value() {
-        // The stored parameters keep the first occurrence of a key, so the
-        // fingerprint has to as well: a row recomputed from the database
-        // must land on the key the ingest computed.
+        // The stored parameters keep the first occurrence of a key, so a row
+        // recomputed from the database must land on the key the ingest computed
         let a = entry(
             "n",
             "h",
@@ -385,8 +340,7 @@ mod tests {
 
     #[test]
     fn the_parameter_values_are_decoded() {
-        // A percent-encoded path and a plain one describe the same
-        // transport, so they must not land in two rows.
+        // A percent-encoded path and a plain one are the same transport
         let a = entry("n", "h", vec![param("path", "%2Fws%3Fed%3D2560")]);
         let b = entry("n", "h", vec![param("path", "/ws?ed=2560")]);
         assert_eq!(fingerprint(&a), fingerprint(&b));
@@ -394,9 +348,9 @@ mod tests {
 
     #[test]
     fn clash_spellings_are_security_relevant() {
-        // Clash keeps its own field names; parsed verbatim they must still
-        // reach the dedup key, or two nodes differing only in `servername`
-        // collapse and the upsert overwrites one with the other.
+        // Clash field names must reach the dedup key, or two nodes differing
+        // only in `servername` collapse and the upsert overwrites one with the
+        // other
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
@@ -417,7 +371,7 @@ mod tests {
     #[test]
     fn clash_structured_fields_are_security_relevant() {
         // `ws-headers`, `ws-opts` and `reality-opts` are YAML blocks with no
-        // URI spelling; they are kept verbatim and are connection-defining.
+        // URI spelling; they are kept verbatim and are connection-defining
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
@@ -447,9 +401,8 @@ mod tests {
 
     #[test]
     fn clash_and_uri_spellings_agree() {
-        // The same node advertised once as Clash YAML and once as a URI must
-        // deduplicate together, so the Clash spelling has to canonicalize onto
-        // the URI one rather than sitting beside it.
+        // The Clash spelling must canonicalize onto the URI one, not sit
+        // beside it
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
@@ -468,8 +421,6 @@ mod tests {
 
     #[test]
     fn a_structured_block_and_its_flat_spelling_agree() {
-        // The same node published as a `reality-opts` block and as the flat
-        // `pbk`/`sid` parameters is one node, not two.
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
@@ -482,17 +433,16 @@ mod tests {
 
     #[test]
     fn cert_pin_is_security_relevant() {
-        // The pinned certificate decides which servers the client accepts, so
-        // two hysteria2 nodes pinning different certificates are different
-        // nodes. Left out of the dedup key they shared one row and the
-        // upsert silently overwrote one with the other.
+        // The pinned certificate decides which servers the client accepts;
+        // left out of the dedup key the two nodes shared one row and the
+        // upsert silently overwrote one with the other
         let uri_a = parse_one("hysteria2://pass@h.example.com:443?pinSHA256=AAAA");
         let uri_b = parse_one("hysteria2://pass@h.example.com:443?pinSHA256=BBBB");
         assert_ne!(fingerprint(&uri_a), fingerprint(&uri_b));
 
-        // Clash spells the same field `fingerprint`; it must canonicalize
-        // onto the URI spelling instead of sitting beside it, or a node
-        // published in both formats lands in two rows.
+        // Clash spells the same field `fingerprint`; it must canonicalize onto
+        // the URI spelling, or a node published in both formats lands in two
+        // rows
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: hysteria2, server: h.example.com, port: 443,",
@@ -512,8 +462,6 @@ mod tests {
 
     #[test]
     fn the_version_is_part_of_the_key() {
-        // A change of the canonical form changes every key, so the version
-        // is hashed into the pre-image.
         let e = entry("n", "h", vec![]);
         let mut hasher = Sha256::new();
         hasher.update(FINGERPRINT_VERSION.as_bytes());
@@ -526,11 +474,9 @@ mod tests {
     fn clash_and_uri_spellings_agree_for_vmess() {
         // vmess names the transport `net` in the URI JSON and sing-box native
         // form, `network` only in Clash; the cipher is `scy` in the JSON and
-        // `cipher` in Clash, the alter id `aid` and `alterId`. Folding the
-        // Clash spellings onto the URI ones left the two forms as separate
-        // keys, so one vmess server published as Clash YAML and as a vmess://
-        // link got two fingerprints, two rows and two copies in every
-        // subscription.
+        // `cipher` in Clash, the alter id `aid` and `alterId`. Before the
+        // Clash spellings were folded onto the URI ones, one server published
+        // in both formats got two fingerprints and two rows
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
@@ -546,8 +492,6 @@ mod tests {
         uri.name = String::new();
         assert_eq!(fingerprint(&clash), fingerprint(&uri));
 
-        // The same cipher also spelled the Clash way must dedup with the
-        // URI spelling, not sit beside it under its own key.
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
@@ -565,10 +509,9 @@ mod tests {
 
     #[test]
     fn two_vmess_nodes_differing_only_in_cipher_do_not_collapse() {
-        // Both nodes are Clash vmess items, so the cipher arrives under the
-        // Clash spelling: before it was folded onto `scy` it was dropped
-        // from the pre-image entirely, the two collapsed onto one row and
-        // reconcile_source's upsert silently overwrote one with the other.
+        // Before the Clash cipher spelling was folded onto `scy` it was
+        // dropped from the pre-image, the two collapsed onto one row and
+        // reconcile_source's upsert silently overwrote one with the other
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
@@ -586,9 +529,8 @@ mod tests {
 
     #[test]
     fn newly_covered_security_params_split_nodes() {
-        // Each of these changes how the client connects; left out of the
-        // pre-image two nodes differing only in it shared one row and the
-        // upsert silently overwrote one with the other.
+        // Each changes how the client connects; left out of the pre-image the
+        // two nodes shared one row and the upsert silently overwrote one
         for (key, first, second) in [
             ("obfs-host", "a.example.com", "b.example.com"),
             ("version", "3", "4"),
@@ -612,7 +554,7 @@ mod tests {
     #[test]
     fn separator_bytes_in_values_cannot_forge_a_pair() {
         // Without escaping, `path=/search` + `host=evil` and the single param
-        // `host=evil&path=/search` are the same pre-image.
+        // `host=evil&path=/search` are the same pre-image
         let split = entry(
             "n",
             "h",
@@ -632,11 +574,10 @@ mod tests {
 
     #[test]
     fn pipe_in_a_field_cannot_shift_the_pre_image_boundary() {
-        // The pre-image is `version|scheme|host|port|credential|params`, and
-        // the host and the credential reach it verbatim (parse_hostport and
-        // split_userinfo keep them as written). A `|` inside either one moved
-        // a field boundary, so two unrelated malformed lines hashed to the
-        // same fingerprint and the upsert kept only the last of them.
+        // The host and the credential reach the pre-image verbatim
+        // (parse_hostport and split_userinfo keep them as written); a `|`
+        // inside either one moved a field boundary and the upsert kept only
+        // the last of two unrelated malformed lines
         let first = parse_one("vless://x@a|443:1#one");
         let second = parse_one("vless://1|x@a:443#two");
         assert_eq!(first.host, "a|443");
@@ -647,9 +588,8 @@ mod tests {
         assert_eq!(second.credential, "1|x");
         assert_ne!(fingerprint(&first), fingerprint(&second));
 
-        // The value level behind it: a pipe inside a field is rewritten, and a
-        // value without one is untouched, so the common case keeps the
-        // documented pre-image byte for byte.
+        // A value without a pipe is untouched, so the common case keeps the
+        // documented pre-image byte for byte
         assert_eq!(escape("a|443"), "a%7C443");
         assert_eq!(escape("1|x"), "1%7Cx");
         assert_eq!(escape("h.example.com"), "h.example.com");
@@ -658,7 +598,7 @@ mod tests {
     #[test]
     fn matches_documented_formula() {
         // Lock the composition against accidental drift: the fingerprint must
-        // equal sha256 over the documented preimage, field by field.
+        // equal sha256 over the documented preimage, field by field
         let e = entry(
             "ignored",
             "Example.com.",

@@ -1,17 +1,13 @@
 //! One-shot toast messages for the plain-browser path.
 //!
 //! An HTMX action hands its message to the client in the `HX-Trigger`
-//! header. A plain browser follows the redirect as a normal navigation
-//! and the header is gone, so the message needs another way back: it used
-//! to ride on the redirect URL as a `flash` query parameter. That put the
-//! text into the address bar, the browser history and every copied link,
-//! and a crafted link could show a message of the attacker's choosing
-//! (a fake "your session expired, sign in again" prompt).
-//!
-//! The message now waits here, keyed by the session, and the page picks
-//! it up once: it is handed out on the first request and gone afterwards,
-//! so a refresh or a copied link does not replay it and a crafted link
-//! cannot add one.
+//! header; a plain browser follows the redirect as a normal navigation and
+//! the header is gone. Carrying the message on the redirect URL would put
+//! it into the address bar, the browser history and every copied link, and
+//! a crafted link could show a message of the attacker's choosing (a fake
+//! "your session expired, sign in again" prompt), so the message waits
+//! here, keyed by the session, and the page picks it up once: a refresh or
+//! a copied link does not replay it and a crafted link cannot add one.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -38,8 +34,8 @@ pub enum FlashLevel {
 
 impl FlashLevel {
     /// The level a `FLASH_LEVEL_HEADER` value names. `error` is the only
-    /// word the client tells from the rest, so anything else — a missing
-    /// header included — is the default toast.
+    /// word the client tells from the rest, so anything else, a missing
+    /// header included, is the default toast.
     pub fn from_header(value: &str) -> Self {
         if value == "error" {
             Self::Error
@@ -84,7 +80,6 @@ struct Inner {
 }
 
 impl FlashStore {
-    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
@@ -126,7 +121,7 @@ impl FlashStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A panic in another request must not take the panel down: the
-        // store holds no invariant that a poison would break.
+        // store holds no invariant that a poison would break
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -182,7 +177,7 @@ mod tests {
         for idx in 0..(CAPACITY * 2) {
             store.put(&format!("s{idx}"), "m".into(), FlashLevel::Ok);
         }
-        // The oldest entries are gone, the newest are still there.
+        // The oldest entries are gone, the newest are still there
         assert_eq!(store.take("s0"), None);
         assert!(store.take(&format!("s{}", CAPACITY * 2 - 1)).is_some());
     }

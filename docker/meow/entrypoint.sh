@@ -1,11 +1,10 @@
 #!/bin/sh
 # Render the meow-rs bootstrap config and start the kernel.
-#
 # The controller can rewrite the proxy kernel's configuration, so it must
 # answer only to the probe: the secret is mandatory and the container
 # refuses to start without one. The rendered config holds the secret, so it
 # is written to a tmpfs (never to a disk) and stays readable by the kernel
-# user alone.
+# user alone
 set -eu
 
 TEMPLATE="${FUMOX_MEOW_CONFIG_TEMPLATE:-/etc/meow/config.yaml.template}"
@@ -21,7 +20,7 @@ if [ -z "$secret" ]; then
 fi
 # The secret is substituted into the template, so it has to survive the
 # substitution unchanged: only characters that are inert in a YAML double
-# quoted scalar and in the substitution itself are allowed.
+# quoted scalar and in the substitution itself are allowed
 case "$secret" in
     *[!A-Za-z0-9._-]*)
         echo "error: FUMOX_MEOW__API_TOKEN may only contain letters, digits," >&2
@@ -43,7 +42,7 @@ if [ ! -r "$TEMPLATE" ]; then
 fi
 
 # The data dir and the rendered config are the only writable paths of the
-# container; both live on the tmpfs the orchestrator mounts.
+# container; both live on the tmpfs the orchestrator mounts
 umask 077
 mkdir -p "$(dirname "$CONFIG_FILE")" "$DATA_DIR"
 

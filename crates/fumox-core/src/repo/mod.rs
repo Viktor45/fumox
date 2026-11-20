@@ -1,9 +1,7 @@
-//! Repository layer: typed async access to the SQLite schema.
-//!
-//! Free async functions grouped by table family; every multi-statement
-//! operation runs in its own transaction. Rows are mapped onto the domain
-//! models from [`crate::models`] manually, the schema stores booleans as
-//! integers and structured fields as JSON text, so the mapping is explicit.
+//! Repository layer over the SQLite schema: free async functions grouped by
+//! table family, every multi-statement operation in its own transaction.
+//! Rows map manually onto [`crate::models`] because the schema stores
+//! booleans as integers and structured fields as JSON text.
 
 pub mod fetch_log;
 pub mod probe;
@@ -18,11 +16,9 @@ use sqlx::sqlite::SqliteArguments;
 use std::collections::HashMap;
 
 /// Dynamic WHERE-clause accumulator shared by the admin list filters of
-/// this module tree: the single copy of the "whitelist the fragment, bind
-/// the value" pattern the admin handlers used to re-implement per screen.
+/// this module tree.
 ///
-/// Every clause is a compile-time constant of this crate (a whitelist
-/// bucket or a fixed predicate over one table family); the only
+/// Every clause is a compile-time constant of this crate; the only
 /// caller-controlled content is the text value each clause binds, and
 /// those travel through `.bind()`, never into the SQL text. The count and
 /// list queries of one family build their clauses through the family's
@@ -39,22 +35,21 @@ impl WhereFilter {
         Self::default()
     }
 
-    /// Append a clause without bound values (`s.enabled = 1`, an EXISTS
-    /// fragment from a whitelist bucket).
+    /// Append a clause with no bound values (`s.enabled = 1`, a
+    /// whitelist-bucket EXISTS fragment).
     pub(crate) fn clause(mut self, clause: impl Into<String>) -> Self {
         self.clauses.push(clause.into());
         self
     }
 
-    /// Append a clause that binds one text value.
     pub(crate) fn text(mut self, clause: &str, value: impl Into<String>) -> Self {
         self.clauses.push(clause.to_string());
         self.values.push(value.into());
         self
     }
 
-    /// Append one more bound text value without a clause of its own; for
-    /// predicates that repeat a value under several `?` placeholders
+    /// Bind one more text value without its own clause, for predicates
+    /// that repeat a value under several `?` placeholders
     /// (`(host LIKE ? OR name LIKE ?)`).
     pub(crate) fn text_value(mut self, value: impl Into<String>) -> Self {
         self.values.push(value.into());
@@ -62,9 +57,9 @@ impl WhereFilter {
     }
 
     /// Append an `IN (?, ?, …)` clause over `column`, one placeholder per
-    /// element, bound in order. `values` must not be empty: an empty SQL
-    /// `IN ()` list is a syntax error, and the family builders only call
-    /// this after their own emptiness guard.
+    /// element, bound in order. `values` must not be empty: an empty
+    /// `IN ()` is a syntax error, and family builders call this after
+    /// their own emptiness guard.
     pub(crate) fn text_in(mut self, column: &str, values: &[String]) -> Self {
         debug_assert!(
             !values.is_empty(),
@@ -76,8 +71,7 @@ impl WhereFilter {
         self
     }
 
-    /// The joined WHERE fragment: `""` when no clause was pushed, else
-    /// `" WHERE a AND b"`.
+    /// Joined WHERE fragment: `""` when empty, else `" WHERE a AND b"`.
     pub(crate) fn sql(&self) -> String {
         if self.clauses.is_empty() {
             String::new()
@@ -86,19 +80,16 @@ impl WhereFilter {
         }
     }
 
-    /// The bound values in clause order; each fills the `?` placeholder
-    /// of the clause it was pushed with.
+    /// Bound values in clause order, each filling the `?` of its clause.
     pub(crate) fn values(&self) -> &[String] {
         &self.values
     }
 }
 
-/// Apply the bound values of a [`WhereFilter`] to a sqlx query builder,
-/// in clause order. A local trait because `bind` is an inherent method
-/// returning `Self` on the sibling query constructors (`query_as`,
-/// `query_scalar`), which share no interface to call it through. The
-/// lifetime parameter ties the values slice to the query's argument
-/// lifetime: a bound value must outlive the query it feeds.
+/// Bind the [`WhereFilter`] values to a sqlx query builder, in clause
+/// order. A local trait because `bind` is inherent on `query_as` and
+/// `query_scalar`, which share no interface to call it through; the
+/// lifetime ties the values slice to the query's argument lifetime.
 pub(crate) trait BindWhereFilter<'a>: Sized {
     fn bind_where_filter(self, values: &'a [String]) -> Self;
 }
@@ -122,10 +113,6 @@ impl<'q, O> BindWhereFilter<'q> for sqlx::query::QueryScalar<'q, Sqlite, O, Sqli
 }
 
 /// Read a service key from `meta`.
-///
-/// The executor is generic so the read can join a caller's transaction
-/// (the admin dashboard reads every key inside one snapshot) or run on
-/// the pool on its own.
 pub async fn meta_get<'e, E>(executor: E, key: &str) -> crate::Result<Option<String>>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -137,13 +124,8 @@ where
     Ok(row.map(|(value,)| value))
 }
 
-/// Read several service keys from `meta` in one query.
-///
-/// The admin panel reads the four probe stamps on every render; four
-/// round trips are four chances to queue behind a write, and none of
-/// them depends on another. A key without a row is simply absent from
-/// the map, so the caller tells "no record" from "no value" the same
-/// way it does with [`meta_get`].
+/// Read several service keys from `meta` in one query. Keys without a
+/// row are absent from the map, matching [`meta_get`]'s `None`.
 pub async fn meta_get_many<'e, E>(
     executor: E,
     keys: &[&str],
@@ -166,7 +148,6 @@ where
     Ok(rows.into_iter().collect())
 }
 
-/// Upsert a service key in `meta`.
 pub async fn meta_set(pool: &DbPool, key: &str, value: &str) -> crate::Result<()> {
     sqlx::query(
         "INSERT INTO meta (key, value) VALUES (?, ?)
@@ -180,13 +161,10 @@ pub async fn meta_set(pool: &DbPool, key: &str, value: &str) -> crate::Result<()
 }
 
 /// Atomically increment an integer counter key in `meta`, creating it at 1
-/// when absent, and return the new value. A single upsert, so two
-/// concurrent callers each observe their own bump: a `meta_get` +
-/// `meta_set` pair would race them onto the same value. A pre-existing
-/// non-integer value casts to 0 and self-heals from 1 — the heal rewrites
-/// the stored text silently, so it is logged with the key and the value it
-/// replaced. Stored through the TEXT-affinity column, so `meta_get` still
-/// reads the number back as text.
+/// when absent, and return the new value. A single upsert, so concurrent
+/// callers each observe their own bump. A non-integer value casts to 0
+/// and self-heals from 1 (the rewrite is logged with the replaced value);
+/// stored in the TEXT-affinity column, so `meta_get` reads it back as text.
 pub async fn meta_increment(pool: &DbPool, key: &str) -> crate::Result<i64> {
     let previous: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
         .bind(key)
@@ -219,9 +197,8 @@ pub(crate) fn json_to_text(value: &serde_json::Value) -> crate::Result<String> {
         .map_err(|e| crate::Error::Parse(format!("cannot serialize JSON column: {e}")))
 }
 
-/// Parse a JSON column value. `row_id` names the row the column was read
-/// from, so the error points at the broken row instead of just the broken
-/// column.
+/// Parse a JSON column value; `row_id` names the row so the error points
+/// at the broken row, not just the column.
 pub(crate) fn text_to_json(
     text: &str,
     column: &str,
@@ -234,27 +211,22 @@ pub(crate) fn text_to_json(
     })
 }
 
-/// The pause between two batches of a batched purge ([`purge_batched`]).
-///
-/// A purge batch holds the WAL write lock for the duration of its
-/// statement, and the probe daemon and the ingest want that lock for
-/// their own writes. The pause gives them a window between two batches
-/// instead of making them wait for the whole sweep.
+/// Pause between two batches of a batched purge ([`purge_batched`]): each
+/// batch holds the WAL write lock for the duration of its statement, and
+/// the probe daemon and ingest need that lock, so they get a window
+/// between batches instead of waiting out the whole sweep.
 pub(crate) const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Run a bounded-batch retention `DELETE` on the pool, one statement per
 /// batch with a pause between the batches (see [`PURGE_BATCH_PAUSE`]),
 /// until a batch deletes fewer than `batch_size` rows.
 ///
-/// `sql` must have the shape
-/// `DELETE FROM t WHERE id IN (SELECT id FROM t WHERE … ORDER BY id
-/// LIMIT ?)`: the optional `cutoff` is bound first (`None` for a
-/// statement without a cutoff placeholder), the batch limit last. A
-/// single `DELETE` over the whole expired population would hold the
-/// write lock until the last row is gone and grow the WAL with one giant
-/// commit — on a long-lived database exactly the case the retention
-/// exists for. Each statement here is its own transaction, so the lock
-/// is released between the batches.
+/// `sql` must have the shape `DELETE FROM t WHERE id IN (SELECT id FROM t
+/// WHERE … ORDER BY id LIMIT ?)`: the optional `cutoff` is bound first
+/// (`None` for a statement without a cutoff placeholder), the batch limit
+/// last. A single `DELETE` over the whole expired population would hold
+/// the write lock until the last row is gone and grow the WAL with one
+/// giant commit, so each statement here is its own transaction.
 ///
 /// sqlx 0.9 SqlSafeStr: `sql` is a compile-time constant of the calling
 /// module; every value flows through `.bind()`.
@@ -285,9 +257,8 @@ mod tests {
     use super::*;
     use crate::db;
 
-    /// Fresh migrated pool on a scoped temp database: keep the returned
-    /// guard in scope (`let (_dir, pool) = temp_pool().await`) and the
-    /// whole directory, database included, is removed when it drops.
+    /// Fresh migrated pool on a scoped temp database: the whole directory,
+    /// database included, is removed when the returned guard drops.
     pub(crate) async fn temp_pool() -> (crate::tempdir_lite::TempDir, DbPool) {
         let dir = crate::tempdir_lite::TempDir::new("repo");
         let cfg = crate::config::DatabaseConfig {
@@ -314,21 +285,21 @@ mod tests {
         let (_dir, pool) = temp_pool().await;
         assert_eq!(meta_increment(&pool, "counter").await.unwrap(), 1);
         assert_eq!(meta_increment(&pool, "counter").await.unwrap(), 2);
-        // Keys are independent.
+        // Keys are independent
         assert_eq!(meta_increment(&pool, "other").await.unwrap(), 1);
-        // A non-integer value casts to 0 and self-heals from 1.
+        // A non-integer value casts to 0 and self-heals from 1
         meta_set(&pool, "corrupt", "not-a-number").await.unwrap();
         assert_eq!(meta_increment(&pool, "corrupt").await.unwrap(), 1);
-        // Stored through the TEXT-affinity column: meta_get reads it back.
+        // Stored through the TEXT-affinity column: meta_get reads it back
         assert_eq!(
             meta_get(&pool, "counter").await.unwrap().as_deref(),
             Some("2")
         );
     }
 
-    /// The upsert is the whole increment: 16 callers firing concurrently
-    /// observe 16 distinct values, so a lost update (two callers landing on
-    /// the same bump) is impossible by construction.
+    /// 16 concurrent callers must observe 16 distinct values: the upsert
+    /// is the whole increment, so a lost update is impossible by
+    /// construction.
     #[tokio::test]
     async fn meta_increment_is_atomic_under_concurrent_callers() {
         let (_dir, pool) = temp_pool().await;
@@ -351,8 +322,6 @@ mod tests {
         );
     }
 
-    /// The `IN`-clause builder: one placeholder per element, values bound
-    /// in list order.
     #[test]
     fn where_filter_text_in_binds_every_element() {
         let wf = WhereFilter::new().text_in("col", &["a".into(), "b".into()]);
@@ -360,8 +329,6 @@ mod tests {
         assert_eq!(wf.values(), ["a".to_string(), "b".to_string()].as_slice());
     }
 
-    /// The fragments accumulate in push order, both in the SQL text and in
-    /// the bound values.
     #[test]
     fn where_filter_keeps_the_push_order() {
         let wf = WhereFilter::new()
@@ -375,8 +342,6 @@ mod tests {
         );
     }
 
-    /// A caller-supplied value never enters the SQL text: a value with
-    /// quotes travels through the bind, so it cannot change the clause.
     #[test]
     fn where_filter_value_with_quotes_stays_out_of_the_sql_text() {
         let wf = WhereFilter::new().text("s.name = ?", "it's \"quoted\"");
@@ -395,8 +360,8 @@ mod tests {
         .await
         .unwrap();
         // Subset check: a migration adding a table/index must extend these
-        // lists — the version assert below is the only tripwire forcing an
-        // update here.
+        // lists; the version assert below is the only tripwire forcing the
+        // update
         let tables: Vec<&str> = tables.iter().map(|(name,)| name.as_str()).collect();
         for expected in [
             "sources",
@@ -446,7 +411,7 @@ mod tests {
             assert!(indexes.contains(&expected), "missing index {expected}");
         }
 
-        // The denormalised T2 recency stamp is on the proxy row.
+        // The denormalised T2 recency stamp is on the proxy row
         let columns: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM pragma_table_info('proxies')")
                 .fetch_all(&pool)
@@ -458,7 +423,7 @@ mod tests {
             "the proxy row must carry the T2 recency stamp"
         );
 
-        // The geo-unknown flag of migration 0021 is on the profile row.
+        // The geo-unknown flag of migration 0021 is on the profile row
         let profile_columns: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM pragma_table_info('profiles')")
                 .fetch_all(&pool)
@@ -473,15 +438,12 @@ mod tests {
             "the profile row must carry the geo-unknown flag"
         );
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 21
-        // by migration 0021 (the profile geo-unknown flag,
-        // profiles.include_unknown_country); 0020 was the fetch journal
-        // keyset index, which replaces idx_fetch_time — a strict prefix of
-        // the new composite.
+        // Schema version is stamped into meta by db::migrate; 21 is
+        // migration 0021 (the profiles.include_unknown_country flag)
         let version = meta_get(&pool, "schema_version").await.unwrap();
         assert_eq!(version.as_deref(), Some("21"));
 
-        // The fetch-attempt stamp of migration 0015 is on the source row.
+        // The fetch-attempt stamp of migration 0015 is on the source row
         let source_columns: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM pragma_table_info('sources')")
                 .fetch_all(&pool)
@@ -494,7 +456,7 @@ mod tests {
             "the source row must carry the fetch-attempt stamp"
         );
 
-        // The attempt count of migration 0016 is on the journal row.
+        // The attempt count of migration 0016 is on the journal row
         let journal_columns: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM pragma_table_info('fetch_log')")
                 .fetch_all(&pool)
@@ -509,7 +471,6 @@ mod tests {
             "the journal row must carry the attempt count"
         );
 
-        // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
             .fetch_one(&pool)
             .await
@@ -519,8 +480,8 @@ mod tests {
 
     /// Migration 0005 must carry the old fixed-ladder schedule over to the
     /// generic `ladder_at`/`ladder_step` columns: every quarantined row
-    /// keeps its scheduled moment and its ladder position, and the old
-    /// columns are gone afterwards.
+    /// keeps its scheduled moment and ladder position, the old columns
+    /// are gone.
     #[tokio::test]
     async fn migration_0005_preserves_quarantine_ladder_schedule() {
         use sqlx::migrate::Migrator;
@@ -533,8 +494,8 @@ mod tests {
         };
         let pool = db::connect_pool(&cfg).await.unwrap();
 
-        // Apply the pre-ladder schema (0001..0004) by hand, without the
-        // migration stamping, so 0005 can be applied separately below.
+        // Pre-ladder schema (0001..0004) applied by hand, so 0005 can be
+        // applied separately below
         for migration in MIGRATOR.migrations.iter().filter(|m| m.version <= 4) {
             sqlx::raw_sql(migration.sql.clone())
                 .execute(&pool)
@@ -543,7 +504,7 @@ mod tests {
         }
 
         // Quarantined rows on every old schedule column, plus an alive row
-        // without any schedule.
+        // without a schedule
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, host, port, status,
                                   quarantined_at, second_chance_at, created_at, updated_at)
@@ -604,14 +565,13 @@ mod tests {
             .into_iter()
             .map(|(fp, at, step)| (fp, (at, step)))
             .collect();
-        // second_chance_at → step 0; each recheck column → its step index.
+        // second_chance_at → step 0; each recheck column → its step index
         assert_eq!(by_fp["fp-sc"], (Some(9000), 0));
         assert_eq!(by_fp["fp-r15"], (Some(2400), 1));
         assert_eq!(by_fp["fp-r30"], (Some(3300), 2));
         assert_eq!(by_fp["fp-r1h"], (Some(5100), 3));
         assert_eq!(by_fp["fp-alive"], (None, 0));
 
-        // The old columns are dropped.
         assert!(
             sqlx::query("SELECT second_chance_at FROM proxies")
                 .execute(&pool)
@@ -623,13 +583,12 @@ mod tests {
     }
 
     /// Migration 0018 rebuilds `proxies` with a port range CHECK and drops
-    /// the rows a pre-check database could carry with port = 0 (SQLite
-    /// cannot add a CHECK to an existing column, so the rebuild copies the
-    /// rows the CHECK accepts and leaves the junk behind). The children of
-    /// a dropped row go with it — the explicit deletes stand in for the
+    /// rows a pre-check database could carry with port = 0 (SQLite cannot
+    /// add a CHECK to an existing column, so the rebuild copies the rows
+    /// the CHECK accepts and leaves the junk behind). The children of a
+    /// dropped row go with it: the explicit deletes stand in for the
     /// `ON DELETE CASCADE` the schema declares, which cannot fire while
-    /// foreign keys are off — and every valid row keeps its id and its
-    /// columns.
+    /// foreign keys are off, and every valid row keeps its id and columns.
     #[tokio::test]
     async fn migration_0018_drops_port_zero_rows_and_installs_the_port_range_check() {
         use sqlx::migrate::Migrator;
@@ -642,8 +601,8 @@ mod tests {
         };
         let pool = db::connect_pool(&cfg).await.unwrap();
 
-        // The pre-check schema (0001..0017), applied by hand so the rebuild
-        // runs against rows and children that already exist.
+        // Pre-check schema (0001..0017) applied by hand so the rebuild
+        // runs against rows and children that already exist
         for migration in MIGRATOR.migrations.iter().filter(|m| m.version <= 17) {
             sqlx::raw_sql(migration.sql.clone())
                 .execute(&pool)
@@ -677,7 +636,7 @@ mod tests {
                 .unwrap()
         };
         // Both rows carry a source link and a probe result: the kept row's
-        // children must survive the rebuild, the dropped row's must not.
+        // children must survive the rebuild, the dropped row's must not
         let keep_id = id_of("fp-keep").await;
         let zero_id = id_of("fp-zero").await;
         assert_ne!(keep_id, zero_id, "the fixture rows must get distinct ids");
@@ -709,7 +668,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The port-0 row is gone, the valid row survived with its columns.
         let ports: Vec<i64> = sqlx::query_scalar("SELECT port FROM proxies ORDER BY port")
             .fetch_all(&pool)
             .await
@@ -728,7 +686,6 @@ mod tests {
         );
         assert_eq!(ladder_step, 0);
 
-        // The children of the dropped row are gone, the kept row's are intact.
         for table in ["proxy_source_links", "probe_results"] {
             let kept: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE proxy_id = ?1"
@@ -749,7 +706,7 @@ mod tests {
         }
 
         // The CHECK is active on the rebuilt table: port 0 is refused, the
-        // boundary ports are not.
+        // boundary ports are not
         let err = sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
              VALUES ('fp-new0', 'vless', 'h.example.com', 0, 'unknown', 1, 1)",
@@ -776,13 +733,11 @@ mod tests {
         pool.close().await;
     }
 
-    /// Migration 0013 backfills the T2 block from the probe history.
-    ///
-    /// Migration 0007 added `last_t2_failed_at` empty, so every row that
-    /// existed then looked like a proxy that had never failed a tunnel
-    /// check — the T1 lane kept serving the proxies the probe had already
-    /// found untunnellable. The backfill reads the history: the newest T2
-    /// attempt decides, and only a failed one stamps the row.
+    /// Migration 0013 backfills the T2 block from the probe history. 0007
+    /// added `last_t2_failed_at` empty, so every row that existed then
+    /// looked like it had never failed a tunnel check, and the T1 lane
+    /// kept serving proxies the probe had found untunnellable; the newest
+    /// T2 attempt decides, and only a failed one stamps the row.
     #[tokio::test]
     async fn migration_0013_backfills_the_t2_block_from_the_probe_history() {
         use sqlx::migrate::Migrator;
@@ -795,8 +750,8 @@ mod tests {
         };
         let pool = db::connect_pool(&cfg).await.unwrap();
 
-        // The pre-backfill schema, applied by hand so the backfill can be
-        // run against rows that already carry a history.
+        // Pre-backfill schema applied by hand so the backfill runs against
+        // rows that already carry a history
         for migration in MIGRATOR.migrations.iter().filter(|m| m.version <= 12) {
             sqlx::raw_sql(migration.sql.clone())
                 .execute(&pool)
@@ -829,7 +784,7 @@ mod tests {
         };
 
         // A failed T2, then a later successful one: the block was cleared
-        // by the success, so the backfill must not stamp it.
+        // by the success, so the backfill must not stamp it
         sqlx::query(
             "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
              VALUES (?1, 1000, 0, 't2'), (?1, 2000, 1, 't2')",
@@ -838,7 +793,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // A failed T2 and nothing since: the block belongs to it.
+        // A failed T2 and nothing since: the block belongs to it
         sqlx::query(
             "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
              VALUES (?1, 1000, 0, 't2')",
@@ -848,7 +803,7 @@ mod tests {
         .await
         .unwrap();
         // An unverified attempt (the engine produced no verdict) counts as
-        // an attempt and blocks the row.
+        // an attempt and blocks the row
         sqlx::query(
             "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
              VALUES (?1, 1500, 0, 't2_unverified')",

@@ -15,7 +15,7 @@
 //!   percent-encoded), so serialization can reproduce the original bytes.
 //!
 //! The value vocabulary is not URI-only: the Clash and sing-box parsers feed
-//! the same [`Param`] list with *decoded* text taken from YAML/JSON scalars,
+//! the same [`Param`] list with decoded text taken from YAML/JSON scalars,
 //! so a stored value may carry a raw `&` or `#`. Serialization therefore
 //! escapes the characters that would otherwise break the emitted line (see
 //! `encode_query_delimiters`).
@@ -31,8 +31,8 @@ pub struct UriSchemeSpec {
     pub scheme: Scheme,
     /// URI prefix emitted on serialization, e.g. `"vless://"`.
     pub prefix: &'static str,
-    /// Lower-cased keys recognized as defined parameters of this scheme.
-    /// Anything else is kept as an unknown pass-through parameter.
+    /// Lower-cased keys recognized as defined parameters of this scheme;
+    /// anything else is kept as an unknown pass-through parameter.
     pub known_keys: &'static [&'static str],
     /// Whether a missing credential makes the line invalid.
     pub credential_required: bool,
@@ -120,10 +120,8 @@ pub static TUIC_SPEC: UriSchemeSpec = UriSchemeSpec {
 
 /// Render a host for a `host:port` context: an IPv6 literal must be
 /// bracketed (`[2001:db8::1]:443`) or the concatenation is not a parseable
-/// `host:port` at all, both directions of the round-trip and every
-/// consumer of the subscription output rely on that. `parse_hostport`
-/// strips the brackets on input, so round-tripping stays byte-stable for
-/// bracketed feeds too. Everything else (hostnames, IPv4) passes through.
+/// `host:port` at all. `parse_hostport` strips the brackets on input, so
+/// round-tripping stays byte-stable for bracketed feeds too.
 pub(crate) fn host_for_uri(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -143,7 +141,7 @@ pub static SOCKS5_SPEC: UriSchemeSpec = UriSchemeSpec {
     scheme: Scheme::Socks5,
     prefix: "socks5://",
     known_keys: &[],
-    // socks5 lines without authentication do exist in the wild.
+    // socks5 lines without authentication do exist in the wild
     credential_required: false,
 };
 
@@ -174,8 +172,7 @@ pub static ANYTLS_SPEC: UriSchemeSpec = UriSchemeSpec {
 /// The transport is part of the scheme identity (`naive+https://` vs
 /// `naive+quic://`), not a client-facing query key: the parser attaches it,
 /// the serializer consumes it to rebuild the prefix, and it never appears in
-/// an emitted URI. The key lives here so the parser, the serializer and the
-/// fingerprint all read the same spelling.
+/// an emitted URI.
 pub const NAIVE_TRANSPORT_PARAM: &str = "naive_transport";
 
 pub static NAIVE_SPEC: UriSchemeSpec = UriSchemeSpec {
@@ -312,7 +309,7 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
         if host.contains(':') {
             // An unbracketed IPv6 literal: `2001:db8::1:443` would be split
             // into the host `2001:db8::1` and the port 443, and the client
-            // would dial the wrong address.
+            // would dial the wrong address
             return Err("IPv6 host must be bracketed".to_string());
         }
         (host.to_string(), port)
@@ -322,13 +319,12 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
     }
     let port: u16 = port_str.parse().map_err(|_| {
         // A junk "port" can be arbitrarily long; keep the diagnostic
-        // bounded (the caller logs the line truncated as well).
+        // bounded (the caller logs the line truncated as well)
         format!("invalid port: {:?}", super::truncate_utf8(port_str, 16))
     })?;
-    // Port 0 is the listener's "any port" bind convention, not an address
-    // a client could dial, so a line carrying it is malformed feed content:
-    // the record must not reach the database or the subscription output.
-    // The schema CHECK (migration 0018) is the second gate behind this one.
+    // Port 0 is the listener's "any port" bind convention, not an address a
+    // client could dial, so a line carrying it is malformed feed content
+    // The schema CHECK (migration 0018) is the second gate behind this one
     if port == 0 {
         return Err("port 0 is not a valid proxy port".to_string());
     }
@@ -375,7 +371,7 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// break the round-trip guarantee.
 pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
     // Count before allocating: `split` is lazy, so this never materializes
-    // the oversized parameter list.
+    // the oversized parameter list
     let count = query.split('&').count();
     if count > MAX_QUERY_PARAMS {
         return Err(format!(
@@ -384,7 +380,7 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
     }
     let mut params = Vec::with_capacity(count);
     for pair in query.split('&') {
-        // Size caps run before any allocation for the pair (F13).
+        // Size caps run before any allocation for the pair (F13)
         match pair.split_once('=') {
             Some((key, value)) => {
                 check_param_size(key, value)?;
@@ -402,7 +398,7 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
                     value: String::new(),
                     known: false,
                     // No `=` in the segment: serialization must emit the
-                    // bare key, not `k=`.
+                    // bare key, not `k=`
                     bare: true,
                 });
             }
@@ -411,7 +407,6 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
     Ok(params)
 }
 
-/// Enforce [`MAX_PARAM_BYTES`] on one key/value pair.
 fn check_param_size(key: &str, value: &str) -> Result<(), String> {
     if key.len() > MAX_PARAM_BYTES || value.len() > MAX_PARAM_BYTES {
         return Err(format!(
@@ -525,7 +520,6 @@ pub fn decode_b64_lenient(input: &str) -> Option<Vec<u8>> {
     if input.is_empty() {
         return None;
     }
-    // Map the URL-safe alphabet onto the standard one.
     let normalized: String = input
         .chars()
         .map(|c| match c {
@@ -579,7 +573,7 @@ pub fn parse_with_spec(
 ) -> Result<ProxyEntry, String> {
     let parts = split_uri(rest)?;
     let credential = match parts.userinfo {
-        // An `@` with nothing before it is as unusable as no `@` at all.
+        // An `@` with nothing before it is as unusable as no `@` at all
         Some(userinfo) if spec.credential_required && userinfo.is_empty() => {
             return Err("empty credential".to_string());
         }
@@ -637,8 +631,8 @@ fn encode_structural<'a>(raw: &'a str, chars: &[char]) -> Cow<'a, str> {
 /// asking where the entry came from. An entry parsed from a URI cannot carry
 /// them (the parser splits the fragment and the query off before the
 /// userinfo), so the encoding is a no-op there and the byte-exact round-trip
-/// holds; an entry whose fields were *decoded* on another path — a
-/// structured-format record rebuilt with a source line, or a merge of rows —
+/// holds; an entry whose fields were decoded on another path (a
+/// structured-format record rebuilt with a source line, or a merge of rows)
 /// cannot smuggle a raw `#` or `?` into the emitted line regardless of how
 /// it was built, instead of relying on the `raw_line` sentinel to tell the
 /// two apart.
@@ -704,7 +698,7 @@ mod tests {
 
     #[test]
     fn splits_fragment_before_query() {
-        // The name may contain `?`; the query may not contain `#`.
+        // The name may contain `?`; the query may not contain `#`
         let parts = split_uri("uuid@host:443?a=b#name?with?marks").unwrap();
         assert_eq!(parts.fragment.as_deref(), Some("name?with?marks"));
         assert_eq!(parts.query_pairs.len(), 1);
@@ -721,7 +715,7 @@ mod tests {
 
     #[test]
     fn userinfo_split_at_last_at_sign() {
-        // base64 userinfo may contain `/`, the path split must not trigger.
+        // base64 userinfo may contain `/`, the path split must not trigger
         let parts = split_uri("YWVz/x@host:8388/").unwrap();
         assert_eq!(parts.userinfo.as_deref(), Some("YWVz/x"));
         assert_eq!(parts.host, "host");
@@ -736,9 +730,6 @@ mod tests {
         assert_eq!(port, 8443);
     }
 
-    /// The serializer must bracket an IPv6 literal in the `host:port`
-    /// context: the unbracketed `2001:db8::1:8443` is not a parseable
-    /// `host:port` at all.
     #[test]
     fn serializes_ipv6_host_bracketed_and_round_trips() {
         let entry = ProxyEntry {
@@ -759,7 +750,7 @@ mod tests {
         };
         let out = serialize_with_spec(&VLESS_SPEC, &entry);
         assert!(out.contains("@[2001:db8::1]:8443"), "{out}");
-        // Bracketed input parses back to the same bare-literal host.
+        // Bracketed input parses back to the same bare-literal host
         let parsed =
             parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
         assert_eq!(parsed.host, "2001:db8::1");
@@ -768,8 +759,8 @@ mod tests {
         assert_eq!(parsed.name, "v6");
     }
 
-    /// A structured source (Clash YAML, sing-box JSON) carries *decoded*
-    /// text: a raw `#`, `?`, `@` or `/` in the host or the credential would
+    /// A structured source (Clash YAML, sing-box JSON) carries decoded text:
+    /// a raw `#`, `?`, `@` or `/` in the host or the credential would
     /// truncate the emitted line or move the userinfo boundary, and the
     /// client would dial the wrong host.
     #[test]
@@ -795,7 +786,7 @@ mod tests {
             out,
             "vless://pa%23ss%3Fword@ho%23st%3Fx%40y%2Fz:443?security=tls#node"
         );
-        // The emitted line stays parseable: the boundaries survive.
+        // The emitted line stays parseable: the boundaries survive
         let parsed =
             parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
         assert_eq!(parsed.port, 443);
@@ -806,8 +797,7 @@ mod tests {
     }
 
     /// A URI-sourced entry is emitted byte-for-byte: the parser had already
-    /// split the structural characters apart, so there is nothing to encode
-    /// and the round-trip stays exact.
+    /// split the structural characters apart, so there is nothing to encode.
     #[test]
     fn a_uri_sourced_entry_is_emitted_verbatim() {
         let line = "vless://uuid@h.example.com:443?security=tls#name";
@@ -816,11 +806,10 @@ mod tests {
         assert_eq!(serialize_with_spec(&VLESS_SPEC, &parsed), line);
     }
 
-    /// The hybrid state — decoded text in a field of an entry that also
-    /// carries a source line — is not producible by the parsers, but it is
+    /// The hybrid state (decoded text in a field of an entry that also
+    /// carries a source line) is not producible by the parsers, but it is
     /// one assignment away on the public struct and reachable through a
-    /// cross-row merge. The emitted line must stay URI-safe regardless: a
-    /// raw `#` in the userinfo truncates it and swallows the host.
+    /// cross-row merge; the emitted line must stay URI-safe regardless.
     #[test]
     fn a_structural_character_in_a_hybrid_entry_is_escaped_on_output() {
         let entry = ProxyEntry {
@@ -836,7 +825,7 @@ mod tests {
         };
         let line = serialize_with_spec(&TROJAN_SPEC, &entry);
         assert_eq!(line, "trojan://pa%23ss@h.example:443#node", "{line}");
-        // The line parses again, with the userinfo boundary intact.
+        // The line parses again, with the userinfo boundary intact
         let parsed =
             parse_with_spec(&TROJAN_SPEC, line.strip_prefix("trojan://").unwrap(), &line).unwrap();
         assert_eq!(parsed.credential, "pa%23ss");
@@ -874,7 +863,7 @@ mod tests {
         assert!(parse_hostport("host:").is_err());
         assert!(parse_hostport("host").is_err());
         assert!(parse_hostport("").is_err());
-        // Port 0 is not a dialable endpoint: both host spellings drop it.
+        // Port 0 is not a dialable endpoint: both host spellings drop it
         assert!(parse_hostport("host:0").is_err());
         assert!(parse_hostport("[2001:db8::1]:0").is_err());
     }
@@ -898,7 +887,7 @@ mod tests {
         assert!(!pairs[2].bare);
         assert_eq!(serialize_query(&pairs), "a&b=&c=1");
 
-        // The bare key survives a full entry round-trip too.
+        // The bare key survives a full entry round-trip too
         let line = "vless://u@h.example.com:443?legacy#n";
         let entry = parse_with_spec(&VLESS_SPEC, "u@h.example.com:443?legacy#n", line).unwrap();
         assert!(entry.params[0].bare);
@@ -916,7 +905,7 @@ mod tests {
         let err = parse_query(&too_many).unwrap_err();
         assert!(err.contains("over the"), "{err}");
 
-        // The whole line is skipped rather than silently shortened.
+        // The whole line is skipped rather than silently shortened
         let line = format!("vless://u@h.example.com:443?{too_many}");
         assert!(matches!(
             super::super::parse_line(&line),
@@ -932,25 +921,23 @@ mod tests {
         let huge = "x".repeat(MAX_PARAM_BYTES + 1);
         let err = parse_query(&format!("type={huge}")).unwrap_err();
         assert!(err.contains("over the"), "{err}");
-        // And the whole line is skipped, not stored truncated.
+        // And the whole line is skipped, not stored truncated
         let line = format!("vless://u@h.example.com:443?type={huge}");
         assert!(matches!(
             super::super::parse_line(&line),
             super::super::LineOutcome::Unrecognized
         ));
-        // Just under the cap passes.
         let ok = "x".repeat(MAX_PARAM_BYTES);
         assert!(parse_query(&format!("type={ok}")).is_ok());
     }
 
-    /// `raw_line` is persisted verbatim onto every stored row, so an
-    /// oversized line is a storage bomb: a 10 MiB single-line fetch
-    /// became ~20 MiB of SQLite data per row per refresh.
+    /// An oversized line is a storage bomb (`raw_line` is persisted
+    /// verbatim, see `MAX_LINE_BYTES`).
     #[test]
     fn oversized_line_is_skipped_entirely() {
         // One huge fragment keeps the line under the param-value cap but
-        // over the line cap, `parse_line` must drop it before anything is
-        // stored.
+        // over the line cap, so `parse_line` must drop it before anything
+        // is stored
         let name = "x".repeat(MAX_LINE_BYTES + 1);
         let line = format!("vless://u@h.example.com:443?security=reality#{name}");
         assert!(line.len() > MAX_LINE_BYTES);
@@ -959,7 +946,6 @@ mod tests {
             super::super::LineOutcome::Unrecognized
         ));
 
-        // A normal-length line still parses.
         let ok = "vless://u@h.example.com:443?security=reality#node";
         assert!(matches!(
             super::super::parse_line(ok),
@@ -970,7 +956,6 @@ mod tests {
     #[test]
     fn percent_decode_is_lenient() {
         assert_eq!(percent_decode("%F0%9F%8C%90%20World"), "🌐 World");
-        // Invalid escapes and raw UTF-8 pass through unchanged.
         assert_eq!(percent_decode("50%off"), "50%off");
         assert_eq!(percent_decode("привет"), "привет");
     }
@@ -1023,9 +1008,8 @@ mod tests {
     }
 
     /// A value the Clash/sing-box parsers contributed as decoded text can
-    /// carry a raw `&` or `#`. Emitted verbatim, `&` spawns a bogus extra
-    /// parameter and `#` swallows the proxy name (the fragment is everything
-    /// after the first `#`).
+    /// carry a raw `&` or `#`: emitted verbatim, `&` spawns a bogus extra
+    /// parameter and `#` swallows the proxy name.
     #[test]
     fn query_delimiters_in_values_do_not_corrupt_the_line() {
         let entry = ProxyEntry {
@@ -1054,25 +1038,25 @@ mod tests {
         };
         let out = serialize_with_spec(&VLESS_SPEC, &entry);
         // `&` is escaped; the rest of the value is left as the producer
-        // wrote it (`?` and `=` are legal inside a query value).
+        // wrote it (`?` and `=` are legal inside a query value)
         assert_eq!(
             out,
             "vless://uuid@h.example.com:443?type=ws&path=/search?q=1%26host=evil#Name"
         );
-        // One `path` parameter, and the name is still `Name`.
+        // One `path` parameter, and the name is still `Name`
         let back =
             parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
         assert_eq!(back.params.len(), 2);
         assert_eq!(back.params[1].key, "path");
         assert_eq!(back.name, "Name");
         // The escaped value is what a client percent-decodes back to the
-        // original text.
+        // original text
         assert_eq!(
             percent_decode(&back.params[1].value),
             "/search?q=1&host=evil"
         );
 
-        // A `#` in a value used to make the name `b&path=…`.
+        // A `#` in a value would make the name `b&path=…`
         let hashed = ProxyEntry {
             params: vec![Param {
                 key: "type".into(),
@@ -1122,7 +1106,7 @@ mod tests {
         );
 
         // Space and the C0/DEL controls are not legal in a URI at all; they
-        // are the one thing that is always encoded.
+        // are the one thing that is always encoded
         let controls = vec![Param {
             key: "v".into(),
             value: "a b\tc\u{7f}".into(),
@@ -1132,8 +1116,8 @@ mod tests {
         assert_eq!(serialize_query(&controls), "v=a%20b%09c%7F");
     }
 
-    /// A raw `=` in a key used to shift the first-`=` split on re-parse:
-    /// `allowInsecure=x` came back as a *present* `allowInsecure` parameter.
+    /// A raw `=` in a key would shift the first-`=` split on re-parse:
+    /// `allowInsecure=x` came back as a present `allowInsecure` parameter.
     #[test]
     fn equals_sign_in_a_param_key_is_escaped() {
         let params = vec![Param {
@@ -1146,13 +1130,13 @@ mod tests {
         assert_eq!(query, "allowInsecure%3Dx=1");
 
         // Round-trip is stable: the escaped key re-serializes to the same
-        // bytes, so no parameter is forged on the way out.
+        // bytes, so no parameter is forged on the way out
         let back = parse_query(&query).unwrap();
         assert_eq!(back[0].key, "allowInsecure%3Dx");
         assert_eq!(back[0].value, "1");
         assert_eq!(serialize_query(&back), query);
 
-        // A value keeps its raw `=`.
+        // A value keeps its raw `=`
         let value = vec![Param {
             key: "path".into(),
             value: "/a=b".into(),
@@ -1164,7 +1148,7 @@ mod tests {
         assert_eq!(back[0].key, "path");
         assert_eq!(back[0].value, "/a=b");
 
-        // End to end: the full line survives a re-parse unchanged.
+        // End to end: the full line survives a re-parse unchanged
         let entry = ProxyEntry {
             scheme: Scheme::Vless,
             name: "n".into(),
@@ -1182,9 +1166,7 @@ mod tests {
         assert_eq!(serialize_with_spec(&VLESS_SPEC, &back), out);
     }
 
-    /// A `snell://` line must round-trip: the psk is the userinfo, the
-    /// version/obfs travel as ordinary params, and serializing the parsed
-    /// entry must reproduce a line the parser accepts again.
+    /// The psk is the userinfo, the version/obfs travel as ordinary params.
     #[test]
     fn snell_line_round_trips() {
         let line = "snell://psk123@h.example.com:44046?version=4&obfs=http&obfs-host=bing.com#sn";
@@ -1229,8 +1211,7 @@ mod tests {
         assert_eq!(back.param("sni"), Some("a.example.com"));
     }
 
-    /// Both schemes carry a secret, so a line without one is unusable and
-    /// must be rejected rather than stored as a credential-less proxy.
+    /// Both schemes carry a secret, so a credential-less line is unusable.
     #[test]
     fn snell_and_anytls_require_a_credential() {
         for (spec, rest) in [
@@ -1245,7 +1226,7 @@ mod tests {
             );
         }
         // An `@` with nothing before it is an empty credential, not a
-        // missing one, and is rejected all the same.
+        // missing one, and is rejected all the same
         assert!(parse_with_spec(&SNELL_SPEC, "@h.example.com:44046", "").is_err());
     }
 }

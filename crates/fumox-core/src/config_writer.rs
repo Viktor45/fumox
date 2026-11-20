@@ -1,29 +1,12 @@
 //! Round-trip editor for `config/app.toml`.
 //!
-//! The admin panel's *Edit settings* page must write back individual
-//! fields without destroying the comments the operator put in the file
-//! (every section of `config/app.toml` carries RU/EN pair comments).
-//! `toml_edit` is built for exactly that, its `DocumentMut` keeps the
-//! decoration around every key.
-//!
-//! Atomic save: write to a sibling `.<name>.tmp.<pid>.<n>`, then
-//! rename. If `rename` fails (some network filesystems do not support
-//! it), fall back to a direct write and surface the failure in the log,
-//! losing atomicity is better than losing the change. When the direct
-//! write fails too, the tmp holding the new content stays on the disk
-//! and its path is logged, so neither version of the file is lost.
-//!
-//! Serialised save: the editor holds an exclusive advisory lock on a
-//! sibling lock file for the whole read-modify-write cycle, so two
-//! writers cannot interleave. The lock is a file lock rather than a
-//! process-wide mutex because the admin panel is not the only writer
-//! of this file: an operator edits it by hand, a deployment tool
-//! rewrites it.
-//!
-//! Conflict detection: the file is fingerprinted when it is loaded and
-//! again when it is saved. A file that changed in between carries a
-//! concurrent modification, and the save is refused rather than
-//! overwriting the other change.
+//! The admin panel's *Edit settings* page must write back individual fields
+//! without destroying the comments the operator put in the file, which
+//! `toml_edit`'s `DocumentMut` keeps around every key. Saves are serialised
+//! by an exclusive advisory lock on a sibling lock file (the admin panel is
+//! not the only writer of this file), refused when the file changed on disk
+//! between load and save, and committed atomically via a temporary file
+//! with a direct-write fallback for filesystems without rename support.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -37,11 +20,11 @@ pub use toml_edit::Item as ConfigItem;
 
 /// Failure mode of [`EditableConfig`] operations.
 ///
-/// The enum is `#[non_exhaustive]`: new variants and fields may land
-/// with any release, match on it with a catch-all arm. Variants
-/// compare equal field-by-field; the two failures of
-/// [`ConfigWriteError::Io`] are the same error when the path and the
-/// [`std::io::ErrorKind`] match, `io::Error` itself has no equality.
+/// The enum is `#[non_exhaustive]`: new variants and fields may land with
+/// any release, match on it with a catch-all arm. Variants compare equal
+/// field-by-field; the two failures of [`ConfigWriteError::Io`] are the same
+/// error when the path and the [`std::io::ErrorKind`] match, `io::Error`
+/// itself has no equality.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConfigWriteError {
@@ -170,7 +153,7 @@ impl PartialEq for ConfigWriteError {
                 },
             ) => a == b && m == n,
             // `io::Error` has no equality; the kind at the same path is
-            // the meaningful part of the failure.
+            // the meaningful part of the failure
             (E::Io { path: a, source: s }, E::Io { path: b, source: t }) => {
                 a == b && s.kind() == t.kind()
             }
@@ -181,25 +164,23 @@ impl PartialEq for ConfigWriteError {
 
 impl Eq for ConfigWriteError {}
 
-/// A writable handle over the on-disk TOML config.
+/// A writable handle over the on-disk TOML config, loaded once per request,
+/// mutated by [`Self::set`], committed by [`Self::save`]. The in-memory
+/// document preserves comments, blank lines and key ordering from the source
+/// file.
 ///
-/// Loaded once per request, mutated by [`Self::set`], committed by
-/// [`Self::save`]. The in-memory document preserves comments, blank
-/// lines and key ordering from the source file.
-///
-/// That is a read-modify-write of the whole file, and the settings
-/// form has no double-submit guard, so the window between `load` and
-/// `save` is reachable from two requests at once. The handle therefore
-/// takes an exclusive lock on the config for its whole lifetime, which
-/// makes the snapshot the `save` writes a snapshot of the current file
-/// rather than of whatever the file held when the request started.
+/// That is a read-modify-write of the whole file, and the settings form has
+/// no double-submit guard, so the window between `load` and `save` is
+/// reachable from two requests at once. The handle therefore takes an
+/// exclusive lock on the config for its whole lifetime, which makes the
+/// snapshot the `save` writes a snapshot of the current file rather than of
+/// whatever the file held when the request started.
 pub struct EditableConfig {
     path: PathBuf,
     doc: DocumentMut,
-    /// Fingerprint of the bytes this document was parsed from. The
-    /// save compares it with the file on disk: a file that changed in
-    /// between carries a concurrent modification, and the write is
-    /// refused instead of dropping the other change.
+    /// Fingerprint of the bytes this document was parsed from. The save
+    /// compares it with the file on disk: a file that changed in between
+    /// carries a concurrent modification, and the write is refused.
     fingerprint: String,
     /// The exclusive lock on the config, held from `load` to drop.
     /// `None` when the config directory cannot hold the lock file (a
@@ -217,13 +198,11 @@ impl std::fmt::Debug for EditableConfig {
 }
 
 impl EditableConfig {
-    /// Load the TOML at `path`. Returns an empty document if the file
-    /// does not exist yet (the admin panel's *Create from defaults*
-    /// path writes one for the first time).
-    ///
-    /// Blocks while another writer holds the lock on this file, so the
-    /// document returned is the current state of the file and no save
-    /// can land between the read and the mutation that follows it.
+    /// Load the TOML at `path`, returning an empty document if the file does
+    /// not exist yet (the admin panel's *Create from defaults* path writes
+    /// one for the first time). Blocks while another writer holds the lock,
+    /// so the document returned is the current state of the file and no
+    /// save can land between the read and the mutation that follows it.
     pub fn load(path: &Path) -> Result<Self, ConfigWriteError> {
         let lock = ConfigLock::acquire(path);
         let (text, fingerprint) = match std::fs::read_to_string(path) {
@@ -241,7 +220,7 @@ impl EditableConfig {
         };
         let doc = DocumentMut::from_str(&text).map_err(|e| {
             // The span points into the text just read; the operator
-            // gets a file:line:column they can jump to in an editor.
+            // gets a file:line:column they can jump to in an editor
             let (line, column) = line_col_at(&text, e.span().map(|s| s.start).unwrap_or(0));
             tracing::error!(
                 path = %path.display(),
@@ -285,35 +264,29 @@ impl EditableConfig {
         Some(current)
     }
 
-    /// Set the leaf at `dotted` to `value`. Auto-creates any missing
-    /// intermediate `[section]` tables and the leaf itself, so callers
-    /// can write a brand-new key without first inserting scaffolding.
+    /// Set the leaf at `dotted` to `value`, auto-creating any missing
+    /// intermediate `[section]` tables and the leaf itself, so callers can
+    /// write a brand-new key without first inserting scaffolding.
     ///
-    /// `dotted` must be a non-empty string of non-empty segments
-    /// separated by exactly one `.`, no leading / trailing dot, no
-    /// `..`. Empty or doubled segments are rejected with
-    /// [`ConfigWriteError::InvalidKey`].
+    /// `dotted` must be a non-empty string of non-empty segments separated
+    /// by exactly one `.`, no leading / trailing dot, no `..`; violations
+    /// are rejected with [`ConfigWriteError::InvalidKey`].
     ///
     /// The decoration of the value being replaced is carried over: the
-    /// trailing comment of a key belongs to the key, not to the value
-    /// it holds, and dropping it would silently strip the operator's
-    /// notes from the file.
-    ///
-    /// A leaf that holds a table on disk is not replaced by a value:
-    /// the write would drop every key under it. Such a collision is
-    /// refused with [`ConfigWriteError::SectionConflict`].
+    /// trailing comment of a key belongs to the key, not to the value it
+    /// holds, and dropping it would silently strip the operator's notes
+    /// from the file. A leaf that holds a table on disk is not replaced by
+    /// a value, the write would drop every key under it; such a collision
+    /// is refused with [`ConfigWriteError::SectionConflict`].
     pub fn set(&mut self, dotted: &str, mut value: Item) -> Result<(), ConfigWriteError> {
-        // One pass over the dotted key: any empty segment — the empty
-        // key itself, a leading or trailing dot, a doubled one — is
-        // rejected. Empty segments would write keys with no name into
-        // the file and toml_edit would parse them back fine, but the
-        // operator cannot have meant to do that.
+        // One pass over the dotted key: any empty segment is rejected
+        // Empty segments would write keys with no name into the file and
+        // toml_edit would parse them back fine, but the operator cannot
+        // have meant to do that
         if dotted.split('.').any(str::is_empty) {
             return Err(ConfigWriteError::InvalidKey(dotted.into()));
         }
         let segments: Vec<&str> = dotted.split('.').collect();
-
-        // Walk into the parent table, creating intermediates if needed.
         let mut current = self.doc.as_table_mut();
         for &segment in &segments[..segments.len() - 1] {
             current = enter_or_create_table(current, segment, dotted)?;
@@ -329,7 +302,6 @@ impl EditableConfig {
                 key: dotted.to_string(),
             });
         }
-        // Carry the old decoration over to the replacement.
         if let Some(old) = current
             .get(leaf)
             .and_then(|item| item.as_value())
@@ -342,44 +314,36 @@ impl EditableConfig {
         Ok(())
     }
 
-    /// Atomic save: write to a sibling `.<name>.tmp.<pid>.<n>` and
-    /// rename over the original. Falls back to direct `write` on
-    /// filesystems that reject `rename` (some NFS / SMB mounts); the
-    /// atomicity and the durability guarantees hold on the rename path
-    /// only, the direct write keeps the original inode.
+    /// Atomic save: write to a sibling `.<name>.tmp.<pid>.<n>` and rename
+    /// over the original. Falls back to direct `write` on filesystems that
+    /// reject `rename` (some NFS / SMB mounts); the atomicity and durability
+    /// guarantees hold on the rename path only, the direct write keeps the
+    /// original inode.
     ///
-    /// The tmp is fsynced before the rename and the parent dir after
-    /// it, so a committed save survives a crash. A failed save leaves
-    /// no tmp behind — unless the direct-write fallback failed too, in
-    /// which case the tmp stays on the disk holding the new content and
-    /// its path is logged: the direct write never truncates the
-    /// original up front, so neither the previous nor the new version
-    /// of the file is lost.
+    /// The tmp is fsynced before the rename and the parent dir after it, so
+    /// a committed save survives a crash. A failed save leaves no tmp
+    /// behind, unless the direct-write fallback failed too: the direct write
+    /// never truncates the original up front, so neither the previous nor
+    /// the new version of the file is lost, and the tmp stays on the disk
+    /// with its path logged.
     ///
-    /// The document is checked against the config model before anything
-    /// is written: a file the binaries refuse to load aborts both of
-    /// them at the next start, so a save that would produce one is
-    /// refused here, where the operator can still fix it.
-    ///
-    /// The file is fingerprinted again before the write. A file that
-    /// changed since [`Self::load`] carries somebody else's edit, and
-    /// the save is refused with [`ConfigWriteError::Conflict`] rather
+    /// The document is checked against the config model before anything is
+    /// written, and the file is fingerprinted again before the write: a
+    /// file that changed since [`Self::load`] carries somebody else's edit,
+    /// and the save is refused with [`ConfigWriteError::Conflict`] rather
     /// than overwriting it.
     ///
-    /// Tmp-file uniqueness: the name carries the process id and a
-    /// counter, so two concurrent saves from the same admin server
-    /// process (a double-click on the form button, or a retry
-    /// fire-and-forget) cannot race for the same file. The file is
-    /// created with `create_new`, so a name that is already taken is
-    /// retried with the next counter value instead of overwriting
-    /// somebody else's tmp.
+    /// The tmp name carries the process id and a counter, and the file is
+    /// created with `create_new`, so two concurrent saves from the same
+    /// admin server process (a double-click on the form button) cannot race
+    /// for the same file; a taken name is retried with the next counter
+    /// value instead of overwriting somebody else's tmp.
     pub fn save(&mut self) -> Result<(), ConfigWriteError> {
         let serialized = self.doc.to_string();
 
-        // The document must be one the binaries can load. The panel
-        // writes the file verbatim and the next start of both binaries
-        // aborts on anything the config model refuses, so a save that
-        // would produce such a file is refused here.
+        // The document must be one the binaries can load: they write the
+        // file verbatim and abort at the next start on anything the config
+        // model refuses
         if let Err(err) = crate::config::parse_document(&serialized) {
             return Err(ConfigWriteError::InvalidDocument {
                 path: self.path.clone(),
@@ -387,9 +351,8 @@ impl EditableConfig {
             });
         }
 
-        // The file must not have changed under us: the document in hand
-        // is a snapshot of a file that no longer exists, and writing it
-        // would drop whatever landed in the meantime.
+        // The file must not have changed under us: writing a stale snapshot
+        // would drop whatever landed in the meantime
         if fingerprint(&self.path) != self.fingerprint {
             return Err(ConfigWriteError::Conflict {
                 path: self.path.clone(),
@@ -409,17 +372,16 @@ impl EditableConfig {
         // The rename swaps the inode, and the tmp file was created by
         // this process: hand it the owner and the group of the config it
         // replaces, so the save does not silently transfer the file (and
-        // the admin token in it) to the server's user.
+        // the admin token in it) to the server's user
         if let Err(err) = mirror_owner(&self.path, &tmp_path) {
             tracing::warn!(
                 error = %err,
                 path = %self.path.display(),
                 "could not give the temporary file the original's owner; writing through the original file instead"
             );
-            // No rename here: the tmp still carries this process's
-            // owner, swapping it in would hand the config to the
-            // server's user. The direct write keeps the tmp until it
-            // has taken, so a failure loses neither version of the file.
+            // No rename here: the tmp still carries this process's owner,
+            // swapping it in would hand the config to the server's user
+            // The direct write keeps the tmp until it has taken
             commit_direct(&self.path, &tmp_path, serialized.as_bytes())?;
             sync_parent_dir(parent);
             self.fingerprint = fingerprint(&self.path);
@@ -438,12 +400,10 @@ impl EditableConfig {
         Ok(())
     }
 
-    /// Write the temporary file and return its path.
-    ///
-    /// The name carries the writer's pid and a counter, so two writers
-    /// never pick the same one. `create_new` turns a collision into an
-    /// error rather than a silent overwrite of somebody else's tmp,
-    /// and the name is retried with the next counter value.
+    /// Write the temporary file and return its path. The name carries the
+    /// writer's pid and a counter, `create_new` turns a collision into an
+    /// error rather than a silent overwrite of somebody else's tmp, and the
+    /// name is retried with the next counter value.
     fn write_tmp(
         &self,
         parent: &Path,
@@ -456,12 +416,11 @@ impl EditableConfig {
             match write_tmp_preserving_mode(&self.path, &tmp, bytes) {
                 Ok(()) => return Ok(tmp),
                 // Somebody else holds the name: take the next one. The
-                // file on disk is not ours, so it is left alone.
+                // file on disk is not ours, so it is left alone
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                // A permission denial or a read-only mount is the
-                // config directory refusing new files, the panel's
-                // read-only answer naming the config; the rest carries
-                // the tmp path the write failed on.
+                // A permission denial or a read-only mount is the config
+                // directory refusing new files, the panel's read-only
+                // answer naming the config; the rest carries the tmp path
                 Err(e) => return Err(save_io_error(&self.path, tmp, e)),
             }
         }
@@ -497,12 +456,10 @@ const TMP_NAME_ATTEMPTS: u32 = 8;
 static EDITOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Exclusive advisory lock on the config, held for the whole
-/// read-modify-write cycle.
-///
-/// The lock lives in a sibling file so every process that opens the
-/// same config contends for it: the admin panel is not the only writer
-/// of this file. The kernel drops the lock when the descriptor is
-/// closed, so a crashed writer does not wedge the file.
+/// read-modify-write cycle. The lock lives in a sibling file so every
+/// process that opens the same config contends for it, and the kernel drops
+/// it when the descriptor is closed, so a crashed writer does not wedge the
+/// file.
 enum ConfigLock {
     /// Unix: an exclusive `flock` on the sibling lock file. The
     /// descriptor is held for its drop side effect: closing it is what
@@ -515,12 +472,11 @@ enum ConfigLock {
 }
 
 impl ConfigLock {
-    /// Take the lock for `path`.
-    ///
-    /// A config directory that cannot hold the lock file (a read-only
-    /// mount, `FUMOX_CONFIG_ACCESS=ro`) yields no lock at all: the
-    /// panel cannot write there anyway, and the fingerprint check still
-    /// refuses a write that would drop somebody else's change.
+    /// Take the lock for `path`. A config directory that cannot hold the
+    /// lock file (a read-only mount, `FUMOX_CONFIG_ACCESS=ro`) yields no
+    /// lock at all: the panel cannot write there anyway, and the
+    /// fingerprint check still refuses a write that would drop somebody
+    /// else's change.
     #[cfg(unix)]
     fn acquire(path: &Path) -> Option<Self> {
         use std::os::fd::AsRawFd;
@@ -533,7 +489,7 @@ impl ConfigLock {
             Ok(file) => file,
             Err(err) => {
                 // The directory may be read-only while the lock file is
-                // still there: a read-only descriptor can be locked.
+                // still there: a read-only descriptor can be locked
                 match std::fs::File::open(&lock_path) {
                     Ok(file) => file,
                     Err(_) => {
@@ -547,7 +503,7 @@ impl ConfigLock {
                 }
             }
         };
-        // SAFETY: `file` owns a valid descriptor for the lock file.
+        // SAFETY: `file` owns a valid descriptor for the lock file
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
@@ -580,13 +536,12 @@ fn lock_file_path(path: &Path) -> PathBuf {
     parent.join(format!(".{name}.lock"))
 }
 
-/// Fingerprint of the bytes at `path`: the hex sha256 of the file, or
-/// the empty string when the file does not exist.
-///
-/// The panel sends the fingerprint of the file it rendered with the
-/// form and refuses the submit when the file on disk no longer
-/// matches: an operator who edited `app.toml` by hand in the meantime
-/// would otherwise lose that edit to the stale form.
+/// Fingerprint of the bytes at `path`: the hex sha256 of the file, or the
+/// empty string when the file does not exist. The panel sends the
+/// fingerprint of the file it rendered with the form and refuses the submit
+/// when the file on disk no longer matches, so an operator who edited
+/// `app.toml` by hand in the meantime does not lose that edit to the stale
+/// form.
 pub fn fingerprint(path: &Path) -> String {
     match std::fs::read(path) {
         Ok(bytes) => hex_digest(&bytes),
@@ -623,21 +578,19 @@ fn line_col_at(text: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// Name of the sibling temporary file a save writes through.
-///
-/// Hidden (a leading dot) so it does not sit in a directory listing
-/// next to the real config, and it carries the writer's pid so a stale
-/// file can be attributed to a process that is gone.
+/// Name of the sibling temporary file a save writes through: hidden (a
+/// leading dot) so it does not sit in a directory listing next to the real
+/// config, and carrying the writer's pid so a stale file can be attributed
+/// to a process that is gone.
 fn tmp_name(file_name: &str, pid: u32, n: u64) -> String {
     format!(".{file_name}.tmp.{pid}.{n:x}")
 }
 
-/// Remove the leftover temporary files of writers that are gone.
-///
-/// A save that died between creating the tmp and renaming it leaves a
-/// copy of the config behind, and the config carries `[admin].token`.
-/// The tmp files are named `.<name>.tmp.<pid>.<n>`, so the pid says
-/// who wrote it: a pid that is not alive any more cannot be writing.
+/// Remove the leftover temporary files of writers that are gone. A save
+/// that died between creating the tmp and renaming it leaves a copy of the
+/// config behind, and the config carries `[admin].token`. The tmp files are
+/// named `.<name>.tmp.<pid>.<n>`, so a pid that is not alive any more
+/// cannot be writing.
 pub fn cleanup_stale_tmp_files(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -684,44 +637,37 @@ fn tmp_name_pid(name: &str) -> Option<u32> {
 /// Is the process with this pid still running?
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 only probes for existence, it never signals.
+    // SAFETY: signal 0 only probes for existence, it never signals
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
     }
-    // The process exists but belongs to another user.
+    // The process exists but belongs to another user
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
 fn process_is_alive(_pid: u32) -> bool {
     // Without a way to probe for a live process, a leftover file is
-    // kept: removing a file a live writer still needs would break it.
+    // kept: removing a file a live writer still needs would break it
     true
 }
 
 /// Write the tmp file with the original file's permission mode.
 ///
 /// `save` commits by renaming the tmp over the original, which swaps the
-/// inode: whatever mode the operator put on the config file would
-/// silently decay to the umask default (typically 0644) on the first
-/// admin-panel save. The file carries `[admin].token`, the same class
-/// of plaintext secret for which `db.rs` deliberately hard-codes 0600 on
-/// the SQLite file, so a hardened 0600 `app.toml` becoming world-readable
-/// exposes the token to every local user (security review f5). The mode is
-/// applied at tmp creation, so the file holding the token is never briefly
-/// world-readable between a write and a chmod.
+/// inode: whatever mode the operator put on the config file would silently
+/// decay to the umask default (typically 0644) on the first admin-panel
+/// save. The file carries `[admin].token`, so a hardened 0600 `app.toml`
+/// becoming world-readable exposes the token to every local user (security
+/// review f5). The mode is applied at tmp creation, so the file holding the
+/// token is never briefly world-readable between a write and a chmod.
 ///
-/// A missing original (the *Create from defaults* path) gets 0600: the
-/// file is created from a document that may carry the admin token, so it
-/// starts private rather than world-readable.
-///
-/// The body is fsynced before the handle drops: the save commits by rename,
-/// and without the flush a crash could leave a truncated config in place.
-///
-/// The file is created with `create_new`, so a name that is taken is an
-/// error rather than an overwrite of somebody else's tmp. A failure
-/// after the creation removes the file again: it is a copy of the
+/// A missing original (the *Create from defaults* path) gets 0600, and the
+/// body is fsynced before the handle drops, so a crash cannot leave a
+/// truncated config in place. The file is created with `create_new`, so a
+/// taken name is an error rather than an overwrite of somebody else's tmp;
+/// a failure after the creation removes the file again, it is a copy of the
 /// config, with the token in it.
 #[cfg(unix)]
 fn write_tmp_preserving_mode(original: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -736,12 +682,10 @@ fn write_tmp_preserving_mode(original: &Path, tmp: &Path, bytes: &[u8]) -> std::
         .create_new(true)
         .mode(mode)
         .open(tmp)?;
-    // The kernel masks the creation mode with the process umask, so a
-    // 0660 config under the usual 022 umask would come back 0640. The
-    // exact bits are set again on the descriptor: `fchmod` is not
-    // umasked. The mode is applied before the bytes, so the file
-    // holding the token is never briefly more permissive than the
-    // original.
+    // The kernel masks the creation mode with the process umask, so a 0660
+    // config under the usual 022 umask would come back 0640. The exact bits
+    // are set again on the descriptor: `fchmod` is not umasked, and the
+    // mode is applied before the bytes
     let result = file
         .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
         .and_then(|()| file.write_all(bytes))
@@ -765,16 +709,12 @@ fn write_tmp_preserving_mode(_original: &Path, tmp: &Path, bytes: &[u8]) -> std:
     result
 }
 
-/// Commit the save: rename the committed tmp over the config, or fall
-/// back to a direct write when the filesystem rejects the rename.
-///
-/// `rename` and `commit` are injected so tests can force either half
-/// to fail. On success the tmp is gone — renamed away, or removed
-/// after the direct write took over. When the fallback fails too, the
-/// tmp stays on the disk holding the new content and its path is
-/// logged: the original keeps its bytes (the direct write never
-/// truncates up front) and the new version is recoverable by hand
-/// instead of being lost with the tmp.
+/// Commit the save: rename the committed tmp over the config, or fall back
+/// to a direct write when the filesystem rejects the rename. `rename` and
+/// `commit` are injected so tests can force either half to fail. When the
+/// fallback fails too, the tmp stays on the disk holding the new content
+/// and its path is logged: the original keeps its bytes (the direct write
+/// never truncates up front) and the new version is recoverable by hand.
 fn commit_save<R, C>(
     path: &Path,
     tmp: &Path,
@@ -787,12 +727,10 @@ where
     C: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
 {
     if let Err(e) = rename(tmp, path) {
-        // Atomic rename is not universally supported. If it fails,
-        // do a plain write and remove the tmp, losing atomicity is
-        // preferable to losing the change. The user gets a warning
-        // in the logs and may decide to back the file up first.
-        // The direct write keeps the original inode, so the file's
-        // permissions survive this path without extra work.
+        // Atomic rename is not universally supported. If it fails, do a
+        // plain write and remove the tmp, losing atomicity is preferable to
+        // losing the change. The direct write keeps the original inode, so
+        // the file's permissions survive this path without extra work
         tracing::warn!(
             error = %e,
             path = %path.display(),
@@ -863,17 +801,15 @@ fn save_io_error(unwritable: &Path, io_path: PathBuf, source: std::io::Error) ->
 }
 
 /// Commit the save through the original inode instead of renaming a
-/// temporary file over it.
+/// temporary file over it. The write is not atomic (a reader can observe a
+/// partially written file) but it is the fallback when the temporary file
+/// cannot take over the original's ownership, and it keeps the owner and
+/// the mode the operator put on the config.
 ///
-/// The write is not atomic: a reader can observe a partially written
-/// file. It is the fallback for the case where the temporary file
-/// cannot take over the original's ownership, and it keeps the owner
-/// and the mode the operator put on the config.
-///
-/// The file is not truncated up front: the bytes land first and the
-/// tail is cut to the written length after them, so a write that dies
-/// half-way leaves the old content behind the partial new prefix
-/// instead of an empty or truncated file.
+/// The file is not truncated up front: the bytes land first and the tail is
+/// cut to the written length after them, so a write that dies half-way
+/// leaves the old content behind the partial new prefix instead of an empty
+/// file.
 fn commit_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -883,15 +819,13 @@ fn commit_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Give the temporary file the owner and the group of the config it is
-/// about to replace.
+/// about to replace. A rename swaps the inode, and the temporary file was
+/// created by this process: without this the first admin save silently
+/// hands the config (and the token in it) to the server's user.
 ///
-/// A rename swaps the inode, and the temporary file was created by this
-/// process: without this the first admin save silently hands the config
-/// (and the token in it) to the server's user.
-///
-/// The error is reported rather than swallowed: the caller falls back
-/// to writing through the original inode, which keeps the ownership at
-/// the cost of atomicity.
+/// The error is reported rather than swallowed: the caller falls back to
+/// writing through the original inode, which keeps the ownership at the
+/// cost of atomicity.
 #[cfg(unix)]
 fn mirror_owner(original: &Path, tmp: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -899,12 +833,12 @@ fn mirror_owner(original: &Path, tmp: &Path) -> std::io::Result<()> {
 
     let meta = match std::fs::metadata(original) {
         Ok(meta) => meta,
-        // Nothing to mirror: the config does not exist yet.
+        // Nothing to mirror: the config does not exist yet
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     let file = std::fs::OpenOptions::new().write(true).open(tmp)?;
-    // SAFETY: `file` owns a valid descriptor.
+    // SAFETY: `file` owns a valid descriptor
     let rc = unsafe { libc::fchown(file.as_raw_fd(), meta.uid(), meta.gid()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
@@ -963,14 +897,11 @@ fn sync_parent_dir(dir: &Path) {
 #[cfg(not(unix))]
 fn sync_parent_dir(_dir: &Path) {}
 
-/// Move `current` into the table at `segment`.
-///
-/// An absent slot gets an empty table, so the caller can write a key
-/// into a section the file does not have yet. A slot that holds a
-/// value is left alone: the caller cannot write a key under it, and
-/// the write is refused with
-/// [`ConfigWriteError::SectionConflict`] naming the segment that
-/// collided.
+/// Move `current` into the table at `segment`. An absent slot gets an empty
+/// table, so the caller can write a key into a section the file does not
+/// have yet; a slot that holds a value is left alone, the caller cannot
+/// write a key under it, and the write is refused with
+/// [`ConfigWriteError::SectionConflict`] naming the segment that collided.
 fn enter_or_create_table<'a>(
     current: &'a mut Table,
     segment: &str,
@@ -988,11 +919,10 @@ fn enter_or_create_table<'a>(
         })
 }
 
-/// The answer of [`is_writable`] to "can the OS let us modify `path`?"
-///
+/// The answer of [`is_writable`] to "can the OS let us modify `path`?".
 /// Every variant but [`Writability::Writable`] names the reason of the
-/// refusal, and every refusal is logged at `warn` with the path — the
-/// panel disables the editor on a refusal, the log says why.
+/// refusal, and every refusal is logged at `warn` with the path: the panel
+/// disables the editor on a refusal, the log says why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Writability {
     /// Writes land: the file opened for write, or the directory took a
@@ -1009,32 +939,28 @@ pub enum Writability {
 }
 
 /// Can the OS let us modify `path`? Either the file exists and its
-/// permissions allow writes, or it does not exist and its parent
-/// directory is writable (a brand-new file can be created there), or
-/// `path` is a directory and we can create entries in it.
+/// permissions allow writes, or it does not exist and its parent directory
+/// is writable (a brand-new file can be created there), or `path` is a
+/// directory and we can create entries in it.
 ///
-/// The directory case is not hypothetical: the admin panel's *Create
-/// from defaults* handler asks about the config *directory*, because
-/// the file it is about to create is not there yet. Opening a
-/// directory `O_WRONLY` fails with `EISDIR` on Linux and macOS, so a
-/// directory must be probed like the missing-file case instead of
-/// being run through the file's open-for-write fast path.
+/// The directory case is not hypothetical: the admin panel's *Create from
+/// defaults* handler asks about the config *directory*, because the file it
+/// is about to create is not there yet. Opening a directory `O_WRONLY`
+/// fails with `EISDIR` on Linux and macOS, so a directory must be probed
+/// like the missing-file case instead of being run through the file's
+/// open-for-write fast path.
 ///
-/// The fast path checks the inode's `readonly` flag; the slow path
-/// actually attempts an open-for-write (or a probe file in the
-/// directory when the target is missing or is a directory) so a
-/// read-only filesystem mount, the docker `:ro` case, where metadata
-/// still looks writable but the kernel rejects every write with
-/// `EROFS`, is detected too. A refusal comes back as the
-/// [`Writability`] variant naming why, every refusal is logged at
-/// `warn` with the path and the cause; the `Err` arm is a probe that
-/// failed for another reason, the raw error is the reason.
+/// The fast path checks the inode's `readonly` flag; the slow path actually
+/// attempts an open-for-write (or a probe file in the directory when the
+/// target is missing or is a directory) so a read-only filesystem mount,
+/// where metadata still looks writable but the kernel rejects every write
+/// with `EROFS`, is detected too. Every refusal is logged at `warn` with
+/// the path and the cause.
 ///
-/// **Advisory only.** The check does not consult POSIX mode bits or
-/// ACLs and is meaningless for `root`, which writes regardless. Use
-/// it to decide whether to render the editor with enabled or disabled
-/// controls, not as an access-control gate, `save()` re-checks errors
-/// at write time.
+/// **Advisory only.** The check does not consult POSIX mode bits or ACLs
+/// and is meaningless for `root`, which writes regardless. Use it to decide
+/// whether to render the editor with enabled or disabled controls, not as
+/// an access-control gate, `save()` re-checks errors at write time.
 pub fn is_writable(path: &Path) -> Result<Writability, std::io::Error> {
     is_writable_with(path, &can_open_for_write, &create_probe_file)
 }
@@ -1050,7 +976,7 @@ fn is_writable_with(
 ) -> Result<Writability, std::io::Error> {
     match std::fs::metadata(path) {
         // Asked about a directory, so answer the question that matters:
-        // can we put a new entry in it?
+        // can we put a new entry in it
         Ok(md) if md.is_dir() => can_create_in_with(path, probe_dir),
         Ok(md) => {
             if md.permissions().readonly() {
@@ -1060,11 +986,9 @@ fn is_writable_with(
                 );
                 return Ok(Writability::ReadOnlyMode);
             }
-            // Open for write: Linux returns `EROFS` on a read-only
-            // mount (e.g. docker `:ro`) without performing any I/O,
-            // macOS at the VFS layer. A refused open is the
-            // read-only-mount answer when the kernel says so, any
-            // other failure is reported as-is.
+            // Open for write: Linux returns `EROFS` on a read-only mount
+            // (e.g. docker `:ro`) without performing any I/O, macOS at the
+            // VFS layer. Any other failure is reported as-is
             open_for_write(path)
                 .map(|()| Writability::Writable)
                 .or_else(|e| {
@@ -1087,7 +1011,7 @@ fn is_writable_with(
         }
         // File missing, the target's parent must accept new files. A
         // bare relative name ("app.toml") has an empty parent, which is
-        // the current directory, not the filesystem root.
+        // the current directory, not the filesystem root
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let dir = path
                 .parent()
@@ -1146,7 +1070,7 @@ fn dir_probe_verdict(
     match probe {
         Ok(()) => Ok(Writability::Writable),
         // The probe name is taken: somebody else managed to create a
-        // file in this directory, which is the very question asked.
+        // file in this directory, which is the very question asked
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Writability::Writable),
         Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
             tracing::warn!(
@@ -1174,9 +1098,8 @@ static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 /// Drop a throwaway probe file into `dir`, the probe
 /// [`can_create_in_with`] runs. The name carries the pid, a random
-/// component and the counter: two processes probing the same directory
-/// (a restart, a second instance in the same container) pick different
-/// names, and two probes in this process cannot race for one either.
+/// component and the counter, so two processes probing the same directory
+/// and two probes in this process cannot race for one name.
 fn create_probe_file(dir: &Path) -> std::io::Result<()> {
     let probe = dir.join(format!(
         ".fumox-write-probe-{}-{:x}-{}",
@@ -1193,18 +1116,16 @@ fn create_probe_file(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write `contents` to `path` through the same atomic path a save
-/// takes: a temporary file in the same directory, fsynced, then moved
-/// into place. The config file can carry `[admin].token`, so it must
-/// never exist world-readable, not even for the moment between the
-/// create and a later chmod: the mode is set at creation time.
+/// Write `contents` to `path` through the same atomic path a save takes: a
+/// temporary file in the same directory, fsynced, then moved into place.
+/// The config file can carry `[admin].token`, so it must never exist
+/// world-readable, not even for the moment between the create and a later
+/// chmod: the mode is set at creation time.
 ///
-/// An existing file is never overwritten. The check runs under the
-/// same advisory lock the editor takes, so a create cannot race the
-/// *Edit settings* form for the same path.
-///
-/// On non-Unix platforms the platform's ACL model governs and the mode
-/// is not applied.
+/// An existing file is never overwritten. The check runs under the same
+/// advisory lock the editor takes, so a create cannot race the *Edit
+/// settings* form for the same path. On non-Unix platforms the platform's
+/// ACL model governs and the mode is not applied.
 pub fn create_private_file_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let _lock = ConfigLock::acquire(path);
     if path.exists() {
@@ -1255,13 +1176,12 @@ pub fn create_private_file_atomic(path: &Path, contents: &str) -> std::io::Resul
 }
 
 /// The reference `app.toml` shipped inside the crate
-/// (`crates/fumox-core/reference/app.toml`). Embedded at compile time
-/// so the admin panel's *Create from defaults* button can bootstrap a
-/// fresh checkout without depending on the working directory layout at
-/// runtime — and so the crate builds and packages without reaching for
-/// a file outside it. `config/app.toml` at the repository root is the
-/// deployable example the guides tell operators to copy; keep it in
-/// sync with the embedded reference.
+/// (`crates/fumox-core/reference/app.toml`), embedded at compile time so
+/// the admin panel's *Create from defaults* button can bootstrap a fresh
+/// checkout without depending on the working directory layout at runtime.
+/// `config/app.toml` at the repository root is the deployable example the
+/// guides tell operators to copy; keep it in sync with the embedded
+/// reference.
 pub const REFERENCE_CONFIG: &str = include_str!("../reference/app.toml");
 
 /// Convenience builders for the leaf values the editor page writes.
@@ -1331,7 +1251,7 @@ mod tests {
 
         // A second create must not overwrite what is there: the panel
         // offers the button only for a missing file, and a create that
-        // clobbered an existing config would lose the operator's edits.
+        // clobbered an existing config would lose the operator's edits
         let err =
             create_private_file_atomic(&path, "[server]\nbind = \"0.0.0.0:1\"\n").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
@@ -1343,7 +1263,7 @@ mod tests {
         );
 
         // No temporary file is left behind next to the config. The
-        // advisory lock file is not one: it is the lock, not a leftover.
+        // advisory lock file is not one: it is the lock, not a leftover
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -1361,9 +1281,8 @@ mod tests {
     #[test]
     fn load_preserves_comments_in_reference_config() {
         // `config/app.toml` ships with RU/EN banner comments. Loading it
-        // through `DocumentMut` must keep at least the top-of-file
-        // banner, that is the whole point of round-tripping through
-        // `toml_edit`.
+        // through `DocumentMut` must keep the top-of-file banner, that is
+        // the whole point of round-tripping through `toml_edit`
         let doc = DocumentMut::from_str(super::REFERENCE_CONFIG).expect("reference must parse");
         let rendered = doc.to_string();
         assert!(rendered.contains("# Fumox"), "top-of-file banner lost");
@@ -1463,7 +1382,7 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("127.0.0.1:9999"));
 
-        // No stray tmp files left behind.
+        // No stray tmp files left behind
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1475,9 +1394,9 @@ mod tests {
     }
 
     /// Regression: a failed rename + failed fallback write used to leak the
-    /// tmp (a config copy with `[admin].token]`). The save refuses before
-    /// it writes anything when the file changed under it, so nothing is
-    /// left behind.
+    /// tmp (a config copy with `[admin].token`). The save refuses before it
+    /// writes anything when the file changed under it, so nothing is left
+    /// behind.
     #[test]
     fn a_refused_save_leaves_no_tmp_behind() {
         let dir = tmp_dir("fallback-leak");
@@ -1540,7 +1459,7 @@ mod tests {
         std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
         let stale = dir.join(".app.toml.tmp.999999.1");
         std::fs::write(&stale, b"[admin]\ntoken = \"secret\"\n").unwrap();
-        // A tmp of a live writer (this process) stays.
+        // A tmp of a live writer (this process) stays
         let live = dir.join(tmp_name("app.toml", std::process::id(), 0));
         std::fs::write(&live, b"[admin]\ntoken = \"secret\"\n").unwrap();
 
@@ -1552,11 +1471,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Regression (security review f5): the save commits by renaming a
-    /// fresh tmp file over the original, which swaps the inode, a mode
-    /// the operator put on the file (0600 over the file that carries
-    /// `[admin].token`) used to silently decay to the umask default on
-    /// the first save.
+    /// Regression (security review f5): the save commits by renaming a fresh
+    /// tmp file over the original, which swaps the inode, so the mode the
+    /// operator put on the file (0600 over the file that carries
+    /// `[admin].token`) used to silently decay to the umask default.
     #[cfg(unix)]
     #[test]
     fn save_preserves_the_original_file_mode() {
@@ -1575,7 +1493,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "save() downgraded the file mode");
         // The tmp file is created with the preserved mode directly, so no
-        // world-readable snapshot of the config ever exists next to it.
+        // world-readable snapshot of the config ever exists next to it
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1635,7 +1553,7 @@ mod tests {
         let dir = tmp_dir("missing");
         let path = dir.join("app.toml");
         let cfg = EditableConfig::load(&path).unwrap();
-        // Empty doc, no parse error.
+        // Empty doc, no parse error
         assert!(cfg.doc().to_string().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1665,7 +1583,7 @@ mod tests {
             panic!("expected Parse, got {err:?}");
         }
         // The Display carries the file:line:column an editor can jump
-        // to, plus the parser's own message.
+        // to, plus the parser's own message
         let text = err.to_string();
         assert!(
             text.contains(&path.display().to_string()) && text.contains("parse error"),
@@ -1681,15 +1599,15 @@ mod tests {
     #[test]
     fn parse_error_line_and_column_point_at_the_failure() {
         // Offset 13 is the `s` of `[server`, one character (`[`) stands
-        // before it on the line.
+        // before it on the line
         let (line, column) = line_col_at("a = 1\nb = 2\n[server\n", 13);
         assert_eq!((line, column), (3, 2));
         // A RU comment before the failure must not shift the column:
         // offset 29 is the `x` of `b = x`, four characters stand before
-        // it on the line, the comment's bytes stay on their own line.
+        // it on the line, the comment's bytes stay on their own line
         let (line, column) = line_col_at("# комментарий\nb = x\n", 29);
         assert_eq!((line, column), (2, 5));
-        // Offsets past the text or inside a character are pulled back.
+        // Offsets past the text or inside a character are pulled back
         assert_eq!(line_col_at("ab", 100), (1, 3));
         assert_eq!(line_col_at("я", 1), (1, 1), "offset 1 is inside `я`");
     }
@@ -1716,13 +1634,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Regression: the *Create from defaults* handler asks about the
-    /// config *directory*, not the file it is about to create in it
-    /// (`settings.rs` passes `target.parent()`). Opening a directory
-    /// `O_WRONLY` fails with `EISDIR` on Linux and macOS, so the
-    /// open-for-write fast path reported "not writable" for a directory
-    /// the process can obviously write into and the create button was
-    /// permanently broken.
+    /// Regression: the *Create from defaults* handler asks about the config
+    /// *directory* (`settings.rs` passes `target.parent()`), and opening a
+    /// directory `O_WRONLY` fails with `EISDIR` on Linux and macOS, so the
+    /// open-for-write fast path permanently broke the create button for a
+    /// directory the process can obviously write into.
     #[test]
     fn is_writable_returns_true_for_writable_directory() {
         let dir = tmp_dir("writable-dir");
@@ -1758,15 +1674,12 @@ mod tests {
     /// file, and the write button has no double-submit guard, so two
     /// overlapping submissions used to interleave as
     /// `load(A) load(B) save(A) save(B)` and the second save renamed a
-    /// document snapshotted before the first one landed. Both requests
-    /// reported success and one change was gone. The load -> mutate ->
-    /// save cycle has to be serialised for the whole process, the
-    /// per-save tmp counter only solved the tmp-file-name half of it.
+    /// document snapshotted before the first one landed; one change was
+    /// gone. The load -> mutate -> save cycle has to be serialised.
     ///
     /// Deterministic, no sleeps: the first submission signals that its
     /// snapshot is taken and holds the handle until the second signals
-    /// that it is at its load attempt, so the second always reaches the
-    /// locked file while the first still owns it.
+    /// that it is at its load attempt.
     #[test]
     fn overlapping_edits_do_not_lose_the_first_change() {
         let dir = tmp_dir("lost-update");
@@ -1783,7 +1696,7 @@ mod tests {
                     .unwrap();
                 // Our snapshot is taken and our change is not on disk
                 // yet. Hold the edit open until the second submission
-                // has reached its load attempt, then commit.
+                // has reached its load attempt, then commit
                 snapshot_tx.send(()).unwrap();
                 loading_rx.recv().unwrap();
                 cfg.save().unwrap();
@@ -1818,11 +1731,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The lock must not make the handle un-sendable: the admin server
-    /// holds it across the await points of a request, and a type that
-    /// is not `Send` cannot cross one. The advisory lock is held by an
-    /// owned descriptor rather than by a `MutexGuard`, which is what
-    /// keeps the handle `Send`.
+    /// The lock must not make the handle un-sendable: the admin server holds
+    /// it across the await points of a request, and a type that is not `Send`
+    /// cannot cross one. The advisory lock is held by an owned descriptor
+    /// rather than by a `MutexGuard`, which is what keeps the handle `Send`.
     #[test]
     fn the_editor_handle_is_send() {
         fn assert_send<T: Send>() {}
@@ -1846,7 +1758,7 @@ mod tests {
         )
         .unwrap();
 
-        // Live handle, editor lock held for as long as this binding.
+        // Live handle, editor lock held for as long as this binding
         let _cfg = EditableConfig::load(&path).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1856,7 +1768,7 @@ mod tests {
             tx.send(()).unwrap();
         });
 
-        // A lock the loader also took would block here until the timeout.
+        // A lock the loader also took would block here until the timeout
         let returned = rx.recv_timeout(std::time::Duration::from_secs(5));
         drop(_cfg);
 
@@ -1871,10 +1783,8 @@ mod tests {
     /// Regression: a docker `:ro` mount on a directory that has no file in
     /// it yet (the *Create from defaults* path) must surface as not
     /// writable so the button can be disabled. Modeled with a parent
-    /// directory whose mode strips write, on Linux this is the same
-    /// code path a docker `:ro` mount goes through (the kernel rejects
-    /// the open with `EROFS`); on macOS the permission-mode rejection
-    /// arrives as `EACCES` and the test still covers the contract.
+    /// directory whose mode strips write; on macOS the permission-mode
+    /// rejection arrives as `EACCES` and the test still covers the contract.
     #[cfg(unix)]
     #[test]
     fn is_writable_returns_false_when_probe_in_ro_parent_fails() {
@@ -1946,7 +1856,7 @@ mod tests {
     fn save_uses_unique_tmp_per_call() {
         // Five saves from the same process must end up with five
         // distinct tmp names; otherwise concurrent admin submissions
-        // would race for the same file.
+        // would race for the same file
         let dir = tmp_dir("unique-tmp");
         let path = dir.join("app.toml");
         std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
@@ -1960,7 +1870,7 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("127.0.0.1:4"), "final write must win");
 
-        // No leftover tmp files in the directory after the storm.
+        // No leftover tmp files in the directory after the storm
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1971,10 +1881,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A document the binaries would refuse at startup must not reach
-    /// the disk: the panel writes the file verbatim and both binaries
-    /// abort on the next start when the config does not load, so a
-    /// green toast for such a file is a lie.
+    /// A document the binaries would refuse at startup must not reach the
+    /// disk: the panel writes the file verbatim and both binaries abort on
+    /// the next start, so a green toast for such a file is a lie.
     #[test]
     fn a_save_that_would_not_load_is_refused() {
         let dir = tmp_dir("invalid-doc");
@@ -1982,7 +1891,7 @@ mod tests {
         std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
 
         let mut cfg = EditableConfig::load(&path).unwrap();
-        // A key the config model does not know: the loader refuses it.
+        // A key the config model does not know: the loader refuses it
         cfg.set("server.bynd", item::string("127.0.0.1:9999"))
             .unwrap();
 
@@ -1997,7 +1906,7 @@ mod tests {
             other => panic!("expected an invalid document, got {other:?}"),
         }
 
-        // The file on disk is untouched.
+        // The file on disk is untouched
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
             !on_disk.contains("bynd"),
@@ -2066,7 +1975,7 @@ mod tests {
         cfg.set("server.bind", item::string("127.0.0.1:9999"))
             .unwrap();
 
-        // Somebody edits the file while the form is open.
+        // Somebody edits the file while the form is open
         std::fs::write(
             &path,
             "[server]\nbind = \"0.0.0.0:8080\"\n[probe]\nfail_limit = 7\n",
@@ -2221,10 +2130,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The fallback fails too: neither version of the file may be lost.
-    /// The direct write never truncates up front, so the original keeps
-    /// its bytes, and the tmp holding the new content stays on the disk
-    /// with its path logged for recovery by hand.
+    /// The fallback fails too: neither version of the file may be lost. The
+    /// original keeps its bytes, and the tmp holding the new content stays
+    /// on the disk with its path logged for recovery by hand.
     #[test]
     fn a_failing_fallback_keeps_the_tmp_and_the_original() {
         let dir = tmp_dir("fallback-fail");
@@ -2341,12 +2249,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Regression: the tmp is created with `.mode(...)`, which the
-    /// kernel masks with the process umask — a 0660 config under the
-    /// usual 022 umask came back 0640 (the 0600 case the first mode
-    /// test covers is immune to that umask). The mode is now set again
-    /// on the descriptor, so the saved file carries exactly the
-    /// original's bits.
+    /// Regression: the tmp is created with `.mode(...)`, which the kernel
+    /// masks with the process umask, so a 0660 config under the usual 022
+    /// umask came back 0640. The mode is now set again on the descriptor,
+    /// so the saved file carries exactly the original's bits.
     #[cfg(unix)]
     #[test]
     fn save_preserves_the_exact_mode_bits() {
@@ -2442,9 +2348,8 @@ mod tests {
     }
 
     /// A read-only mount cannot be produced in CI, so the probe is
-    /// injected: directory metadata answers fine and the `create_new`
-    /// probe fails with the error kind the kernel reports for a
-    /// read-only mount — exactly the docker `:ro` case.
+    /// injected: directory metadata answers fine and the `create_new` probe
+    /// fails with the error kind the kernel reports for a read-only mount.
     #[test]
     fn a_readonly_mount_surfaces_as_not_writable_despite_good_metadata() {
         let dir = tmp_dir("erofs-probe");
@@ -2525,7 +2430,7 @@ mod tests {
     /// answer for the CWD.
     #[test]
     fn is_writable_answers_for_a_bare_relative_name() {
-        // The test binary's CWD is the crate root, which is writable.
+        // The test binary's CWD is the crate root, which is writable
         let result = is_writable(Path::new("app.toml"));
         assert!(
             matches!(result, Ok(Writability::Writable)),

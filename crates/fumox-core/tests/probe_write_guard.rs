@@ -5,10 +5,8 @@ use fumox_core::config::DatabaseConfig;
 use fumox_core::db;
 use fumox_core::tempdir_lite::TempDir;
 
-/// Asserts that the statement is refused by the authorizer.
-///
-/// `SQLITE_AUTH` (23) is what SQLite reports for a denied statement;
-/// its error string is "not authorized".
+/// Asserts that the statement is refused by the authorizer (`SQLITE_AUTH`
+/// (23), error string "not authorized").
 async fn assert_denied(pool: &db::DbPool, sql: &'static str, label: &str) {
     let error = sqlx::query(sql)
         .execute(pool)
@@ -29,7 +27,7 @@ async fn the_probe_may_change_the_health_status_but_not_the_content() {
         ..Default::default()
     };
 
-    // The server's pool owns the content.
+    // The server's pool owns the content
     let server = db::connect_pool(&cfg).await.unwrap();
     db::migrate(&server).await.unwrap();
     sqlx::query(
@@ -48,17 +46,16 @@ async fn the_probe_may_change_the_health_status_but_not_the_content() {
     .await
     .unwrap();
 
-    // The probe's pool shares the file but not the write access.
+    // The probe's pool shares the file but not the write access
     let probe = db::connect_probe_pool(&cfg).await.unwrap();
 
-    // Reading is unrestricted.
     let (host,): (String,) = sqlx::query_as("SELECT host FROM proxies WHERE fingerprint = 'fp1'")
         .fetch_one(&probe)
         .await
         .unwrap();
     assert_eq!(host, "origin.example");
 
-    // The health status is the probe's own.
+    // The health status is the probe's own
     sqlx::query(
         "UPDATE proxies SET status = 'alive', fail_count = 1, last_checked_at = 5, updated_at = 5
          WHERE fingerprint = 'fp1'",
@@ -67,7 +64,7 @@ async fn the_probe_may_change_the_health_status_but_not_the_content() {
     .await
     .expect("the probe owns the health status of a proxy");
 
-    // The subscription content does not belong to the probe.
+    // The subscription content does not belong to the probe
     assert_denied(
         &probe,
         "UPDATE proxies SET host = 'evil.example' WHERE fingerprint = 'fp1'",
@@ -93,7 +90,7 @@ async fn the_probe_may_change_the_health_status_but_not_the_content() {
     )
     .await;
 
-    // The probe may not add or remove subscription entries either.
+    // The probe may not add or remove subscription entries either
     assert_denied(
         &probe,
         "INSERT INTO proxies (fingerprint, scheme, host, port, created_at, updated_at)
@@ -116,7 +113,7 @@ async fn the_probe_may_change_the_health_status_but_not_the_content() {
     .await;
 
     // The server's own writes are untouched: the restriction lives on
-    // the probe's connections, not on the file.
+    // the probe's connections, not on the file
     sqlx::query("UPDATE proxies SET host = 'renamed.example' WHERE fingerprint = 'fp1'")
         .execute(&server)
         .await
@@ -175,8 +172,7 @@ async fn the_probe_may_write_its_own_bookkeeping() {
         .expect("the probe drains the request queue");
 
     // The T2 recency stamp is the probe's own bookkeeping on the proxy
-    // row: the journal write path keeps it up to date, so the recency
-    // batch can order by it without reading the history.
+    // row, kept up to date by the journal write path
     sqlx::query("UPDATE proxies SET last_t2_checked_at = 10 WHERE fingerprint = 'fp1'")
         .execute(&probe)
         .await
@@ -188,8 +184,8 @@ async fn the_probe_may_write_its_own_bookkeeping() {
             .unwrap();
     assert_eq!(stamp, Some(10));
 
-    // The same holds for the production write path: journalling a T2
-    // attempt refreshes the stamp on the proxy row.
+    // The production write path: journalling a T2 attempt refreshes the
+    // stamp on the proxy row
     let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = 'fp1'")
         .fetch_one(&probe)
         .await
@@ -227,7 +223,7 @@ async fn the_probe_applies_the_schema_before_its_connections_are_restricted() {
     };
 
     // The probe migrates on startup, before the server may have done
-    // it, so the restricted pool applies the schema itself.
+    // it, so the restricted pool applies the schema itself
     let probe = db::connect_probe_pool(&cfg).await.unwrap();
     let (tables,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'proxies'",
@@ -237,7 +233,7 @@ async fn the_probe_applies_the_schema_before_its_connections_are_restricted() {
     .unwrap();
     assert_eq!(tables, 1, "the schema must be in place");
 
-    // The schema is not the probe's to change afterwards.
+    // The schema is not the probe's to change afterwards
     assert_denied(
         &probe,
         "CREATE TABLE probe_scratch (id INTEGER PRIMARY KEY)",
@@ -259,7 +255,7 @@ async fn the_probe_cannot_reconfigure_the_shared_file_with_a_pragma() {
     db::migrate(&server).await.unwrap();
     let probe = db::connect_probe_pool(&cfg).await.unwrap();
 
-    // A pragma read is a read, like any other read.
+    // A pragma read is a read, like any other read
     let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
         .fetch_one(&probe)
         .await
@@ -269,7 +265,7 @@ async fn the_probe_cannot_reconfigure_the_shared_file_with_a_pragma() {
         "the connection's own configuration must be untouched"
     );
     // The introspection pragmas take an argument too, but theirs is the
-    // subject of the question, not a value to set.
+    // subject of the question, not a value to set
     let indexes = sqlx::query("PRAGMA index_list(proxies)")
         .fetch_all(&probe)
         .await
@@ -281,7 +277,7 @@ async fn the_probe_cannot_reconfigure_the_shared_file_with_a_pragma() {
 
     // A pragma with a value reconfigures what it names, and the ones
     // that name a file property write the shared file's header itself —
-    // outside every table the rules govern.
+    // outside every table the rules govern
     assert_denied(&probe, "PRAGMA user_version = 7", "stamping user_version").await;
     assert_denied(
         &probe,
@@ -296,7 +292,7 @@ async fn the_probe_cannot_reconfigure_the_shared_file_with_a_pragma() {
     assert_eq!(version, 0, "the pragma write must not have landed");
 
     // The schema is not the probe's to reshape either: the rename is
-    // refused before its `sqlite_master` writes are even compiled.
+    // refused before its `sqlite_master` writes are even compiled
     assert_denied(
         &probe,
         "ALTER TABLE proxies RENAME TO proxies_renamed",

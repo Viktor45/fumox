@@ -5,57 +5,44 @@ Input:  lines `date|sha|category|message` on stdin (the flat-draft template
         in cliff.toml, see the "Flat draft" comment there).
 Output: one `## <date> · sha-<last-commit-of-the-day>` section per day,
         Keep a Changelog categories (Added/Changed/Removed/Fixed/Security/Docs)
-        inside, oldest first, the hand-editing pass then rewrites the
-        terse commit subjects and trims whatever landed before the first
-        image was ever published.
+        inside, oldest first; the hand-editing pass then rewrites the terse
+        subjects into prose bullets.
 
 Why a script and not a pure git-cliff template: tera cannot group by a
 computed attribute (day = timestamp floored), and `group_by` on the raw
-timestamp yields one group per commit. The flat draft carries everything
-git-cliff parsed; the day-sectioning is trivial afterwards.
+timestamp yields one group per commit.
 
-Post-processing convention (see `.agents/AGENTS.md` → "Maintaining
-CHANGELOG.md" for the canonical rule):
-
-  - This script's output is the structural source of truth: section
-    anchors, dates, and category placement.
-  - The hand-editing pass rewrites the terse commit subjects into
-    prose-style multi-line bullets, one bullet per logical change.
-  - The output is OLDEST first (matching git-cliff's `sort_commits =
-    "oldest"`); when integrating into CHANGELOG.md, REVERSE the
-    dated sections so the freshest sits directly below the manual
-    `## Unreleased` block.
-  - New in-progress work (commits not yet on an image tag) lives in
-    a manual `## Unreleased (YYYY-MM-DD)` pre-block above the dated
-    sections; the hand-editing pass adds it there, not via this
-    pipeline.
-  - Pre-image commits are kept (no trim); do not delete early
-    sections even if they predate the first GHCR-published image.
+Convention (see `.agents/AGENTS.md` → "Maintaining CHANGELOG.md"):
+  - this output is the structural source of truth (anchors, dates, category
+    placement); the hand-editing pass rewrites subjects only
+  - output is OLDEST first (matching git-cliff's `sort_commits = "oldest"`),
+    so REVERSE the dated sections when integrating into CHANGELOG.md below
+    the manual `## Unreleased` block
+  - new in-progress work goes into that manual Unreleased pre-block, not
+    through this pipeline; pre-image sections are kept, never trimmed
 """
 import re
 import sys
 from collections import OrderedDict
 
 CATEGORIES = ["Added", "Changed", "Removed", "Fixed", "Security", "Docs"]
-# Internal (chore/dependabot merges) never changes the shipped image.
+# Internal (chore/dependabot merges) never changes the shipped image
 DROPPED = ["Internal"]
-# The date field of a draft line: the cliff template writes %Y-%m-%d.
-# Everything else is the draft's header, not a commit.
+# The date field of a draft line (the cliff template writes %Y-%m-%d),
+# everything else is the draft's header, not a commit
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-# The sha field: a full or abbreviated git object name, lowercase hex. A
-# header fragment that happens to carry three pipes must not reach the
-# section anchor (`## <date> · sha-<sha>`), where it would be printed as is.
+# A header fragment that happens to carry three pipes must not reach the
+# section anchor (`## <date> · sha-<sha>`), where it would be printed as is
 SHA = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def sanitize_message(message):
     """Fold a commit subject onto one line and defuse Markdown syntax.
 
-    A subject with a raw newline or tab would split the bullet, so
-    whitespace runs collapse to one space. `[`, `]`, `(` and `)` are
-    backslash-escaped: a subject that carries `[text](url)` would
-    otherwise be read as a Markdown link by every renderer that
-    re-parses CHANGELOG.md.
+    A raw newline or tab would split the bullet, so whitespace runs collapse
+    to one space. `[`, `]`, `(` and `)` are backslash-escaped: a subject
+    carrying `[text](url)` would be read as a Markdown link by renderers
+    that re-parse CHANGELOG.md.
     """
     message = re.sub(r"[\r\n\t ]+", " ", message).strip()
     return re.sub(r"([\[\]()])", r"\\\1", message)
@@ -64,11 +51,9 @@ def sanitize_message(message):
 def parse_draft(lines):
     """Yield (date, sha, category, message) for every draft line.
 
-    A line is a commit only when it has all four fields, a date that
-    looks like one and a sha that is a git object name. The header
-    git-cliff writes above the draft has no pipes at all, but a header
-    line that happens to carry three of them must not be mistaken for a
-    commit.
+    The checks below are not paranoia: the header git-cliff writes above the
+    draft has no pipes at all, but a header line that happens to carry three
+    must not be mistaken for a commit.
     """
     for line in lines:
         line = line.rstrip("\r\n")
@@ -90,18 +75,16 @@ def main() -> None:
         if category in DROPPED:
             continue
         if category not in CATEGORIES:
-            # A category outside the taxonomy: it keeps its own heading
-            # below, but it is worth naming, because a new category
-            # usually means a new commit-prefix convention.
+            # A new category usually means a new commit-prefix convention, so
+            # it is named in the note below instead of being dropped
             unknown.setdefault(category, None)
         days.setdefault(date, []).append((sha, category, message))
 
     for date in sorted(days):
         # The image tag carries the sha of the LAST commit of the batch
-        # (docker/metadata-action tags the built ref). Within a day the
+        # (docker/metadata-action tags the built ref), and within a day the
         # draft arrives in commit order (git-cliff sorts oldest first), so
-        # the last entry is the anchor; only the days themselves are
-        # re-ordered here, so the sections do not depend on input order.
+        # the last entry is the anchor
         commits = days[date]
         anchor = commits[-1][0]
         print(f"## {date} · sha-{anchor}\n")
@@ -115,9 +98,7 @@ def main() -> None:
             for message in by_cat[category]:
                 print(f"- {message}")
             print()
-        # Categories outside the taxonomy are printed under their own
-        # heading: a commit must not disappear because its category is
-        # new.
+        # A commit must not disappear because its category is new
         for category, messages in by_cat.items():
             if category in CATEGORIES:
                 continue

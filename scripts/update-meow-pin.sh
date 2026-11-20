@@ -1,37 +1,34 @@
 #!/usr/bin/env bash
 # Bump the pinned meow-rs release in every file that carries it.
 #
-# docker/meow/Dockerfile refuses to build without an explicit MEOW_VERSION
-# and the two sha256 sums of its musl archives, and the same three values
-# are duplicated as the compose build defaults (docker-compose.build.yml)
-# and the .env.example template. A bump that reaches only some of them
-# leaves the local build and the published image shipping different
-# kernels, so this rewrites all of them in one pass and fails when an
-# anchor is missing rather than half-applying the change.
+# docker/meow/Dockerfile refuses to build without an explicit MEOW_VERSION and
+# the two sha256 sums of its musl archives, and the same three values are
+# duplicated as the compose build defaults (docker-compose.build.yml) and the
+# .env.example template. A bump reaching only some of them leaves the local
+# build and the published image shipping different kernels, so this rewrites
+# all of them in one pass and fails when an anchor is missing rather than
+# half-applying the change.
 #
 # The sums are read from the `.sha256` assets the release publishes AND
 # checked against the downloaded archives before anything is written. No
 # workflow builds the meow image on a pull request (docker-meow.yml is
-# dispatch-only, docker.yml runs on tags), so this is the only place a bad
-# pin is caught before it merges. The published sum and the archive come
-# from the same release, so this proves the download is intact and the pin
-# is the one upstream published — reviewing the resulting PR remains the
-# trust boundary.
+# dispatch-only, docker.yml runs on tags), so this is the only place a bad pin
+# is caught before it merges; reviewing the resulting PR remains the trust
+# boundary.
 #
 # Usage:
 #   scripts/update-meow-pin.sh [--version <tag>]
 #
 # Without --version the newest meow-rs/meow-rs release is used: GitHub's
 # `releases/latest` endpoint skips drafts and prereleases, so a rolling
-# `Prerelease-Alpha` tag can never become the pin. Needs `gh` for the
-# lookup (authenticated, or GH_TOKEN set) and `curl` for the assets;
-# --version skips the lookup but still reads the sums.
+# `Prerelease-Alpha` tag can never become the pin. Needs `gh` for the lookup
+# (authenticated, or GH_TOKEN set) and `curl` for the assets; --version skips
+# the lookup but still reads the sums.
 #
 # Writes `updated`, `version`, `previous_version`, `sha256_amd64` and
-# `sha256_arm64` to $GITHUB_OUTPUT when it is set, so the calling workflow
-# can decide whether to open a pull request. An already-current pin is
-# not an error: it exits 0 with updated=false, leaves the tree alone and
-# downloads only the two tiny checksum files, not the archives.
+# `sha256_arm64` to $GITHUB_OUTPUT when it is set. An already-current pin is
+# not an error: it exits 0 with updated=false and downloads only the two tiny
+# checksum files, not the archives.
 
 set -euo pipefail
 
@@ -69,12 +66,12 @@ done
 if [ -z "$VERSION" ]; then
     VERSION="$(gh api repos/meow-rs/meow-rs/releases/latest --jq .tag_name)"
 fi
-# The same rule the build and merge jobs of docker-meow.yml apply, so a
-# tag this script accepts is a tag they accept.
+# The same rule the build and merge jobs of docker-meow.yml apply, so a tag
+# this script accepts is a tag they accept
 VERSION="$(scripts/validate-meow-version.sh "$VERSION")"
 
 # One ARG per value: `sed -n` printing two lines would make the comparison
-# below succeed against a concatenated string.
+# below succeed against a concatenated string
 read_pin() { # read_pin <arg name>
     local value
     value="$(sed -n "s/^ARG $1=//p" "$DOCKERFILE")"
@@ -105,16 +102,16 @@ RELEASE_BASE="https://github.com/meow-rs/meow-rs/releases/download/${VERSION}"
 
 # GNU coreutils on the runner, `shasum` on a stock macOS: the script is
 # exercised locally by scripts/tests/update-meow-pin.test.sh, so both
-# spellings have to work.
+# spellings have to work
 if command -v sha256sum >/dev/null 2>&1; then
     sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 else
     sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 fi
 
-# The sum the release publishes for one archive. The asset is in
-# `sha256sum` format, "<sum>  <asset name>"; the name is checked too, so a
-# sum published for another target cannot be read as this one's.
+# The .sha256 asset is in `sha256sum` format, "<sum>  <asset name>". The name
+# is checked too, so a sum published for another target cannot be read as
+# this one's
 published_sum() { # published_sum <target triple>
     local asset="meow-${VERSION}-$1.tar.gz"
     local sum
@@ -130,9 +127,9 @@ published_sum() { # published_sum <target triple>
     printf '%s\n' "$sum"
 }
 
-# Download the archive and prove it hashes to the published sum. Only
-# reached when the pin actually moves, so a scheduled no-op run does not
-# pull 16 MB of archives it has no use for.
+# Download the archive and prove it hashes to the published sum. Only reached
+# when the pin actually moves, so a scheduled no-op run does not pull 16 MB
+# of archives it has no use for
 verify_archive() { # verify_archive <target triple> <published sum>
     local asset="meow-${VERSION}-$1.tar.gz" published="$2" actual
     curl -fsSL -o "$WORK/$asset" "$RELEASE_BASE/$asset"
@@ -160,9 +157,9 @@ fi
 verify_archive x86_64-unknown-linux-musl "$AMD64"
 verify_archive aarch64-unknown-linux-musl "$ARM64"
 
-# Literal replacement with an occurrence-count assertion: a renamed ARG
-# or a reformatted comment must fail the bump instead of leaving some of
-# the files on the old release.
+# Literal replacement with an occurrence-count assertion: a renamed ARG or a
+# reformatted comment must fail the bump instead of leaving some of the files
+# on the old release
 rewrite() { # rewrite <file> <old> <new> <expected occurrences>
     local file="$1" old="$2" new="$3" want="$4" got
     got="$(grep -oF -- "$old" "$file" | wc -l | tr -d '[:space:]')" || got=0
@@ -170,15 +167,15 @@ rewrite() { # rewrite <file> <old> <new> <expected occurrences>
         echo "::error::expected $want occurrence(s) of the current pin in $file, found $got" >&2
         exit 1
     fi
-    # Both values are validated (a version tag and a hex sha256), so the
-    # only regex metacharacter they can carry is the dot.
+    # Both values are validated (a version tag and a hex sha256), so the only
+    # regex metacharacter they can carry is the dot
     sed -i.bak "s/${old//./\\.}/${new}/g" "$file"
     rm -f "$file.bak"
 }
 
 # The guides document the default in the MEOW_VERSION row of the env-var
-# table. Only that cell is a pin: the prose example of the dispatch input
-# further down is illustrative and stays as it is.
+# table; only that cell is a pin, the prose dispatch-input example below is
+# illustrative and stays as it is
 rewrite_guide() { # rewrite_guide <file>
     local file="$1"
     local row="^| \`MEOW_VERSION\`"
@@ -193,7 +190,7 @@ rewrite_guide() { # rewrite_guide <file>
 
 # The Dockerfile carries each value twice: the ARG block and the
 # ready-to-use `docker build` example in its header, which claims to show
-# the current pin.
+# the current pin
 rewrite "$DOCKERFILE" "$CURRENT_VERSION" "$VERSION" 2
 rewrite "$DOCKERFILE" "$CURRENT_AMD64" "$AMD64" 2
 rewrite "$DOCKERFILE" "$CURRENT_ARM64" "$ARM64" 2

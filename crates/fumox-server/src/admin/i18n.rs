@@ -1,28 +1,19 @@
 //! Admin panel internationalization.
 //!
 //! Message catalogs live in external TOML files, one file per language,
-//! file name (without extension) is the language code: `locales/ru.toml`,
-//! `locales/en.toml`, … The directory is `[admin].locales_dir` (default
-//! `locales/`, relative to the working directory). Dropping a new file into
-//! the directory and restarting the server adds a language, no rebuild.
-//!
-//! The shipped `ru`/`en` catalogs are also compiled into the binary as a
-//! fallback, so a bare binary without a locales directory still renders the
-//! panel. A file on disk overrides the embedded copy of the same language
-//! **key by key**: the embedded catalog is the base, the disk file wins for
-//! the keys it defines, and the keys it leaves out keep the embedded text.
-//! A partial file therefore translates only what it names instead of
-//! emptying the whole language.
-//!
-//! The UI language is stored in the plain `fumox_lang` cookie; the login
-//! screen (`?lang=` query parameter) and the topbar switcher
-//! (`/admin/set-lang`) set it. The default language is Russian when its
-//! catalog is loaded, otherwise the first available one.
-//!
-//! Templates access messages through the `t` helper and `lang_code()` that
-//! the [`impl_i18n`] macro adds to every template struct carrying a
-//! `lang: Lang` field. Messages injected from Rust (toasts, validation,
-//! badges) are translated with [`Lang::t`] at the call site.
+//! file name (without extension) is the language code. The directory is
+//! `[admin].locales_dir` (default `locales/`, relative to the working
+//! directory): dropping a file in and restarting adds a language, no
+//! rebuild. The shipped `ru`/`en` catalogs are also embedded as a fallback,
+//! and a disk file overrides the embedded copy of the same language
+//! **key by key**, so a partial file translates only what it names instead
+//! of emptying the language. The UI language travels in the plain
+//! `fumox_lang` cookie, set by the login screen's `?lang=` and
+//! `/admin/set-lang`; the default language is Russian when its catalog is
+//! loaded, otherwise the first available one. Templates reach the messages
+//! through the helpers the [`impl_i18n`] macro adds; messages injected
+//! from Rust (toasts, validation, badges) are translated with [`Lang::t`]
+//! at the call site.
 
 use crate::admin::AdminState;
 use axum::extract::{Form, State};
@@ -63,18 +54,12 @@ pub struct Locales {
 
 impl Locales {
     /// Load catalogs: embedded first, then every `<code>.toml` in `dir`.
-    /// Unreadable or malformed files are logged and skipped. A `dir` that
+    /// Unreadable or malformed files are logged and skipped; a `dir` that
     /// cannot be read at all (missing, or present but inaccessible) falls
-    /// back to the embedded catalogs too: a missing directory is the
-    /// normal no-extra-languages case (info), any other read error is
-    /// warned about, the operator's files are then silently unused.
-    ///
-    /// A disk file is merged **per key** onto the embedded catalog of the
-    /// same language: the file's text wins for the keys it defines, the
-    /// embedded text survives for the keys it omits. Before the merge a
-    /// file replaced the whole language, so a partial file (a single
-    /// translated phrase) emptied every other key of that language and
-    /// the panel fell back to echoing the raw keys.
+    /// back to the embedded catalogs too. A disk file is merged **per key**
+    /// onto the embedded catalog of the same language: the file's text wins
+    /// for the keys it defines, the embedded text survives for the keys it
+    /// omits, so a partial file translates only what it names.
     pub fn load(dir: &Path) -> Self {
         let mut catalogs = embedded_catalogs_map();
         merge_disk_catalogs(&mut catalogs, dir);
@@ -84,7 +69,7 @@ impl Locales {
     /// Build the registry from an already-parsed set of catalogs.
     fn from_catalogs(catalogs: BTreeMap<String, Arc<HashMap<String, String>>>) -> Self {
         // Default language: Russian when available, else the first code
-        // (BTreeMap keeps the order deterministic).
+        // (BTreeMap keeps the order deterministic)
         let default_code = if catalogs.contains_key(PREFERRED_DEFAULT) {
             PREFERRED_DEFAULT.to_string()
         } else {
@@ -127,7 +112,6 @@ impl Locales {
         }
     }
 
-    /// The default language.
     pub fn default_lang(&self) -> Lang {
         self.resolve(&self.default_code)
     }
@@ -177,11 +161,10 @@ fn embedded_catalogs_map() -> BTreeMap<String, Arc<HashMap<String, String>>> {
     catalogs
 }
 
-/// Merge the `*.toml` files of `dir` onto the built-in catalogs. A `dir`
+/// Merge the `*.toml` files of `dir` onto the built-in catalogs; a `dir`
 /// that cannot be read at all (missing, or present but inaccessible)
-/// leaves the embedded catalogs as they are: a missing directory is the
-/// normal no-extra-languages case (info), any other read error is warned
-/// about, the operator's files are then silently unused.
+/// leaves the embedded catalogs as they are (the error handling below
+/// distinguishes the missing-directory case from any other read error).
 fn merge_disk_catalogs(catalogs: &mut BTreeMap<String, Arc<HashMap<String, String>>>, dir: &Path) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -196,7 +179,7 @@ fn merge_disk_catalogs(catalogs: &mut BTreeMap<String, Arc<HashMap<String, Strin
             // The directory exists but cannot be read (permissions, a
             // file standing in its place): every extra language the
             // operator dropped there is silently unavailable, so this
-            // is a warning, not the expected no-directory case.
+            // is a warning, not the expected no-directory case
             tracing::warn!(
                 dir = %dir.display(),
                 error = %err,
@@ -238,12 +221,9 @@ fn load_disk_file(catalogs: &mut BTreeMap<String, Arc<HashMap<String, String>>>,
 /// The vetted language code of a locale file name: the trimmed,
 /// lower-cased file stem. `None` when the stem is empty (skipped
 /// silently) or holds characters a language code cannot (logged as
-/// skipped).
-///
-/// The code travels into the switcher's request (`?lang=` on the login
-/// form, the setter's form field) and into the cookie value, so only the
-/// characters a language code can hold are accepted: a file named
-/// `..toml` or `w%20w.toml` must not smuggle anything into either.
+/// skipped). The code travels into the switcher's request (`?lang=` on
+/// the login form) and the cookie value, so `..toml` or `w%20w.toml`
+/// must not smuggle anything into either.
 fn disk_language_code(path: &Path) -> Option<String> {
     let code = path.file_stem()?.to_str()?.trim().to_ascii_lowercase();
     if code.is_empty() {
@@ -354,9 +334,7 @@ impl Lang {
     /// name (and an unclosed brace) is copied through verbatim. One pass
     /// over the original template is the whole contract: an argument that
     /// itself contains `{…}` is inserted literally and never re-scanned,
-    /// which a sequential `String::replace` cascade could not guarantee
-    /// (an argument carrying a later placeholder used to be substituted
-    /// into, corrupting the value).
+    /// which a sequential `String::replace` cascade could not guarantee.
     fn substitute(&self, template: &str, args: &[(String, &str)]) -> String {
         let mut out = String::with_capacity(template.len());
         let mut rest = template;
@@ -372,7 +350,7 @@ impl Lang {
                     }
                     rest = &tail[close + 2..];
                 }
-                // No closing brace: the rest is not a placeholder.
+                // No closing brace: the rest is not a placeholder
                 None => {
                     out.push_str(tail);
                     rest = "";
@@ -554,7 +532,7 @@ mod tests {
                 assert!(catalog.contains_key(key), "key {key} missing in {code}");
             }
         }
-        // Every language describes itself for the switcher.
+        // Every language describes itself for the switcher
         for (code, catalog) in &catalogs {
             assert!(
                 catalog.contains_key(LANG_NAME_KEY),
@@ -564,7 +542,7 @@ mod tests {
         // The probe banner's recommendation labels and the idle factor
         // are resolved through the catalog, so every one of them must
         // exist in both languages and actually be translated (an
-        // unresolved key echoes itself).
+        // unresolved key echoes itself)
         for key in [
             "probe.rec_sample_size",
             "probe.rec_cycle_interval_secs",
@@ -579,7 +557,7 @@ mod tests {
             }
         }
         // The same for the keys the Rust side looks up by value: a status
-        // badge renders through them.
+        // badge renders through them
         for key in rust_side_keys() {
             for (code, catalog) in &catalogs {
                 let text = catalog
@@ -592,7 +570,7 @@ mod tests {
         // every key, repeats included: a translation that drops,
         // renames or duplicates a `{…}` renders the argument raw (or
         // binds it in the wrong spot). Sorted lists keep the comparison
-        // order-insensitive while still counting repeated names.
+        // order-insensitive while still counting repeated names
         let by_code = |code: &str| {
             &catalogs
                 .iter()
@@ -629,10 +607,10 @@ mod tests {
         assert_eq!(locales.resolve("EN").code(), "en");
         assert_eq!(locales.resolve("fr").code(), "ru");
         assert_eq!(locales.resolve("").code(), "ru");
-        // Translation follows the resolved catalog.
+        // Translation follows the resolved catalog
         assert_eq!(locales.resolve("en").t("nav.dashboard"), "Dashboard");
         assert_eq!(locales.resolve("fr").t("nav.dashboard"), "Обзор");
-        // Unknown keys echo themselves.
+        // Unknown keys echo themselves
         assert_eq!(locales.resolve("en").t("no.such.key"), "no.such.key");
     }
 
@@ -640,7 +618,7 @@ mod tests {
     fn t_args_substitutes_positional_arguments() {
         // The substitution contract is pinned on a synthetic catalog
         // (same pattern as `disk_files_add_and_override_languages`), so
-        // the test does not move whenever a shipped phrase is reworded.
+        // the test does not move whenever a shipped phrase is reworded
         let dir = std::env::temp_dir().join(format!(
             "fumox-locales-args-{}",
             fumox_core::models::new_id()
@@ -659,25 +637,25 @@ mod tests {
             zz.t_args("test.pos", &["one".to_string(), "two".to_string()]),
             "A one B two C"
         );
-        // A placeholder without its argument stays visible.
+        // A placeholder without its argument stays visible
         assert_eq!(zz.t_args("test.pos", &["one".to_string()]), "A one B {1} C");
         // An argument that itself carries a placeholder is inserted
         // verbatim: the single-pass substitution never re-scans an
-        // inserted value.
+        // inserted value
         assert_eq!(
             zz.t_args("test.pos", &["{1}".to_string(), "two".to_string()]),
             "A {1} B two C"
         );
-        // An unclosed brace is copied through, not swallowed.
+        // An unclosed brace is copied through, not swallowed
         assert_eq!(zz.t_args("test.open", &["one".to_string()]), "A {0 B");
-        // Unknown keys echo themselves, arguments still substituted.
+        // Unknown keys echo themselves, arguments still substituted
         assert_eq!(
             zz.t_args("no.such.key", &["one".to_string()]),
             "no.such.key"
         );
 
         // The shipped catalogs keep the keys the pipeline errors ride on:
-        // presence and the placeholder count, not the wording.
+        // presence and the placeholder count, not the wording
         for (code, catalog) in embedded_catalogs() {
             let text = catalog
                 .get("pipeline.unknown_flag")
@@ -695,7 +673,7 @@ mod tests {
         // in the allowed list, admins see the full picture from one
         // message (the pipeline tests pin the validator side, this pins
         // the copy). Rendered through `t_args` exactly as the runtime
-        // error path does.
+        // error path does
         let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
         for code in ["en", "ru"] {
             let rendered = locales.resolve(code).t_args(
@@ -716,18 +694,18 @@ mod tests {
         // The settings screens address the edited file by `{path}` so the
         // Russian and English copy can reorder around the value without
         // breaking the binding; a positional substitution would leave
-        // `{path}` visible on the rendered page.
+        // `{path}` visible on the rendered page
         let args: Vec<(&str, String)> = vec![("path", path)];
         let en = locales.resolve("en").t_named("set.editing_path", &args);
         assert_eq!(en, "Editing: /etc/fumox/app.toml");
         // Missing arguments leave their placeholder visible, same contract
         // as `t_args`, so a missing translation or a refactor that drops a
-        // placeholder is obvious instead of silently blank.
+        // placeholder is obvious instead of silently blank
         assert_eq!(
             locales.resolve("en").t_named("set.editing_path", &[]),
             "Editing: {path}"
         );
-        // Unknown keys echo themselves, names still substituted.
+        // Unknown keys echo themselves, names still substituted
         assert_eq!(
             locales.resolve("en").t_named("no.such.key", &args),
             "no.such.key"
@@ -741,15 +719,15 @@ mod tests {
             fumox_core::models::new_id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // A brand-new language appears without any rebuild.
+        // A brand-new language appears without any rebuild
         std::fs::write(
             dir.join("de.toml"),
             "\"lang.name\" = \"Deutsch\"\n\"nav.dashboard\" = \"Armaturenbrett\"\n",
         )
         .unwrap();
-        // A disk copy overrides the embedded catalog of the same code.
+        // A disk copy overrides the embedded catalog of the same code
         std::fs::write(dir.join("en.toml"), "\"nav.dashboard\" = \"Dashboard!\"\n").unwrap();
-        // A malformed file is skipped, not fatal.
+        // A malformed file is skipped, not fatal
         std::fs::write(dir.join("broken.toml"), "\"oops\" = ").unwrap();
 
         let locales = Locales::load(&dir);
@@ -763,11 +741,11 @@ mod tests {
         // The disk file wins for the key it defines…
         assert_eq!(locales.resolve("en").t("nav.dashboard"), "Dashboard!");
         // …and the keys it leaves out keep the embedded text: the merge is
-        // per key, so a partial file does not empty the language.
+        // per key, so a partial file does not empty the language
         assert_eq!(locales.resolve("en").t("nav.logout"), "Log out");
-        // A language the binary does not ship is the file alone.
+        // A language the binary does not ship is the file alone
         assert_eq!(locales.resolve("de").t("nav.logout"), "nav.logout");
-        // Switcher labels come from each catalog's lang.name.
+        // Switcher labels come from each catalog's lang.name
         let choices = locales.choices();
         assert!(choices.contains(&("de".to_string(), "Deutsch".to_string())));
         assert!(choices.contains(&("ru".to_string(), "Русский".to_string())));
@@ -792,7 +770,7 @@ mod tests {
 
         assert!(!locales.contains("."));
         assert!(!locales.contains("de fr"));
-        // A code within the accepted alphabet still loads.
+        // A code within the accepted alphabet still loads
         assert!(locales.contains("ok-code"));
     }
 
@@ -808,13 +786,13 @@ mod tests {
         assert_eq!(locales.lang_from_headers(&HeaderMap::new()).code(), "ru");
 
         // The language may arrive in its own `Cookie` header, not only in
-        // a shared one: every header is scanned.
+        // a shared one: every header is scanned
         let mut split = HeaderMap::new();
         split.append(header::COOKIE, "other=1".parse().unwrap());
         split.append(header::COOKIE, "fumox_lang=en".parse().unwrap());
         assert_eq!(locales.lang_from_headers(&split).code(), "en");
 
-        // A quoted-string value reads as the bare code.
+        // A quoted-string value reads as the bare code
         let mut quoted = HeaderMap::new();
         quoted.insert(header::COOKIE, "fumox_lang=\"en\"".parse().unwrap());
         assert_eq!(locales.lang_from_headers(&quoted).code(), "en");
@@ -888,7 +866,7 @@ mod tests {
             "unknown i18n keys in the Rust sources: {missing:?}"
         );
         // A scan that matches nothing would pass forever: the sources
-        // hold well over a hundred key lookups.
+        // hold well over a hundred key lookups
         assert!(
             found > 100,
             "the Rust scan found {found} keys, the regex no longer fits the sources"
@@ -907,7 +885,7 @@ mod tests {
             r#"{{ self.t_args("probe.recs_head", &[]) }}"#,
             r#"{{ self.t_named("set.editing_path", &[]) }}"#,
             // Spaces around the argument and a key with a dash and an
-            // uppercase letter: the scan has to see both.
+            // uppercase letter: the scan has to see both
             r#"{{ self.t( "probe.rec-Sample" ) }}"#,
         );
         let keys: Vec<String> = TEMPLATE_KEY_RE

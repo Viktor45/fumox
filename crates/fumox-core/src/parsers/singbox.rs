@@ -102,7 +102,7 @@ pub fn parse_payload(payload: &str) -> Result<SingBoxParseResult, String> {
         return Err("sing-box: no `outbounds` array".to_string());
     }
     // One summary line for the whole payload: the element loops only count
-    // their skips, so this is where the truncation becomes visible.
+    // their skips, so this is where the truncation becomes visible
     if result.unsupported > 0 || result.invalid > 0 {
         tracing::warn!(
             entries = result.entries.len(),
@@ -122,8 +122,8 @@ fn harvest(config: &Map<String, Value>, result: &mut SingBoxParseResult) -> bool
     };
     for outbound in outbounds {
         if result.entries.len() >= super::MAX_ENTRIES {
-            // The cap is reached: the rest of the payload is counted instead
-            // of parsed, so the load stays bounded and the truncation shows.
+            // Past the cap: the rest is counted instead of parsed, so the
+            // truncation shows
             result.skipped += 1;
             continue;
         }
@@ -135,11 +135,11 @@ fn harvest(config: &Map<String, Value>, result: &mut SingBoxParseResult) -> bool
 fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
     let Some(map) = outbound.as_object() else {
         // Nothing is known about this outbound, so the event carries only
-        // `error` (see the logging contract in the module docs).
+        // `error` (see the logging contract in the module docs)
         reject_invalid("outbound is not a JSON object", result);
         return;
     };
-    // Dialect: sing-box spells the kind `type`, Xray spells it `protocol`.
+    // Dialect: sing-box spells the kind `type`, Xray spells it `protocol`
     let Some((kind_key, kind)) = outbound_kind(map) else {
         reject_invalid("outbound without a `type`/`protocol`", result);
         return;
@@ -162,9 +162,8 @@ fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
     }
 }
 
-/// Reject a malformed outbound: one debug event naming the concrete reason
-/// and one invalid count. A bad outbound never fails the payload (the
-/// log-and-skip principle is in the module docs).
+/// Reject a malformed outbound: one debug event naming the concrete reason,
+/// one invalid count; a bad outbound never fails the payload.
 fn reject_invalid(message: &str, result: &mut SingBoxParseResult) {
     tracing::debug!(error = message, "skipping malformed sing-box outbound");
     result.invalid += 1;
@@ -213,9 +212,8 @@ fn build_outbound(
     name: &str,
 ) -> Option<Result<XrayOutbound, String>> {
     // sing-box spells the SOCKS protocol version explicitly; only 5 has a
-    // URI representation, so an explicit other version is counted as
-    // unsupported like the protocols without a representation at all
-    // (serializing it as socks5 would serve a socks4 node on a socks5 URI).
+    // URI representation, so any other version is unsupported (serializing
+    // it as socks5 would serve a socks4 node on a socks5 URI)
     if kind_key == "type"
         && matches!(kind, "socks" | "socks5")
         && str_field(map, "version").is_some_and(|version| version != "5")
@@ -243,7 +241,7 @@ fn build_outbound(
 fn accept_outbound(built: XrayOutbound, kind: &str, name: &str, result: &mut SingBoxParseResult) {
     // One summary event per outbound: the element loops count their
     // skips instead of logging per element (the logging contract is
-    // in the module docs).
+    // in the module docs)
     if built.skips.any() {
         tracing::debug!(
             kind,
@@ -258,7 +256,7 @@ fn accept_outbound(built: XrayOutbound, kind: &str, name: &str, result: &mut Sin
     // The outbound itself passed the cap check in `harvest`, but one
     // outbound can carry more entries than the cap has slots left
     // (an Xray endpoint list), so the per-entry bound is enforced
-    // here.
+    // here
     for entry in built.entries {
         if result.entries.len() >= super::MAX_ENTRIES {
             result.skipped += 1;
@@ -268,7 +266,7 @@ fn accept_outbound(built: XrayOutbound, kind: &str, name: &str, result: &mut Sin
     }
     // The users dropped by the per-endpoint cap, and the non-object
     // junk elements, are counted as invalid: they were recognized
-    // but not stored.
+    // but not stored
     result.invalid += built.skips.dropped;
 }
 
@@ -324,8 +322,6 @@ fn vec1(entry: ProxyEntry) -> XrayOutbound {
     }
 }
 
-// sing-box native dialect
-
 fn native_vless(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, String> {
     let (host, port) = native_endpoint(map)?;
     let credential = required_str(map, "uuid")?;
@@ -361,7 +357,7 @@ fn native_vmess(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, Stri
     let credential = required_str(map, "uuid")?;
     let mut params = Vec::new();
     // vmess JSON spells the cipher `security` internally (`scy`) and TLS as
-    // `tls: "tls"`, same convention as the vmess URI parser.
+    // `tls: "tls"`, same convention as the vmess URI parser
     if let Some(scy) = str_field(map, "security") {
         push_param(&mut params, true, "scy", scy);
     }
@@ -421,11 +417,11 @@ fn native_trojan(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, Str
 fn native_ss(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, String> {
     let (host, port) = native_endpoint(map)?;
     let method = required_str(map, "method")?;
-    // A record without a password is invalid, not a no-auth proxy.
+    // A record without a password is invalid, not a no-auth proxy
     let password = required_str(map, "password")?;
     let mut params = Vec::new();
     if let Some(plugin) = str_field(map, "plugin") {
-        // Reassembled into the SIP003 string form the pipeline carries.
+        // Reassembled into the SIP003 string form the pipeline carries
         let opts = str_field(map, "plugin_opts").unwrap_or_default();
         let value = if opts.is_empty() {
             plugin.to_string()
@@ -504,7 +500,7 @@ fn native_socks(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, Stri
     if let Some(tls) = map.get("tls").and_then(Value::as_object) {
         // The socks5 serializer rebuilds TLS from the bare `tls` toggle; the
         // field mapping itself comes from the shared helper, so the TLS
-        // parameters of every native scheme have a single source.
+        // parameters of every native scheme have a single source
         native_tls_params(tls, None, &mut params);
         if tls.get("enabled").and_then(Value::as_bool) == Some(true) {
             push_param(&mut params, true, "tls", "true");
@@ -539,13 +535,13 @@ fn native_socks(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, Stri
 /// schemes, `tls` for vmess JSON, nothing for socks.
 fn native_tls_params(tls: &Map<String, Value>, security: Option<&str>, params: &mut Vec<Param>) {
     // The value the security key carries when TLS is on (`security=tls`,
-    // `tls=tls`).
+    // `tls=tls`)
     const TLS_ON: &str = "tls";
     let enabled = tls.get("enabled").and_then(Value::as_bool).unwrap_or(false);
     let reality = tls.get("reality").and_then(Value::as_object);
-    // An explicit `enabled: false` switches REALITY off, public key or not.
+    // An explicit `enabled: false` switches REALITY off, public key or not
     // Without the switch the legacy lenient mode applies: a public key means
-    // REALITY.
+    // REALITY
     let reality_on = reality.is_some_and(|r| match r.get("enabled").and_then(Value::as_bool) {
         Some(enabled) => enabled,
         None => str_field(r, "public_key").is_some(),
@@ -608,7 +604,7 @@ fn native_transport_params(
                 // Headers other than `Host` are part of the handshake
                 // identity a client has to replay; they pass through as
                 // `headers.<name>` parameters, like the other unmapped
-                // fields.
+                // fields
                 for (key, value) in headers {
                     if key.eq_ignore_ascii_case("host") || value.is_null() {
                         continue;
@@ -646,7 +642,7 @@ fn native_transport_params(
         _ => {}
     }
     // Unmapped transport fields (`early_data_header_name`, `max_early_data`,
-    // xhttp `extra`, …) pass through under their sing-box names.
+    // xhttp `extra`, …) pass through under their sing-box names
     for (key, value) in transport {
         if CONSUMED.contains(&key.as_str()) || value.is_null() {
             continue;
@@ -654,8 +650,6 @@ fn native_transport_params(
         push_param(params, false, key, json_to_param_value(value));
     }
 }
-
-// Xray/v2ray-core ("vnext") dialect
 
 /// Shared skeleton of the Xray builders: iterate `settings.<field>`, hand
 /// every element to `per_element`, and apply the log-and-skip contract — a
@@ -738,7 +732,7 @@ where
             passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
             // `finish` rejects (among others) a credential carrying a line
             // break, which is this one user only; propagating it would
-            // discard the entries of every other endpoint.
+            // discard the entries of every other endpoint
             match finish(scheme, name, host.clone(), port, id.to_string(), params) {
                 Ok(entry) => entries.push(entry),
                 Err(_) => skips.rejected += 1,
@@ -770,7 +764,7 @@ fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, Stri
 }
 
 fn xray_vmess(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String> {
-    // vmess JSON spells TLS as `tls: "tls"`.
+    // vmess JSON spells TLS as `tls: "tls"`
     xray_vnext_elements(
         map,
         Scheme::Vmess,
@@ -803,7 +797,7 @@ fn xray_trojan(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, Str
             let mut skips = XraySkips::default();
             // A malformed element costs only itself (log-and-skip); the
             // `?` used to end the whole loop and discard the entries
-            // already built for the elements before it.
+            // already built for the elements before it
             let (host, port) = match xray_endpoint(server) {
                 Ok(endpoint) => endpoint,
                 Err(_) => {
@@ -864,7 +858,7 @@ fn xray_ss(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String>
                 skips.no_credential += 1;
                 return (Vec::new(), skips);
             };
-            // A server without a password is unusable, not a no-auth proxy.
+            // A server without a password is unusable, not a no-auth proxy
             let Ok(password) = required_str(server, "password") else {
                 skips.no_credential += 1;
                 return (Vec::new(), skips);
@@ -904,7 +898,7 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, Stri
         "xray: socks server without a usable endpoint",
         |server| {
             let mut skips = XraySkips::default();
-            // Unlike the other dialects socks accepts an `addr` spelling too.
+            // Unlike the other dialects socks accepts an `addr` spelling too
             let (Some(host), Ok(port)) = (
                 str_field(server, "address").or_else(|| str_field(server, "addr")),
                 numeric_field(server, "port", "xray"),
@@ -914,7 +908,7 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, Stri
             };
             // A socks server without a `users` list is a no-auth proxy and
             // still yields one entry; with a list, every user is a separate
-            // proxy.
+            // proxy
             let (users, dropped) = xray_users(server);
             skips.dropped += dropped;
             let users: Vec<(String, String)> = users
@@ -958,14 +952,10 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, Stri
 /// dropped element as invalid (see [`xray_elements`]).
 ///
 /// Every user is a distinct credential for the same endpoint, so each one
-/// becomes its own [`ProxyEntry`], the same treatment the sibling
-/// `vnext`/`servers` arrays already get, and the reason a multi-user
-/// outbound must not be collapsed to its first element. A junk element
-/// costs only itself (log-and-skip), not the credentials around it.
-///
-/// At most [`MAX_USERS_PER_ENDPOINT`] users are processed; the rest are
-/// counted as invalid, so one endpoint cannot turn a small payload into an
-/// unbounded number of rows.
+/// becomes its own [`ProxyEntry`] (the reason a multi-user outbound must
+/// not be collapsed to its first element), and a junk element costs only
+/// itself. At most [`MAX_USERS_PER_ENDPOINT`] users are processed, so one
+/// endpoint cannot turn a small payload into an unbounded number of rows.
 fn xray_users(map: &Map<String, Value>) -> XrayObjects<'_> {
     let Some(list) = map.get("users").and_then(Value::as_array) else {
         return (Vec::new(), 0);
@@ -1029,8 +1019,8 @@ fn xray_stream_params(
 ) {
     let network = str_field(stream, "network").unwrap_or("tcp");
     // TCP is the implicit transport in every dialect; `type=tcp` is stored
-    // only when it carries HTTP obfuscation (see `xray_tcp_params`).
-    // Xray renamed `tcp` to `raw` in 1.8.24; it is the same transport.
+    // only when it carries HTTP obfuscation (see `xray_tcp_params`)
+    // Xray renamed `tcp` to `raw` in 1.8.24; it is the same transport
     if network != "tcp" && network != "raw" {
         push_param(params, true, network_key, network);
     }
@@ -1047,7 +1037,7 @@ fn xray_security_params(
     params: &mut Vec<Param>,
 ) {
     // The value the security key carries when TLS is on (`security=tls`,
-    // `tls=tls`).
+    // `tls=tls`)
     const TLS_ON: &str = "tls";
     match str_field(stream, "security") {
         Some("tls") => {
@@ -1071,7 +1061,7 @@ fn xray_security_params(
         }
         Some("reality") => {
             // REALITY is spelled through `security` in the URI family;
-            // vmess has no REALITY and keeps its `tls` spelling.
+            // vmess has no REALITY and keeps its `tls` spelling
             match security {
                 Some("security") => push_param(params, true, "security", "reality"),
                 Some(key) => push_param(params, true, key, TLS_ON),
@@ -1079,7 +1069,7 @@ fn xray_security_params(
             }
             // `spiderX` is an Xray client-side crawler impersonation knob
             // (like `sockopt`) with no proxy-identity meaning and is
-            // deliberately not read; the identity fields below are.
+            // deliberately not read; the identity fields below are
             if let Some(reality) = stream.get("realitySettings").and_then(Value::as_object) {
                 if let Some(sni) = str_field(reality, "serverName") {
                     push_param(params, true, "sni", sni);
@@ -1119,7 +1109,7 @@ fn xray_transport_params(
         // The mKCP and QUIC transports have no URI spelling the clients
         // understand, so their whole settings block passes through as one
         // unknown parameter: nothing is lost, and a client that knows the
-        // transport can still read it.
+        // transport can still read it
         "kcp" | "quic" => {
             let key = format!("{network}Settings");
             if let Some(settings) = stream.get(&key) {
@@ -1143,7 +1133,7 @@ fn xray_ws_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
             // Headers other than `Host` are part of the handshake
             // identity a client has to replay; they pass through as
             // `headers.<name>` parameters, like the other unmapped
-            // fields.
+            // fields
             for (key, value) in headers {
                 if key.eq_ignore_ascii_case("host") || value.is_null() {
                     continue;
@@ -1195,7 +1185,7 @@ fn xray_httpupgrade_params(stream: &Map<String, Value>, params: &mut Vec<Param>)
 
 fn xray_xhttp_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
     // Xray renamed the transport `splithttp` to `xhttp`; either
-    // settings key may spell the block.
+    // settings key may spell the block
     if let Some(xhttp) = stream
         .get("xhttpSettings")
         .or_else(|| stream.get("splithttpSettings"))
@@ -1255,8 +1245,6 @@ fn xray_tcp_params(
     }
 }
 
-// Shared helpers
-
 /// Client-side knobs that describe the local dialer, not the proxy; dropped
 /// rather than passed through to keep DB rows and URI output clean.
 const CLIENT_SIDE_FIELDS: &[&str] = &["mux", "sockopt"];
@@ -1306,14 +1294,14 @@ fn finish(
     super::reject_line_breaks("sing-box: credential", &credential)?;
     // The host, the credential and the name are stored verbatim on every
     // row, so an oversized one is a storage bomb (the vector formats are
-    // not bounded as a whole the way a URI list is).
+    // not bounded as a whole the way a URI list is)
     super::check_field_size("sing-box: server", &host)?;
     super::check_field_size("sing-box: credential", &credential)?;
     // A missing or non-string `tag` falls back to a `host:port` name (an
     // IPv6 host bracketed, the shape a URI authority spells). The
     // placeholder derives from the already-capped host, and
     // `host_port_name` reserves headroom for the suffix it adds, so it
-    // cannot exceed the caps itself.
+    // cannot exceed the caps itself
     let name = if name.is_empty() {
         host_port_name(&host, port)
     } else {
@@ -1322,14 +1310,13 @@ fn finish(
     super::check_field_size("sing-box: name", &name)?;
     // JSON strings may contain `\n`, and the URI serializers emit these
     // fields verbatim (see `parsers::reject_line_breaks`). The cheap check
-    // first keeps the per-param message allocation off the common path.
+    // first keeps the per-param message allocation off the common path
     for param in &params {
         if param.value.contains(['\n', '\r']) {
             super::reject_line_breaks(&format!("sing-box: field {:?}", param.key), &param.value)?;
         }
     }
-    // Field-size cap: sing-box
-    // params bypass `parse_query`, so the caps are enforced here.
+    // sing-box params bypass `parse_query`, so the caps are enforced here
     super::validate_params("sing-box", &params)?;
     Ok(super::with_canonical_cache(ProxyEntry {
         scheme,
@@ -1627,7 +1614,7 @@ mod tests {
         assert_eq!(entry.scheme, Scheme::Vmess);
         assert_eq!(entry.param("scy"), Some("aes-128-gcm"));
         assert_eq!(entry.param("aid"), Some("4"));
-        // vmess JSON spells TLS as `tls: "tls"`.
+        // vmess JSON spells TLS as `tls: "tls"`
         assert_eq!(entry.param("tls"), Some("tls"));
         assert_eq!(entry.param("sni"), Some("s.example.com"));
         assert_eq!(entry.param("net"), Some("ws"));
@@ -1734,14 +1721,14 @@ mod tests {
                 "multiplex":{"enabled":true,"protocol":"h2mux"},
                 "packet_encoding":"packetaddr"}]}"#,
         );
-        // TLS off → no security parameter is invented.
+        // TLS off → no security parameter is invented
         assert_eq!(entry.param("security"), None);
         assert_eq!(entry.param("packet_encoding"), Some("packetaddr"));
         assert_eq!(
             entry.param("multiplex"),
             Some(r#"{"enabled":true,"protocol":"h2mux"}"#)
         );
-        // mux/sockopt are client-side and dropped.
+        // mux/sockopt are client-side and dropped
         let with_sockopt = parse_one(
             r#"{"outbounds":[{"type":"trojan","tag":"t","server":"h.example.com","server_port":443,
                 "password":"p","sockopt":{"domainStrategy":"UseIP"}}]}"#,
@@ -1764,7 +1751,7 @@ mod tests {
                 {"tag":"blocked","protocol":"blackhole"}]}"#,
         )
         .unwrap();
-        // freedom/blackhole are not proxies: skipped, not counted.
+        // freedom/blackhole are not proxies: skipped, not counted
         assert_eq!(entries.entries.len(), 1);
         assert_eq!(entries.unsupported, 0);
         assert_eq!(entries.invalid, 0);
@@ -1774,7 +1761,7 @@ mod tests {
         assert_eq!(entry.host, "1.2.3.4");
         assert_eq!(entry.credential, "u1");
         assert_eq!(entry.param("flow"), Some("xtls-rprx-vision"));
-        // encryption=none is the default and not stored.
+        // encryption=none is the default and not stored
         assert_eq!(entry.param("encryption"), None);
         assert_eq!(entry.param("security"), Some("tls"));
         assert_eq!(entry.param("sni"), Some("at.example.net"));
@@ -1834,7 +1821,7 @@ mod tests {
         assert_eq!(first.param("type"), Some("ws"));
         assert_eq!(first.param("path"), Some("/rutube"));
         assert_eq!(first.param("host"), Some("rutube.example.net"));
-        // loopback is not a proxy.
+        // loopback is not a proxy
         assert_eq!(result.unsupported, 0);
         for entry in &result.entries {
             assert_output_round_trip(entry);
@@ -1855,7 +1842,7 @@ mod tests {
         assert_eq!(vmess.param("aid"), Some("32"));
         assert_eq!(vmess.param("scy"), Some("aes-128-gcm"));
         assert_eq!(vmess.param("tls"), Some("tls"));
-        // Bare TCP is the implicit transport and is not stored.
+        // Bare TCP is the implicit transport and is not stored
         assert_eq!(vmess.param("net"), None);
         assert_output_round_trip(&vmess);
 
@@ -2001,7 +1988,7 @@ mod tests {
                 {"protocol":"vless","settings":{}}]}"#,
         )
         .unwrap();
-        // The first outbound is valid: `tag` is optional like in Clash.
+        // The first outbound is valid: `tag` is optional like in Clash
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.invalid, 4);
     }
@@ -2092,7 +2079,7 @@ mod tests {
             credentials,
             ["user-one", "user-two", "vm-one", "vm-two", "u1:p1", "u2:p2"]
         );
-        // Per-user fields stay on their own entry.
+        // Per-user fields stay on their own entry
         assert_eq!(result.entries[0].param("flow"), Some("xtls-rprx-vision"));
         assert_eq!(result.entries[1].param("flow"), None);
         for entry in &result.entries {
@@ -2119,7 +2106,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].credential, "good");
-        // The junk user and the outbound whose only endpoint yields nothing.
+        // The junk user and the outbound whose only endpoint yields nothing
         assert_eq!(result.invalid, 2);
     }
 
@@ -2139,7 +2126,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.entries.len(), 2);
-        // One junk element per outbound.
+        // One junk element per outbound
         assert_eq!(result.invalid, 2);
     }
 
@@ -2296,7 +2283,7 @@ mod tests {
         assert!(parse_payload("42").is_err());
         assert!(parse_payload("not json").is_err());
         // The pinned contract for an empty outbound list: a valid payload
-        // carrying no proxies, not an error.
+        // carrying no proxies, not an error
         let empty = parse_payload(r#"{"outbounds":[]}"#).unwrap();
         assert_eq!(empty.entries.len(), 0);
     }
@@ -2316,7 +2303,7 @@ mod tests {
         // The host/credential reject already covers those two fields; this
         // asserts the per-param.value loop catches a `\n` smuggled into a
         // outbound's query-style param (sing-box params bypass parse_query
-        // and are emitted verbatim by the serializer).
+        // and are emitted verbatim by the serializer)
         let result = parse_payload(
             r#"{"outbounds":[{"type":"trojan","tag":"evil","server":"h.example.com","server_port":443,"password":"p","network":"ws\nvless://SMUGGLED@7.7.7.7:443#pwn"}]}"#,
         )
@@ -2340,7 +2327,7 @@ mod tests {
     }
 
     /// The per-field byte cap applies to a single parameter too: an
-    /// overlong value — and separately an overlong key — is rejected like
+    /// overlong value, and separately an overlong key, is rejected like
     /// an oversized server, not stored.
     #[test]
     fn an_oversized_parameter_value_or_key_is_rejected() {
@@ -2469,7 +2456,7 @@ mod tests {
     // (single Xray config) and `test-sing2.txt` (v2rayN share array). The
     // fixtures are gitignored (real credentials) and never committed, so
     // these tests are ignored by default: the committed synthetic fixtures
-    // below carry the mandatory coverage.
+    // below carry the mandatory coverage
 
     fn fixture_payload(name: &str) -> Option<String> {
         std::fs::read_to_string(
@@ -2513,7 +2500,7 @@ mod tests {
     fn synthetic_fixture_single_config_parses_and_round_trips() {
         let payload = synthetic_fixture("singbox-config.json");
         let result = parse_payload(&payload).unwrap();
-        // The whole-pipeline path must auto-detect the format too.
+        // The whole-pipeline path must auto-detect the format too
         let via_auto =
             crate::parsers::parse_subscription(&payload, crate::models::Encoding::Auto, None)
                 .unwrap();
@@ -2555,7 +2542,7 @@ mod tests {
         let payload = fixture_payload("test-sing.txt")
             .expect("the local gitignored fixture test-sing.txt is required for this test");
         let result = parse_payload(&payload).unwrap();
-        // The whole-pipeline path must auto-detect the format too.
+        // The whole-pipeline path must auto-detect the format too
         let via_auto =
             crate::parsers::parse_subscription(&payload, crate::models::Encoding::Auto, None)
                 .unwrap();

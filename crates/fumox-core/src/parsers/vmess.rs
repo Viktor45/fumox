@@ -79,7 +79,7 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, ParseError> {
     let port = numeric_field(object, "port")?;
     let credential = string_field(object, "id")?;
     // A number/bool `ps` becomes its literal text, like every parameter
-    // value: the name is display data, never worth failing the line.
+    // value: the name is display data, never worth failing the line
     let name = object
         .get("ps")
         .map(json_to_param_value)
@@ -100,17 +100,16 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, ParseError> {
         .collect();
     // The serializer emits `v` first (see `serialize`); sorting it to the
     // front here keeps the stored parameter order the one a re-parse reads
-    // back, which is what the semantic round-trip contract compares.
+    // back, which is what the semantic round-trip contract compares
     params.sort_by_key(|p| p.key != "v");
 
     if host.is_empty() {
         return Err(invalid("vmess: empty add"));
     }
-    // Field-size cap: vmess
-    // params bypass `parse_query`, so the caps are enforced here.
+    // vmess params bypass `parse_query`, so the caps are enforced here
     super::validate_params("vmess", &params).map_err(over_cap)?;
     // JSON strings may contain `\n`, and the URI serializers emit these
-    // fields verbatim (see `parsers::reject_line_breaks`).
+    // fields verbatim (see `parsers::reject_line_breaks`)
     super::reject_line_breaks("vmess: add", &host).map_err(invalid)?;
     super::reject_line_breaks("vmess: id", &credential).map_err(invalid)?;
     for param in &params {
@@ -118,7 +117,7 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, ParseError> {
             .map_err(invalid)?;
     }
     // The host, the credential and the name are persisted verbatim, so they
-    // are capped like the parameters.
+    // are capped like the parameters
     super::check_field_size("vmess: add", &host).map_err(over_cap)?;
     super::check_field_size("vmess: id", &credential).map_err(over_cap)?;
     super::check_field_size("vmess: ps", &name).map_err(over_cap)?;
@@ -163,7 +162,7 @@ pub fn serialize(entry: &ProxyEntry) -> String {
     // The order is fixed here and only here: `v` first (when present), then
     // the fixed fields, then the remaining parameters in stored order. The
     // parser sorts `v` to the front of the stored list for the same reason,
-    // so a re-parse reads back the same parameter order.
+    // so a re-parse reads back the same parameter order
     if let Some(v) = param("v") {
         object.insert("v".into(), Value::String(v));
     }
@@ -175,7 +174,7 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         // The structured fields are the single source of truth: a stray
         // parameter spelled `add`/`port`/`ps`/`id` (Clash passes unknown
         // fields through, a vmess JSON can carry `PS` next to `ps`) must
-        // not overwrite the host, port, name or credential on output.
+        // not overwrite the host, port, name or credential on output
         if p.key.eq_ignore_ascii_case("v")
             || CONSUMED_FIELDS
                 .iter()
@@ -266,7 +265,6 @@ mod tests {
         assert_eq!(entry.port, 22324);
         assert_eq!(entry.param("aid"), Some("0"));
         assert_eq!(entry.param("skip-cert-verify"), Some("true"));
-        // Bool field is recognized and lands in known params.
         assert!(
             entry
                 .params
@@ -324,7 +322,7 @@ mod tests {
         assert_eq!(first.host, second.host);
         assert_eq!(first.port, second.port);
         assert_eq!(first.credential, second.credential);
-        // Field order is normalized by the serializer, so compare as a set.
+        // Field order is normalized by the serializer, so compare as a set
         let mut a = first.params.clone();
         let mut b = second.params.clone();
         a.sort_by(|x, y| x.key.cmp(&y.key));

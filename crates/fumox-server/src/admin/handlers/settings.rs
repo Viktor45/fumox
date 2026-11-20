@@ -1,21 +1,16 @@
 //! Settings overview + edit page.
 //!
-//! The overview (`GET /admin/settings`) is read-only and shows the
-//! effective configuration grouped by owning process (server / probe /
-//! shared). The edit page (`GET /admin/settings/edit`) is a form that
+//! The overview (`GET /admin/settings`) shows the effective configuration
+//! grouped by owning process. The edit page (`GET /admin/settings/edit`)
 //! round-trips the on-disk TOML through `toml_edit`, preserving every
-//! existing comment. Saving (`POST /admin/settings/update`) writes the
-//! file atomically and refreshes the in-memory view, so a save splits
-//! into two application cases. Everything the handlers read through
-//! [`AdminState::live`] (and its typed accessors — `[probe]`, `[meow]`,
-//! `[fetch]`, …) is in force on the next request, no restart needed. A
-//! few values are startup-frozen on purpose and need the restart: the
-//! listener sockets (`AdminState::server_bind`) and the rate limiters,
-//! built once at startup from the config they were given; the full list
-//! lives on the `AdminState` fields in `crate::admin`. A *Create from
-//! defaults* button on the overview (`POST /admin/settings/create`)
-//! bootstraps a missing `config/app.toml` from the embedded reference
-//! copy.
+//! existing comment; saving (`POST /admin/settings/update`) writes the
+//! file atomically and refreshes the in-memory view. Everything the
+//! handlers read through [`AdminState::live`] is in force on the next
+//! request; the startup-frozen exceptions (listener sockets
+//! (`AdminState::server_bind`), rate limiters) are listed on the
+//! `AdminState` fields in `crate::admin`. *Create from defaults*
+//! (`POST /admin/settings/create`) bootstraps a missing `config/app.toml`
+//! from the embedded reference copy.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -45,13 +40,11 @@ const KEY_ADMIN_TOKEN: &str = "admin.token";
 const KEY_MEOW_BACKOFF_MAX: &str = "meow.backoff_max_secs";
 const KEY_MEOW_BACKOFF_MIN: &str = "meow.backoff_initial_secs";
 
-/// Read-only config view the *Settings* overview renders: the same
-/// field names `templates/settings.html` has always used, populated
-/// from [`AdminState::live`] so the page shows the post-save state
-/// without a restart and without a frozen-field bridge. `config_path`
-/// rides along for the banner and the *Create from defaults* button;
-/// `config_writable` so a read-only deployment gets the same red banner
-/// on the overview the editor shows (USERGUIDE: "the same banner
+/// Read-only config view the *Settings* overview renders, populated from
+/// [`AdminState::live`] so the page shows the post-save state without a
+/// restart. `config_path` feeds the banner and the *Create from defaults*
+/// button; `config_writable` gives a read-only deployment the same red
+/// banner on the overview the editor shows (USERGUIDE: "the same banner
 /// appears on the overview").
 struct SettingsView {
     server: ServerConfig,
@@ -193,9 +186,6 @@ impl_i18n!(SettingsTemplate);
 
 pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
-    // The overview prints the effective config (every panel under
-    // *Settings*), pulled from the figment-merged live view so an edit
-    // that landed between two page loads is visible without a restart.
     let template = SettingsTemplate {
         langs: state.locales.choices().to_vec(),
         theme: theme::from_headers(&headers),
@@ -212,8 +202,6 @@ pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderM
     )
 }
 
-// Edit page.
-
 /// Edit-page template: holds the raw form values and the per-field
 /// errors so the view can re-render on validation failure.
 #[derive(Template)]
@@ -226,8 +214,8 @@ struct SettingsEditTemplate {
     csrf: String,
     /// The file the editor writes to and whether it can: the two
     /// deployment facts the page renders (the path banner, the disabled
-    /// fieldset), split out of the whole `AdminState` — a template has no
-    /// business holding the pool, the caches and the rest of the state.
+    /// fieldset), split out of the whole `AdminState` (a template has no
+    /// business holding the pool and the rest of the state).
     config_path: ResolvedConfigPath,
     config_writable: bool,
     /// Raw form values keyed by `<section>.<field>`. Booleans carry the
@@ -266,7 +254,7 @@ impl SettingsEditTemplate {
 
     fn bool_value(&self, field: &str) -> bool {
         // Same literals the save parser accepts: the failed-save replay
-        // must re-render hidden `value="off"` inputs unchecked.
+        // must re-render hidden `value="off"` inputs unchecked
         parse_bool_literal(self.raw_value(field)).unwrap_or(false)
     }
 
@@ -436,11 +424,11 @@ impl_i18n!(SettingsEditTemplate, errors);
 //
 // One row per setting the panel round-trips. `raw_from_config` (render
 // for the form) and `apply_all` (parse the submit into the TOML
-// document) both iterate this table, so a new field can no longer be
-// added to one side and silently forgotten on the other: the dotted
-// key, its render and its parse live in a single entry. The HTML form
-// remains the one hand-written list; the tests below pin it to this
-// table in both directions.
+// document) both iterate this table, so the dotted key, its render and
+// its parse live in a single entry and a new field cannot be added to
+// one side and silently forgotten on the other. The HTML form remains
+// the one hand-written list; the tests below pin it to this table in
+// both directions.
 
 /// Signature of a per-field parse/write step: read the submitted raw
 /// values for `key`, write into the document, append failures to
@@ -481,7 +469,6 @@ const IP_FAMILIES: &[&str] = IpFamily::ALL_AS_STR;
 const TRUSTED_HEADERS: &[&str] = &["none", "xff", "forwarded", "both"];
 
 static SETTINGS: &[Setting] = &[
-    // --- server ---
     Setting {
         key: "server.bind",
         render: |c, key, raw| {
@@ -529,7 +516,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
     },
-    // --- database ---
     Setting {
         key: "database.path",
         render: |c, key, raw| {
@@ -551,7 +537,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
     },
-    // --- fetch ---
     Setting {
         key: "fetch.connect_timeout_secs",
         render: |c, key, raw| {
@@ -608,7 +593,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| enum_field(raw, key, cfg, IP_FAMILIES, lang, errors),
     },
-    // --- ingest ---
     Setting {
         key: "ingest.refresh_check_limit",
         render: |c, key, raw| {
@@ -630,7 +614,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| bool_field(raw, key, cfg, lang, errors),
     },
-    // --- geo ---
     Setting {
         key: "geo.enabled",
         render: |c, key, raw| {
@@ -680,7 +663,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| bool_field(raw, key, cfg, lang, errors),
     },
-    // --- network ---
     Setting {
         key: "network.dns_timeout_secs",
         render: |c, key, raw| {
@@ -688,7 +670,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
-    // --- admin ---
     Setting {
         key: "admin.enabled",
         render: |c, key, raw| {
@@ -709,7 +690,7 @@ static SETTINGS: &[Setting] = &[
         // admin token is never shown."): the field renders empty and an
         // empty submit keeps the current token (`token_field`). The key
         // still has to be present, `the_registry_covers_every_rendered_key`
-        // and the edit form's input both read it.
+        // and the edit form's input both read it
         render: |_c, key, raw| {
             raw.insert(key.into(), String::new());
         },
@@ -776,7 +757,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| string_list(raw, key, cfg, lang, errors),
     },
-    // --- probe ---
     Setting {
         key: "probe.fail_limit",
         render: |c, key, raw| {
@@ -894,7 +874,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
-    // --- meow ---
     Setting {
         key: "meow.api_addr",
         render: |c, key, raw| {
@@ -938,7 +917,7 @@ static SETTINGS: &[Setting] = &[
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
     // `bool_to_raw`, not `to_string()`: the edit page renders checkbox
-    // state from the raw map, where empty means unchecked.
+    // state from the raw map, where empty means unchecked
     Setting {
         key: "meow.ipv6",
         render: |c, key, raw| {
@@ -946,7 +925,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| bool_field(raw, key, cfg, lang, errors),
     },
-    // --- retention ---
     Setting {
         key: "retention.probe_results_days",
         render: |c, key, raw| {
@@ -961,7 +939,7 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
     },
-    // 0 = the purge is off; the range table says so and the sweep skips.
+    // 0 = the purge is off; the range table says so and the sweep skips
     Setting {
         key: "retention.removed_proxies_days",
         render: |c, key, raw| {
@@ -969,7 +947,6 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
     },
-    // --- log ---
     Setting {
         key: "log.server",
         render: |c, key, raw| {
@@ -1010,7 +987,7 @@ fn rate_into(raw: &mut HashMap<String, String>, prefix: &str, rl: &RateLimit) {
     // them renders as its exact seconds (`90sec`, the vocabulary the
     // config parser round-trips): rendering it as the bucket it falls
     // into would make the next save rewrite the window (`10/90sec`
-    // would save as `10/min`).
+    // would save as `10/min`)
     raw.insert(
         format!("{prefix}.unit"),
         match rl.window.as_secs() {
@@ -1111,7 +1088,7 @@ fn save_settings(
     // override. On the success path below every one of them was applied
     // (a failed application would have produced `Invalid` above, and
     // nothing is written then). Rate-limit rows ride as their
-    // `.limit`/`.unit` halves.
+    // `.limit`/`.unit` halves
     let carried = |key: &str| raw.contains_key(key) || raw.contains_key(&format!("{key}.limit"));
     let written_keys: Vec<String> = SETTINGS
         .iter()
@@ -1130,7 +1107,7 @@ fn save_settings(
             ConfigWriteError::Conflict { .. } => SaveOutcome::Conflict,
             // The document the panel would write is one the binaries
             // refuse to load. That is the operator's file, not a
-            // server fault, and it has to be shown as such.
+            // server fault, and it has to be shown as such
             ConfigWriteError::InvalidDocument { .. } => {
                 SaveOutcome::InvalidDocument(err.to_string())
             }
@@ -1147,14 +1124,9 @@ fn save_settings(
 }
 
 pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    // The form is the view of the FILE, not of the running
-    // configuration: the panel writes the file, so the operator has to
-    // see what the file says. The environment is layered on top of it
-    // (and wins), and the fields it overrides are rendered read-only
-    // and left out of the write.
     let target = state.config_path.path_or_default();
-    // The read and the TOML parse are synchronous file work: on the
-    // blocking pool, so a slow disk cannot stall the async runtime.
+    // Synchronous file work: on the blocking pool, so a slow disk cannot
+    // stall the async runtime
     let (raw, load_error) = match tokio::task::spawn_blocking({
         let target = target.clone();
         move || raw_from_file(&target)
@@ -1163,11 +1135,11 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
     .unwrap_or_else(|err| Err(err.to_string()))
     {
         Ok(Some(raw)) => (raw, None),
-        // No file yet: the operator creates it from the defaults.
+        // No file yet: the operator creates it from the defaults
         Ok(None) => (raw_from_config(&state.live()), None),
         // The file is there but cannot be read: the live view is the
-        // only thing left to show, and the operator is told why the
-        // values below are not the file's.
+        // only thing left to show, and the banner explains why the
+        // values below are not the file's
         Err(reason) => {
             tracing::warn!(
                 error = %reason,
@@ -1204,15 +1176,15 @@ pub async fn settings_update(
     let lang = state.locales.lang_from_headers(&headers);
     let raw: HashMap<String, String> = form.into_iter().collect();
 
-    // The fields the environment overrides. The env layer wins over the
-    // file, so they are left out of the write and rendered read-only.
+    // The fields the environment overrides; the env layer wins over the
+    // file, so they are left out of the write and rendered read-only
     let env_locked = fumox_core::config::env_overridden_paths();
 
     // Optimistic concurrency: the form carries the fingerprint of the
-    // file it was rendered from. A file that changed since (a hand edit
-    // in a shell, another panel instance, a deployment that rewrote
-    // it) is refused instead of being overwritten by a form that never
-    // saw the newer content. The operator reloads and re-applies.
+    // file it was rendered from. A file that changed since (a hand edit,
+    // another panel instance, a deployment) is refused instead of being
+    // overwritten by a form that never saw the newer content; the
+    // operator reloads and re-applies
     let target = state.config_path.path_or_default();
     if form_is_stale(&target, &raw) {
         tracing::warn!(
@@ -1222,14 +1194,12 @@ pub async fn settings_update(
         return settings_edit_conflict(&state, &headers).await;
     }
 
-    // Build a fresh `EditableConfig` so we can fail-and-replay the form
-    // before touching disk. The validator only reads `raw` and the
-    // language catalog, no side effects. The editor holds the
-    // process-wide config lock, so it is confined to this cycle: its
-    // guard must not ride across the awaits below.
-    //
-    // The whole cycle is synchronous file work and runs on the blocking
-    // pool, so a slow disk cannot stall the async runtime.
+    // Build a fresh `EditableConfig` so the form can fail-and-replay
+    // before touching disk (the validator only reads `raw` and the
+    // language catalog). The editor holds the process-wide config lock,
+    // so its guard is confined to this cycle and must not ride across
+    // the awaits below. The whole cycle is synchronous file work on the
+    // blocking pool, so a slow disk cannot stall the async runtime
     let outcome = match tokio::task::spawn_blocking({
         let target = target.clone();
         let raw = raw.clone();
@@ -1413,7 +1383,7 @@ async fn saved_response(
 
     // The audit line names the file, the keys the submit wrote (names
     // only, never values) and a non-reversible tag of the session that
-    // made it.
+    // made it
     tracing::info!(
         path = %path,
         keys = written_keys.join(","),
@@ -1429,23 +1399,16 @@ async fn saved_response(
 /// Revoke every admin session when this submit rotated the admin token,
 /// answering whether it did.
 ///
-/// A token rotation through this form must also revoke the sessions
-/// minted under the old token: the session key is derived from the
-/// token at startup and stays frozen (`AdminState::session_key`), so
-/// without an epoch bump a stolen cookie keeps authenticating until
-/// the next restart.
-///
-/// The comparison is between the token of the document before the
-/// write and the one after it, so only an actual change counts: an
-/// unconditional bump would log out the very session performing an
-/// unrelated save. An empty submit is NOT a change: `token_field`
-/// reads it as "keep the current token", so treating it as a
-/// rotation would log the operator out of every unrelated save (the
-/// field renders empty and untouched fields submit empty).
-///
-/// A token the environment overrides is not a rotation at all: the
-/// file's value is inert, the running server keeps the environment's
-/// token, and the sessions that token minted stay valid.
+/// The session key is derived from the token at startup and stays frozen
+/// (`AdminState::session_key`), so without a revocation a stolen cookie
+/// keeps authenticating until the next restart. The comparison is
+/// between the token before the write and the one after it, so only an
+/// actual change counts: an unconditional bump would log out the very
+/// session performing an unrelated save, and an empty submit is NOT a
+/// change (`token_field` reads it as "keep the current token"; the field
+/// renders empty and untouched fields submit empty). A token the
+/// environment overrides is not a rotation at all: the file's value is
+/// inert and the running server keeps the environment's token.
 async fn revoke_rotated_token_sessions(
     state: &AdminState,
     env_locked: &[String],
@@ -1480,7 +1443,7 @@ fn saved_redirect(
     // /admin/settings, and every handler reading the live config,
     // renders the values the operator just wrote, instead of the startup
     // snapshot. ENV overrides are re-applied by `config::load` itself, so
-    // `FUMOX_*` env vars keep winning on top of the file.
+    // `FUMOX_*` env vars keep winning on top of the file
     if let Err(err) = state.refresh_live_config(Path::new(path)) {
         tracing::warn!(error = %err, path = %path, "live config refresh skipped");
         return settings_refresh_failed(lang, headers, path, &err);
@@ -1490,7 +1453,7 @@ fn saved_redirect(
     // environment overrules is not a plain success: the operator has to
     // learn that the value they changed is not the one in force. A
     // token rotation ends every session, the operator's own included,
-    // so its toast says so instead of a plain "saved".
+    // so its toast says so instead of a plain "saved"
     let (toast, level) = save_toast(lang, path, env_locked, token_rotated);
     if headers.get("HX-Request").is_some() {
         return htmx_redirect_with_toast("/admin/settings", &toast, level);
@@ -1528,7 +1491,7 @@ fn invalid_form_response(
     errors: Vec<(String, String)>,
 ) -> Response {
     // Field names only, never the submitted values: the log must
-    // explain the refusal without carrying what the operator typed.
+    // explain the refusal without carrying what the operator typed
     tracing::warn!(
         fields = ?errors.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
         "settings update rejected"
@@ -1537,7 +1500,7 @@ fn invalid_form_response(
     // the refusal would otherwise pin the typed secret into the
     // 422 page. The field comes back empty and the message under
     // it says the token was not applied, so the operator knows
-    // it has to be typed again.
+    // it has to be typed again
     let mut raw = raw;
     raw.insert(KEY_ADMIN_TOKEN.to_string(), String::new());
     let mut errors = errors;
@@ -1706,7 +1669,7 @@ fn htmx_redirect_with_toast(redirect_to: &str, toast: &str, level: &str) -> Resp
 async fn settings_edit_conflict(state: &AdminState, headers: &HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(headers);
     // The re-read is synchronous file work: on the blocking pool, so a
-    // slow disk cannot stall the async runtime.
+    // slow disk cannot stall the async runtime
     let raw = match tokio::task::spawn_blocking({
         let target = state.config_path.path_or_default();
         move || raw_from_file(&target)
@@ -1780,7 +1743,7 @@ fn settings_edit_load_error(
 }
 
 /// Create `config/app.toml` from the embedded reference copy when it is
-/// missing. No-op when the file already exists, so a retry from a stale
+/// missing; no-op when the file already exists, so a retry from a stale
 /// tab is harmless.
 pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
@@ -1793,7 +1756,7 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     // Back to the overview with the reason as an error toast, like
     // every other answer of this button: the operator clicked on the
     // overview, the answer lands where they are instead of a 422 page
-    // that looks like the editor broke.
+    // that looks like the editor broke
     if let Some(message) = create_blocked_message(&lang, &target) {
         return super::flash_redirect("/admin/settings", &message, "error");
     }
@@ -1801,7 +1764,7 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     // The file is written through the same atomic path a save takes: a
     // temporary file in the same directory, fsynced, then moved into
     // place. A create that dies half-way leaves no half-written config
-    // behind for the next start to refuse.
+    // behind for the next start to refuse
     if let Err(err) = write_reference_config(target.clone()).await {
         tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
         return settings_create_failed(&state, &headers, err);
@@ -1814,7 +1777,7 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     // The file was just materialised from the embedded reference copy;
     // pull the freshly-merged view into the in-memory cache so the next
     // GET to /admin/settings/edit (and the *Settings* overview) renders
-    // every default rather than the empty startup snapshot.
+    // every default rather than the empty startup snapshot
     if let Err(err) = state.refresh_live_config(&target) {
         return create_refresh_failed(&lang, &target, &err);
     }
@@ -1905,8 +1868,6 @@ fn settings_create_failed(state: &AdminState, headers: &HeaderMap, message: Stri
     )
 }
 
-// Validation / application.
-
 /// Walk every registered setting and apply the ones the form carried.
 /// Each field is parsed in isolation, errors accumulate without
 /// short-circuiting so the operator sees every problem on a single
@@ -1929,7 +1890,7 @@ fn apply_all(
         (setting.apply)(raw, setting.key, cfg, lang, errors);
     }
 
-    // Cross-field checks the serde model cannot express.
+    // Cross-field checks the serde model cannot express
     let max = raw
         .get(KEY_MEOW_BACKOFF_MAX)
         .and_then(|s| s.parse::<u64>().ok());
@@ -1937,7 +1898,7 @@ fn apply_all(
         .get(KEY_MEOW_BACKOFF_MIN)
         .and_then(|s| s.parse::<u64>().ok());
     // A locked side of the pair carries the environment's value, not
-    // the file's, so the two halves are not comparable here.
+    // the file's, so the two halves are not comparable here
     if is_env_locked(KEY_MEOW_BACKOFF_MAX, env_locked)
         || is_env_locked(KEY_MEOW_BACKOFF_MIN, env_locked)
     {
@@ -1955,8 +1916,6 @@ fn apply_all(
         ));
     }
 }
-
-// Field helpers.
 
 /// Return the value at `field` only when the form actually carried it.
 /// Missing fields are skipped silently, the editor only writes the
@@ -2043,14 +2002,14 @@ fn token_field(
     let v = v.trim();
     if v.is_empty() {
         // Keep-current: nothing is written, the document keeps the
-        // token it loaded from disk.
+        // token it loaded from disk
         return;
     }
     if v == fumox_core::config::PLACEHOLDER_ADMIN_TOKEN {
         // The placeholder is not a credential: writing it would leave the
         // server unable to start on a non-loopback bind, and it would
         // never open a session. Reject it here, where the operator can
-        // still fix it.
+        // still fix it
         errors.push((
             field.to_string(),
             lang.t("val.token_placeholder").to_string(),
@@ -2066,7 +2025,7 @@ fn token_field(
 fn out_of_range(field: &str, lang: &Lang) -> String {
     let Some(range) = bounds::range_of(field) else {
         // A numeric field with no entry in the table is a wiring bug,
-        // not a user error. Say so instead of blaming the input.
+        // not a user error. Say so instead of blaming the input
         return format!("{field} has no configured range");
     };
     lang.t_args(
@@ -2102,8 +2061,8 @@ fn u64_field(
         errors.push((field.into(), out_of_range(field, lang)));
         return;
     }
-    // `item::integer` stores an `i64`, so a larger `u64` wraps negative
-    // on the write and the saved config fails to load at the next start.
+    // A larger `u64` would wrap negative on the write (see
+    // [`fits_document_i64`])
     if !fits_document_i64(parsed) {
         errors.push((
             field.into(),
@@ -2182,7 +2141,7 @@ fn bool_field(
     // reached) must not reset the setting: writing `false` for it would
     // change a value nobody touched. The form posts the hidden
     // `value="off"` pair next to every checkbox, so an unchecked box
-    // still arrives as an explicit "off".
+    // still arrives as an explicit "off"
     let Some(v) = raw_get(raw, field) else { return };
     let Some(b) = parse_bool_literal(v) else {
         errors.push((field.into(), lang.t_args("val.bad_bool", &[v.to_string()])));
@@ -2255,7 +2214,7 @@ fn url_list(
     }
     // The guard lives in the `[probe]` section, which the editor applies
     // before this one, so the flag in hand is the one the operator just
-    // saved, not the one on disk.
+    // saved, not the one on disk
     let allow_private = cfg
         .get("probe.allow_private_targets")
         .and_then(|item| item.as_bool())
@@ -2343,23 +2302,18 @@ fn cidr_list(
 
 /// One integer per line, bounded the way the canonical loader bounds the
 /// field it writes: at most `max_items` entries, each within `min..=max`.
-/// The admin panel writes the file verbatim and the next start of both
-/// binaries aborts on anything `fumox_core::config` refuses, so a bound
-/// the loader does not share would turn a green toast into a dead server.
-///
-/// Bounds of the quarantine recheck ladder, copied from
-/// `fumox_core::config::de_recheck_delays` (the deserializer both
-/// binaries load the file with). The panel writes the file verbatim, so
-/// it must refuse exactly what that parser refuses: a value the loader
-/// rejects aborts the next start of fumox-server and fumox-probe.
+/// The bounds of the quarantine recheck ladder are copied from
+/// `fumox_core::config::de_recheck_delays`, the deserializer both
+/// binaries load the file with; the panel writes the file verbatim, so a
+/// bound the loader does not share would turn a green toast into a dead
+/// server.
 ///
 /// An empty list is refused even though the loader accepts one: for the
 /// only field using this helper today, the recheck ladder, `[]` means
 /// «remove the proxy right after the failed second chance». The field
 /// hint says so (`set.ladder_hint` names the `recheck_delays_secs = []`
 /// file edit), and silently emptying the textarea behind a success toast
-/// would disable the quarantine ladder anyway — the panel refuses it and
-/// the operator makes the change in the file directly.
+/// would disable the quarantine ladder anyway.
 #[allow(clippy::too_many_arguments)]
 fn i64_list_field(
     raw: &HashMap<String, String>,
@@ -2401,7 +2355,7 @@ fn i64_list_field(
     // The count, not a value, is what failed: `val.in_range` is the
     // scalar range key the other helpers use and would read as a per-value
     // bound that the very same check accepts `max_items` of. The message
-    // counts generic entries, not whatever the caller's field calls them.
+    // counts generic entries, not whatever the caller's field calls them
     if parsed.len() > max_items {
         errors.push((
             field.into(),
@@ -2481,7 +2435,7 @@ fn rate_limit(
     errors: &mut Vec<(String, String)>,
 ) {
     // Both halves of the pair must be present, leaving one out means
-    // the form was incomplete.
+    // the form was incomplete
     let limit_raw = raw_get(raw, &format!("{prefix}.limit")).map(str::to_string);
     let unit_raw = raw_get(raw, &format!("{prefix}.unit")).map(str::to_string);
     let (limit_raw, unit_raw) = match (limit_raw, unit_raw) {
@@ -2490,7 +2444,7 @@ fn rate_limit(
             // The unit half did not come in. The document supplies it,
             // so the limit is still checked against the pair it would
             // form, and the submit is then refused: a form that lost
-            // half of a pair is not a form the operator meant to send.
+            // half of a pair is not a form the operator meant to send
             let stored = stored_rate_unit(cfg, prefix);
             errors.push((
                 format!("{prefix}.unit"),
@@ -2519,12 +2473,10 @@ fn rate_limit(
             return;
         }
     };
-    // The form has always advertised `min="1" max="1000000"` on this
-    // input, but nothing checked it: the browser's number validation is
-    // the only thing that ever enforced it, so a hand-crafted POST wrote
-    // `0/min` and every public request met the limit. The bound now
-    // comes from the same table the form renders, which is the point of
-    // having one.
+    // The form advertises `min="1" max="1000000"` on this input; a
+    // hand-crafted POST used to write `0/min` and lock every public
+    // request behind a zero budget, so the bound comes from the same
+    // table the form renders
     let field = format!("{prefix}.limit");
     if !bounds::range_of(&field).is_some_and(|r| r.contains(u64::from(limit))) {
         let msg = out_of_range(&field, lang);
@@ -2537,7 +2489,7 @@ fn rate_limit(
     // vocabulary, and a window the four select options cannot express
     // (rendered as its exact seconds, `90sec`) would be silently
     // rewritten into a different one. An unchanged pair leaves the
-    // document alone.
+    // document alone
     let unchanged = stored_rate_limit_text(cfg, prefix)
         .and_then(|text| text.parse::<RateLimit>().ok())
         .is_some_and(|stored| {
@@ -2557,7 +2509,7 @@ fn rate_limit(
     // through [`RATE_UNITS`] — no intermediate seconds for the four
     // select options to be re-spelled through. The exact-seconds form
     // (`90sec`) is what the render side emits for a window the four
-    // cannot spell; the config parser accepts the same vocabulary.
+    // cannot spell; the config parser accepts the same vocabulary
     let unit = unit_str.trim();
     let toml_unit = match RATE_UNITS.iter().find(|(form, _)| *form == unit) {
         Some((_, toml)) => (*toml).to_string(),
@@ -2580,7 +2532,7 @@ fn rate_limit(
     // form and the bounds table know `{prefix}.limit`, but the document
     // stores the whole `limit/unit` string under `{prefix}` itself. Like
     // `set_field`, a rejected write must surface as a per-field error
-    // instead of being swallowed behind a success toast.
+    // instead of being swallowed behind a success toast
     if let Err(err) = cfg.set(prefix, item::string(format!("{limit}/{toml_unit}"))) {
         errors.push((field, lang.t_args("val.write_failed", &[err.to_string()])));
     }
@@ -2616,7 +2568,7 @@ mod tests {
     fn test_lang() -> Lang {
         // Embedded catalogs load without a directory. Resolve an explicit
         // English code so the per-error assertions read stable text;
-        // the Russian copy is exercised by the i18n catalog tests.
+        // the Russian copy is exercised by the i18n catalog tests
         crate::admin::i18n::Locales::load(Path::new("/nonexistent-fumox-locales")).resolve("en")
     }
 
@@ -2701,17 +2653,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Regression: `cfg.set` returns `UnknownSection` when the slot on
-    /// disk holds a non-table value, and every call site used to discard
-    /// that result. The save then wrote the untouched document and the
-    /// operator got a success toast for a setting that was never
-    /// applied. The failure must surface as a per-field error.
+    /// Regression: a slot on disk holding a non-table value used to be
+    /// swallowed, saving the untouched document behind a success toast;
+    /// the failure must surface as a per-field error.
     #[test]
     fn apply_all_surfaces_unsettable_slot_instead_of_swallowing_it() {
         let dir = temp_dir("unsettable");
         let path = dir.join("app.toml");
         // `server` is a scalar where the editor needs a table to dive
-        // into for `server.bind`.
+        // into for `server.bind`
         std::fs::write(&path, "server = 42\n[probe]\nfail_limit = 3\n").unwrap();
 
         let mut raw = HashMap::new();
@@ -2727,7 +2677,7 @@ mod tests {
             collect_field(&errors, "server.bind").is_some(),
             "a failed set must surface as a field error, got {errors:?}"
         );
-        // The failure is per-field: unrelated edits still applied.
+        // The failure is per-field: unrelated edits still applied
         assert!(cfg.doc().to_string().contains("fail_limit = 5"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2735,8 +2685,8 @@ mod tests {
     #[test]
     fn apply_all_ip_family_round_trips_through_parser() {
         // The dropdown values must match IpFamily::from_str, otherwise
-        // the admin save writes a value that the canonical parser
-        // refuses on the next restart, silently reverting to default.
+        // the save writes a value the canonical parser refuses on the
+        // next restart, silently reverting to default
         use std::str::FromStr;
 
         let dir = temp_dir("ip-roundtrip");
@@ -2762,7 +2712,7 @@ mod tests {
 
             // toml_edit serialises the leaf under its `[fetch]` section
             // header, so the on-disk text contains the bare key
-            // (`ip_family = "ipv4"`) rather than the dotted form.
+            // (`ip_family = "ipv4"`) rather than the dotted form
             assert!(
                 serialized.contains(&format!("ip_family = \"{}\"", family.as_str())),
                 "saved config missing the literal for {family:?}: {serialized}"
@@ -2820,7 +2770,7 @@ mod tests {
         let mut raw = HashMap::new();
         raw.insert("ingest.drop_gate".into(), "on".into());
         // `removed_as_unknown` is absent: a checkbox the browser did
-        // not post must not reset the setting.
+        // not post must not reset the setting
 
         let lang = test_lang();
         let mut errors = Vec::new();
@@ -2873,10 +2823,9 @@ mod tests {
     }
 
     /// A window the four form units cannot spell (`10/90sec`) must
-    /// survive a save that did not touch the pair. The edit page renders
-    /// its exact seconds (`90sec`), and the pair submitted back verbatim
-    /// is not rewritten; the old render bucketed 90s into `min`, so
-    /// saving any other field silently turned the window into `10/min`.
+    /// survive a save that did not touch the pair: the edit page renders
+    /// its exact seconds, and the pair submitted back verbatim is not
+    /// rewritten.
     #[test]
     fn noncanonical_rate_window_survives_an_untouched_save() {
         let dir = temp_dir("rate-window");
@@ -2888,7 +2837,7 @@ mod tests {
         .unwrap();
 
         // The edit page renders the exact seconds, not the bucket the
-        // window falls into.
+        // window falls into
         let raw = raw_from_file(&path).unwrap().expect("the file parses");
         assert_eq!(
             raw.get("server.rate_limit.limit").map(String::as_str),
@@ -2903,7 +2852,7 @@ mod tests {
         // keeps the window exactly as the document holds it. Each cycle
         // scopes its `EditableConfig` handle: the editor holds the
         // config lock from `load` to drop, so a second overlapping load
-        // would deadlock.
+        // would deadlock
         let lang = test_lang();
         let mut raw = raw;
         raw.insert("probe.fail_limit".into(), "7".into());
@@ -2921,7 +2870,7 @@ mod tests {
         );
         assert!(serialized.contains("fail_limit = 7"), "{serialized}");
 
-        // A pair the operator did change is written as submitted.
+        // A pair the operator did change is written as submitted
         let mut raw = raw_from_file(&path).unwrap().unwrap();
         raw.insert("server.rate_limit.limit".into(), "20".into());
         raw.insert("server.rate_limit.unit".into(), "min".into());
@@ -2961,8 +2910,8 @@ mod tests {
         // `EditLock` that `EditableConfig::load` holds: the plain loader
         // reads the file without it, and has to keep doing so, because the
         // admin handler re-reads through it while the editor handle is still
-        // in scope. A loader that took the lock would deadlock the request.
-        // See `fumox_core::config_writer::EditLock`.
+        // in scope. A loader that took the lock would deadlock the request
+        // See `fumox_core::config_writer::EditLock`
         let save = |raw: &HashMap<String, String>| -> Vec<(String, String)> {
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
@@ -2983,7 +2932,7 @@ mod tests {
             )])
         };
 
-        // A ladder the loader accepts must save and reload unchanged.
+        // A ladder the loader accepts must save and reload unchanged
         let steps: Vec<i64> = (1..=16).collect();
         let errors = save(&ladder(&steps));
         assert!(errors.is_empty(), "16 steps must be accepted: {errors:?}");
@@ -2991,12 +2940,10 @@ mod tests {
         assert_eq!(loaded.probe.recheck_delays_secs, steps);
 
         // 17 steps: the panel must refuse it, the loader would not. The
-        // message must name the count, not borrow the scalar range wording
-        // `u64_field` and friends use, «must be between 0 and 16» reads
-        // as a per-delay bound and contradicts the 16 steps just accepted.
-        // It also must stay generic: `i64_list_field` is parameterised by
-        // `max_items` and knows nothing about ladders, so it counts
-        // entries, not steps.
+        // message names the count, not a scalar range («must be between
+        // 0 and 16» would read as a per-delay bound contradicting the 16
+        // steps just accepted), and stays generic: `i64_list_field`
+        // counts entries, not steps
         let errors = save(&ladder(&(1..=17).collect::<Vec<i64>>()));
         let message = collect_field(&errors, "probe.recheck_delays_secs")
             .unwrap_or_else(|| panic!("17 steps must be refused with a message, got {errors:?}"));
@@ -3015,7 +2962,7 @@ mod tests {
         );
 
         // Per-delay range: 0, a negative and 30 days + 1s are out,
-        // 30 days exactly is in.
+        // 30 days exactly is in
         for (value, accepted) in [
             ("0", false),
             ("-1", false),
@@ -3035,7 +2982,7 @@ mod tests {
         // ladder: `[]` means «remove the proxy right after the failed
         // second chance», the field hint sends the operator to the file
         // for that (`set.ladder_hint`), and the panel must not trade the
-        // operator's ladder for it on a stray select-all + delete.
+        // operator's ladder for it on a stray select-all + delete
         let errors = save(&ladder(&[]));
         assert_eq!(
             collect_field(&errors, "probe.recheck_delays_secs"),
@@ -3054,10 +3001,8 @@ mod tests {
 
     /// Every dotted key the registry renders must be parseable back by
     /// the very same registry, and the shipped defaults must validate
-    /// cleanly. This is the whole render→parse pairing in one shot: a
-    /// field added to one side but not the other, or a default outside
-    /// the advertised range, fails here instead of surfacing as a
-    /// silently reverted or unsaveable setting.
+    /// cleanly; a one-sided field or an out-of-range default fails here
+    /// instead of surfacing as a silently reverted or unsaveable setting.
     #[test]
     fn the_registry_round_trips_the_default_config_with_zero_errors() {
         let dir = temp_dir("registry-roundtrip");
@@ -3075,9 +3020,8 @@ mod tests {
 
     /// The keys `raw_from_config` produces are exactly the registry's:
     /// every registered key is rendered (a rate-limit entry as its
-    /// `.limit`/`.unit` pair), and nothing is rendered that the registry
-    /// does not own. A key that appears here but nowhere else is exactly
-    /// the silent drift this table exists to prevent.
+    /// `.limit`/`.unit` pair) and nothing is rendered that the registry
+    /// does not own.
     #[test]
     fn the_registry_covers_every_rendered_key() {
         let raw = raw_from_config(&AppConfig::default());
@@ -3143,11 +3087,10 @@ mod tests {
         expanded
     }
 
-    /// The HTML form is the one hand-written artifact left: this test is
-    /// the stitch that keeps it honest. Every input the form posts must
-    /// belong to a registry entry, and every entry must be editable
-    /// through the form, either under its own `name=` or, for a
-    /// rate-limit pair, as `.limit` + `.unit`.
+    /// The HTML form is the one hand-written artifact: every input it
+    /// posts must belong to a registry entry, and every entry must be
+    /// editable through the form (a rate-limit pair as `.limit` +
+    /// `.unit`).
     #[test]
     fn the_form_posts_exactly_the_registered_settings() {
         let template =
@@ -3186,10 +3129,8 @@ mod tests {
     }
 
     /// Every field the form can carry has a place to show what the
-    /// server refused. The registry decides which fields exist, and the
-    /// server reports its errors under those field names, so a field
-    /// without an error block would swallow the message: the page comes
-    /// back with a 422 and nothing on it.
+    /// server refused; a field without an error block would swallow the
+    /// message (the page comes back with a 422 and nothing on it).
     #[test]
     fn the_form_carries_an_error_block_for_every_field() {
         let raw = raw_from_config(&AppConfig::default());
@@ -3212,11 +3153,10 @@ mod tests {
         }
     }
 
-    /// Regression for the *Edit settings* bug where the page re-rendered
-    /// stale `state.config` instead of reading the file the editor just
-    /// wrote to. After `EditableConfig::save()`, a subsequent reload
-    /// must hand the form the new on-disk values, not the in-memory
-    /// snapshot frozen at startup.
+    /// Regression: the page used to re-render stale in-memory state
+    /// instead of the file the editor just wrote; after
+    /// `EditableConfig::save()`, a reload must hand the form the new
+    /// on-disk values.
     #[test]
     fn raw_from_config_reflects_post_save_file_state() {
         use fumox_core::config::load_config;
@@ -3234,15 +3174,15 @@ mod tests {
         let raw = raw_from_config(&cfg);
         // `drop_gate = false` in the file → key present with empty value;
         // `bool_value` parses the literals through `parse_bool_literal`,
-        // so an empty string (and an absent key) read as unchecked.
+        // so an empty string (and an absent key) read as unchecked
         assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some(""));
-        // `secure_cookies = true` → "on".
+        // `secure_cookies = true` → "on"
         assert_eq!(
             raw.get("admin.secure_cookies").map(String::as_str),
             Some("on")
         );
 
-        // Simulate the admin save: flip the bool values in the file.
+        // Simulate the admin save: flip the bool values in the file
         std::fs::write(
             &path,
             "[ingest]\ndrop_gate = true\n[admin]\nsecure_cookies = false\n",
@@ -3251,9 +3191,6 @@ mod tests {
 
         let cfg = load_config(Some(&path)).expect("post-save load must work");
         let raw = raw_from_config(&cfg);
-        // The fresh load must see the *new* file values, not the
-        // startup snapshot, this is the regression for the bug where
-        // the edit page re-rendered stale in-memory state.
         assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some("on"));
         assert_eq!(
             raw.get("admin.secure_cookies").map(String::as_str),
@@ -3264,15 +3201,9 @@ mod tests {
     }
 
     /// Every number input in the settings form resolves to a row in
-    /// `config::bounds`, and no bound in that table is left unrendered.
-    ///
-    /// The ranges used to exist twice: as literal `min`/`max` attributes
-    /// in the template and as literal arguments at the save site. The two
-    /// could disagree and nothing noticed, which is how the rate-limit
-    /// inputs ended up advertising a range the server never checked. Now
-    /// that both read one table, the only drift left to guard is the
-    /// table losing or gaining a key the form does not use, and a key
-    /// typed into a field that is not in the table at all.
+    /// `config::bounds`, and no bound in that table is left unrendered:
+    /// both sides read one table, so the only drift left to guard is the
+    /// table losing or gaining a key the form does not use.
     #[test]
     fn every_number_input_has_a_bounds_entry() {
         let template = include_str!("../../../templates/settings_edit.html");
@@ -3323,11 +3254,9 @@ mod tests {
         }
     }
 
-    /// The form has always advertised `min="1" max="1000000"` on the
-    /// rate-limit inputs. Before the table existed nothing checked it:
-    /// only the browser's own number validation enforced it, so a POST
-    /// that skipped the browser wrote `0/min` and locked every public
-    /// route behind a zero budget. The bound is now the loader's.
+    /// The rate-limit inputs advertise `min="1" max="1000000"`; the
+    /// bound is the loader's, so a POST that skips the browser cannot
+    /// write `0/min` and lock every public route behind a zero budget.
     #[test]
     fn rate_limit_rejects_a_value_outside_the_advertised_range() {
         let dir = temp_dir("rate-range");
@@ -3366,7 +3295,7 @@ mod tests {
             bounds::display("probe.sample_size").as_deref(),
             Some("1..=100000")
         );
-        // A key that is not a bounded number has no range to render.
+        // A key that is not a bounded number has no range to render
         assert_eq!(bounds::max_attr("server.bind"), "");
         assert_eq!(bounds::display("server.bind"), None);
     }
@@ -3391,7 +3320,7 @@ mod tests {
             );
         }
         // An unknown literal is refused; an absent entry reads as the
-        // empty-string default.
+        // empty-string default
         assert_eq!(parse_bool_literal("maybe"), None);
     }
 
@@ -3519,9 +3448,6 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
 
-        // The document stores integers as `i64`. A larger value would
-        // wrap negative on the write and the saved config would fail to
-        // load at the next start.
         assert!(fits_document_i64(i64::MAX as u64));
         assert!(!fits_document_i64(i64::MAX as u64 + 1));
         assert!(!fits_document_i64(u64::MAX));
@@ -3531,9 +3457,8 @@ mod tests {
     /// re-parses them at startup and DROPS what it cannot parse (fail
     /// closed, pinned by the `parse_trusted_cidrs` tests in
     /// `admin_tests.rs`). An entry the parser would drop must therefore
-    /// be refused here behind a field error: the old `string_list`
-    /// behavior persisted e.g. `10.0.0.0/33` behind a success toast and
-    /// silently emptied the entry at the next restart, degrading per-IP
+    /// be refused here behind a field error: persisting it would
+    /// silently empty the list at the next restart, degrading per-IP
     /// rate limiting to peer-IP keying and switching the
     /// X-Forwarded-Proto scheme detection off.
     #[test]
@@ -3650,7 +3575,7 @@ mod tests {
         );
 
         // The document keeps the token it had: the placeholder never
-        // reaches the file.
+        // reaches the file
         cfg.save().unwrap();
         let loaded = load_config(Some(&path)).expect("the kept token must load");
         assert_eq!(loaded.admin.token, "live-secret");
@@ -3677,7 +3602,7 @@ mod tests {
         let lang = test_lang();
 
         // Empty and whitespace-only submits are keep-current: no error,
-        // the token on disk survives save → reload.
+        // the token on disk survives save → reload
         for submitted in ["", "   "] {
             let mut raw = HashMap::new();
             raw.insert("admin.token".into(), submitted.into());
@@ -3693,7 +3618,7 @@ mod tests {
             assert_eq!(loaded.admin.token, "live-secret");
         }
 
-        // A non-empty submit still rotates the token.
+        // A non-empty submit still rotates the token
         let mut raw = HashMap::new();
         raw.insert("admin.token".into(), "  rotated-secret  ".into());
         let mut errors = Vec::new();
@@ -3739,12 +3664,11 @@ mod tests {
     }
 
     /// The edit page as rendered: the live token must not appear
-    /// anywhere in the markup (the leak used to be the `value` attribute
-    /// of the password input on every GET), and a not-writable config
-    /// must disable the form controls (USERGUIDE: "every control is
-    /// disabled") on top of the banner the page already showed. The
-    /// template is built through the same `edit_template` constructor the
-    /// handlers use, so the test renders exactly what a request renders.
+    /// anywhere in the markup, and a not-writable config must disable
+    /// the form controls (USERGUIDE: "every control is disabled") on top
+    /// of the banner the page already showed. Built through the same
+    /// `edit_template` constructor the handlers use, so the test renders
+    /// exactly what a request renders.
     #[tokio::test]
     async fn settings_edit_renders_without_the_token_and_disables_fields_when_unwritable() {
         let admin = AdminConfig {
@@ -3759,7 +3683,7 @@ mod tests {
 
         // Not writable: the panes are wrapped in a disabled fieldset,
         // the submit button is disabled on its own, the token is still
-        // absent, and the banner names the file.
+        // absent, and the banner names the file
         state.config_writable = false;
         let template = edit_template(
             &state,
@@ -3790,7 +3714,7 @@ mod tests {
             "the banner must be announced as an alert: {html:.400}"
         );
 
-        // Writable: nothing disabled, token still absent, no banner.
+        // Writable: nothing disabled, token still absent, no banner
         state.config_writable = true;
         let template = edit_template(
             &state,
@@ -3818,21 +3742,18 @@ mod tests {
     }
 
     /// USERGUIDE promises that on a not-writable config "the same banner
-    /// appears on the overview" (a first-class deployment mode via
+    /// appears on the overview" (a deployment mode via
     /// `FUMOX_CONFIG_ACCESS=ro`). Render the real overview template for
-    /// both states so the promise cannot regress silently again. The view
-    /// model comes from the shared [`SettingsView::from_state`] the
-    /// handler itself uses, the banner text is compared in the escaped
-    /// form askama renders (a path with a markup character must be found
-    /// the way the page prints it), and the banner must sit in a
-    /// `role="alert"` container, not plain text.
+    /// both states; the banner text is compared in the escaped form
+    /// askama renders, and the banner must sit in a `role="alert"`
+    /// container, not plain text.
     #[tokio::test]
     async fn settings_overview_shows_the_unwritable_banner() {
         let lang = test_lang();
         for (writable, path) in [
             (false, "/tmp/fumox-overview/app.toml".to_string()),
             // A path with a markup character: the page may only show it
-            // escaped (`&` renders as askama's numeric reference).
+            // escaped (`&` renders as askama's numeric reference)
             (false, "/tmp/a&b/app.toml".to_string()),
             (true, "/tmp/fumox-overview/app.toml".to_string()),
         ] {
@@ -3868,7 +3789,7 @@ mod tests {
                     "the banner must render inside a role=alert container: {html:.400}"
                 );
                 // The escaped path itself, independent of the catalog
-                // wording: `&` reaches the page only as its escaped form.
+                // wording: `&` reaches the page only as its escaped form
                 let escaped_path = crate::admin::askama_html_escape(&path);
                 assert!(
                     html.contains(&escaped_path),
@@ -4041,7 +3962,7 @@ mod tests {
             settings_refresh_failed(&lang, &HeaderMap::new(), "/etc/fumox/app.toml", &err);
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        // The message rides in a header, the redirect target stays clean.
+        // The message rides in a header, the redirect target stays clean
         assert_eq!(
             response
                 .headers()
@@ -4224,14 +4145,14 @@ mod tests {
         );
 
         // A missing file is not an error: the operator creates it from
-        // the defaults.
+        // the defaults
         let missing = dir.join("absent.toml");
         assert!(
             raw_from_file(&missing).unwrap().is_none(),
             "a missing file must not be an error"
         );
 
-        // A file that cannot be parsed names the reason.
+        // A file that cannot be parsed names the reason
         let broken = dir.join("broken.toml");
         std::fs::write(&broken, "[ingest\ndrop_gate = true\n").unwrap();
         assert!(
@@ -4266,7 +4187,7 @@ mod tests {
         );
 
         // A key the environment overrides is not written: the env layer
-        // wins over the file, so naming it would be a lie.
+        // wins over the file, so naming it would be a lie
         let raw = HashMap::from([("admin.token".to_string(), "new-token".to_string())]);
         let outcome = save_settings(path, raw, test_lang(), vec![KEY_ADMIN_TOKEN.to_string()]);
         let SaveOutcome::Saved { written_keys, .. } = outcome else {
@@ -4296,7 +4217,7 @@ mod tests {
             &[("path", "/etc/fumox/app.toml".to_string())],
         );
         assert_eq!(message, expected);
-        // The rotation wording is distinct from the plain saved toast.
+        // The rotation wording is distinct from the plain saved toast
         assert_ne!(
             message,
             lang.t_named(
@@ -4334,7 +4255,7 @@ mod tests {
 
         // The token is the sharpest case: the panel runs under the
         // environment's token whatever the file says, so a green toast
-        // would claim a rotation that did not happen.
+        // would claim a rotation that did not happen
         let (message, level) = save_toast(
             &lang,
             "/etc/fumox/app.toml",
@@ -4379,7 +4300,7 @@ mod tests {
 
         // The control of the locked field carries the attribute, and
         // the hidden mirror next to it does too: a mirror that stayed
-        // enabled would post the field and defeat the lock.
+        // enabled would post the field and defeat the lock
         assert!(
             html.contains(r#"<input type="checkbox" name="ingest.drop_gate" value="on" id="ingest-drop" checked disabled>"#),
             "the locked checkbox must be disabled: {html}"
@@ -4388,13 +4309,13 @@ mod tests {
             html.contains(r#"<input type="hidden" name="ingest.drop_gate" value="off" disabled>"#),
             "the hidden mirror of the locked checkbox must be disabled: {html}"
         );
-        // A field that is not locked stays editable.
+        // A field that is not locked stays editable
         assert!(
             html.contains(r#"<input type="checkbox" name="ingest.removed_as_unknown" value="on" id="ingest-removed" >"#)
                 || html.contains(r#"name="ingest.removed_as_unknown" value="on" id="ingest-removed""#),
             "an unlocked field must stay editable: {html}"
         );
-        // The reason is on the page.
+        // The reason is on the page
         let lang = test_lang();
         let hint = lang.t_named(
             "set.env_locked_hint",

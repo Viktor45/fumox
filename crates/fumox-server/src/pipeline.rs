@@ -1,23 +1,19 @@
 //! Processing pipeline JSON v1.
 //!
-//! The pipeline configuration is stored as JSON in `sources.pipeline` and
-//! `profiles.pipeline`; the profile config overrides matching top-level
-//! sections of each source config. Validation is strict: unknown keys are
-//! errors, so a future schema v2 can add fields without ambiguity. Regexes
-//! are compiled at save time; an uncompilable pattern rejects the form.
+//! Stored as JSON in `sources.pipeline` and `profiles.pipeline`; the
+//! profile config overrides matching top-level sections of each source
+//! config. Validation is strict: unknown keys are errors, regexes are
+//! compiled at save time.
 //!
 //! Step order: parse → filter → drop → rename → geo-enrich →
 //! health-filter → merge+dedup → sort → encode. Parse happens during
-//! ingestion, health-filtering is expressed as a status exclusion list for
-//! the repository query (and re-applied here defensively), encode lives in
-//! the serving layer. The `drop` rules run at ingestion too (the source's
-//! own pipeline, via [`CompiledPipeline::drop_entries_with_geo`]), before
-//! `rename`, so both sides see the original values. The ASN filters read a
-//! fact the row may not carry yet, so [`fill_missing_asns`] completes it
-//! before them. The two ASN exclusion mechanisms are deliberately
-//! distinct: `filter.exclude_asns` hides matching rows from the output
-//! while the rows stay stored, a drop rule with `target: "asn"` keeps them
-//! from being stored at all. Speed-enrich is a stub until Phase 4.
+//! ingestion, health-filtering is a status exclusion list re-applied here
+//! defensively, encode lives in the serving layer. Drop rules run at
+//! ingestion too ([`CompiledPipeline::drop_entries_with_geo`]) before
+//! `rename`, so both sides see the original values. The two ASN exclusion
+//! mechanisms are distinct by design: `filter.exclude_asns` hides rows
+//! from the output while they stay stored, a drop rule with
+//! `target: "asn"` keeps them from being stored at all.
 
 use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoResolver, HostGeo, apply_template};
 use fumox_core::models::{ProxyEntry, ProxyStatus, Scheme};
@@ -28,36 +24,32 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 
-/// Default geo name template.
 pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
 
 /// Raw pipeline configuration, deserialized with `deny_unknown_fields` at
-/// every level so unknown keys fail validation. `pub(crate)` so the admin
-/// pipeline editor's ingest parses JSON with the exact same definitions
-/// instead of mirroring them.
+/// every level. `pub(crate)` so the admin pipeline editor's ingest parses
+/// JSON with the exact same definitions instead of mirroring them.
 ///
 /// The `Serialize` side carries the builder's omit-defaults emit policy:
-/// only non-default values are written (`Option`s when present,
-/// booleans and defaulted fields only when they differ from their schema
-/// default), so the editor builds a typed [`PipelineConfig`] and
-/// serializes it instead of restating every key literal in a hand-rolled
-/// writer.
+/// only non-default values are written, so the editor builds a typed
+/// [`PipelineConfig`] and serializes it instead of restating every key
+/// literal in a hand-rolled writer.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PipelineConfig {
     /// Schema version; must be `1`. A missing key defaults to `0`, which
     /// fails the `pipeline.version` check in [`CompiledPipeline::from_json`]
-    /// like any other wrong value: an unversioned document is a localized
-    /// field error instead of an opaque serde type error.
+    /// like any other wrong value: a localized field error instead of an
+    /// opaque serde type error.
     #[serde(default)]
     pub(crate) version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) filter: Option<FilterConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rename: Option<Vec<RenameRule>>,
-    /// Discard rules: a proxy matching any rule is never
-    /// stored. Applied at ingestion (the source's own pipeline) and again
-    /// on serving before `rename`, so both sides see the original values.
+    /// Discard rules: a proxy matching any rule is never stored. Applied
+    /// at ingestion (the source's own pipeline) and again on serving
+    /// before `rename`, so both sides see the original values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) drop: Option<Vec<DropRule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,21 +58,19 @@ pub(crate) struct PipelineConfig {
     pub(crate) health: Option<HealthConfig>,
     /// Accepted-but-ignored backward-compatibility key: v1 deduplication
     /// is unconditional (by fingerprint), so any `dedup` section is a
-    /// no-op. Accepted rather than rejected by `deny_unknown_fields` so
-    /// old exports keep importing; real modes arrive in schema v2.
+    /// no-op. Accepted rather than rejected so old exports keep importing;
+    /// real modes arrive in schema v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dedup: Option<DedupConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sort: Option<SortConfig>,
-    /// Output-size cap: keep at most `count` proxies of
-    /// the final, deduplicated and sorted list.
+    /// Output-size cap: keep at most `count` proxies of the final,
+    /// deduplicated and sorted list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<LimitConfig>,
 }
 
-/// Protocol and ASN gates plus the insecure-TLS switch. `protocols` and
-/// `exclude_protocols` compose: when both keys are set, a proxy must pass
-/// both checks — the result is the intersection of the two lists.
+/// Protocol and ASN gates plus the insecure-TLS switch.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FilterConfig {
@@ -93,10 +83,9 @@ pub(crate) struct FilterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) asns: Option<Vec<String>>,
     /// AS numbers to hide from the output, the same accepted format as
-    /// [`Self::asns`]: rows whose ASN matches are filtered at serving and
-    /// stay stored otherwise untouched. To prevent storage entirely, use
-    /// a drop rule with `target: "asn"` — the two are complementary
-    /// ("hide" and "not store"), not interchangeable.
+    /// [`Self::asns`]: matching rows are filtered at serving and stay
+    /// stored otherwise untouched. To prevent storage entirely, use a
+    /// drop rule with `target: "asn"` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exclude_asns: Option<Vec<String>>,
     /// Drop proxies that allow insecure TLS: any
@@ -115,9 +104,7 @@ const fn default_true() -> bool {
     true
 }
 
-/// `skip_serializing_if` predicates backing the omit-defaults emit policy:
-/// a field at its schema default is never written, the same rule the
-/// builder's emit applies to every section it builds.
+/// `skip_serializing_if` predicates for the omit-defaults emit policy.
 fn is_true(value: &bool) -> bool {
     *value
 }
@@ -184,9 +171,9 @@ pub(crate) fn parse_rename_target(
     Some(target)
 }
 
-/// Compile one rule's regex (shared by rename and drop rules): the `i`/`m`/`s`
-/// flags, then the build. An unknown flag or an uncompilable pattern pushes
-/// the field error and yields `None`, the rule is skipped, every other rule
+/// Compile one rule's regex (shared by rename and drop rules): the
+/// `i`/`m`/`s` flags, then the build. An unknown flag or an uncompilable
+/// pattern pushes the field error and yields `None`, every other rule
 /// still reports.
 fn compile_rule_regex(
     pattern: &str,
@@ -237,7 +224,6 @@ pub(crate) enum RenameTarget {
 }
 
 impl RenameTarget {
-    /// The field the rule rewrites, for the logs.
     fn label(&self) -> String {
         match self {
             RenameTarget::Name => "name".to_string(),
@@ -248,20 +234,19 @@ impl RenameTarget {
     }
 }
 
-/// A discard rule: a proxy matching any rule is thrown away entirely. The
-/// mirror of [`RenameRule`] minus `replace`, the field is absent on purpose
-/// (`deny_unknown_fields` rejects a copy-pasted rewrite rule), a drop rule
-/// only selects. An ASN-targeted rule prevents storage entirely — the
-/// counterpart of `filter.exclude_asns`, which only hides the stored rows
-/// from the output; see [`CompiledDrop::Asn`].
+/// A discard rule: a proxy matching any rule is thrown away entirely.
+/// The mirror of [`RenameRule`] minus `replace`, the field is absent on
+/// purpose (`deny_unknown_fields` rejects a copy-pasted rewrite rule), a
+/// drop rule only selects. An ASN-targeted rule prevents storage
+/// entirely, the counterpart of `filter.exclude_asns`, which only hides
+/// the stored rows from the output (see [`CompiledDrop::Asn`]).
 ///
 /// Two flavours share one rule shape:
-/// - regex over `name` / `host` / `port` / `param:KEY` (the rename-style
-///   selectors), with `match` + optional `flags`;
-/// - ASN list against `target: "asn"`, with `asns` carrying the
-///   numbers. The two flavours are mutually exclusive at validation time:
-///   `match` is meaningless against an ASN and `asns` is meaningless
-///   against a regex.
+/// - regex over `name` / `host` / `port` / `param:KEY`, with `match` +
+///   optional `flags`;
+/// - ASN list against `target: "asn"`. Mutually exclusive at validation
+///   time: `match` is meaningless against an ASN and `asns` is
+///   meaningless against a regex.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DropRule {
@@ -275,7 +260,7 @@ pub(crate) struct DropRule {
     /// or `asn` (see `asns`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target: Option<String>,
-    /// AS numbers for `target: "asn"`. Accepts both bare (`24940`) and
+    /// AS numbers for `target: "asn"`. Accepts bare (`24940`) and
     /// prefixed (`AS24940`) spellings, normalised at validation. Required
     /// when `target == "asn"`; forbidden otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,11 +294,9 @@ pub(crate) struct HealthConfig {
 }
 
 /// The typed source of truth behind [`default_exclude_statuses`] and the
-/// default pipeline's health filter: quarantine and removed are hidden
-/// from subscriptions unless the pipeline says otherwise. The string form
-/// derives from `as_str()`, the exact spelling `ProxyStatus::from_str`
-/// accepts (it is its inverse for every `all()` entry), so the two forms
-/// cannot drift and no string→status parsing is needed at compile time.
+/// default pipeline's health filter. The string form derives from
+/// `as_str()`, the exact spelling `ProxyStatus::from_str` accepts, so the
+/// two forms cannot drift.
 const DEFAULT_EXCLUDED_STATUSES: &[ProxyStatus] = &[ProxyStatus::Quarantine, ProxyStatus::Removed];
 
 /// Default health exclusion: quarantine and removed are hidden
@@ -325,8 +308,7 @@ pub(crate) fn default_exclude_statuses() -> Vec<String> {
         .collect()
 }
 
-/// The accepted-but-ignored `dedup` section, see [`PipelineConfig::dedup`]:
-/// any `by` value compiles, v1 deduplication is unconditional.
+/// The accepted-but-ignored `dedup` section, see [`PipelineConfig::dedup`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DedupConfig {
@@ -371,13 +353,11 @@ pub(crate) struct SortConfig {
     pub(crate) desc: bool,
 }
 
-/// Output-size cap. `count` is a raw JSON number so that fractional or
+/// Output-size cap. `count` is a raw JSON number so fractional or
 /// out-of-range input fails with the field-level `pipeline.invalid_limit`
-/// error in [`CompiledPipeline::from_json`] instead of an opaque serde
-/// type error; `null`/missing means "no cap", the explicit-defaults reset
-/// of the profile tri-state. Unlike the other fields, `count` serializes
-/// even when `None`: `"count": null` is the explicit no-cap reset the
-/// builder emits.
+/// error instead of an opaque serde type error; `null`/missing means no
+/// cap. Unlike the other fields, `count` serializes even when `None`:
+/// `"count": null` is the explicit no-cap reset the builder emits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LimitConfig {
@@ -404,10 +384,9 @@ struct CompiledRename {
 enum CompiledDrop {
     /// Regex over a single `ProxyEntry` field (name / host / port / param).
     Regex { regex: Regex, target: RenameTarget },
-    /// Discard when the proxy's resolved AS number is in `asns` — the
-    /// "never store" counterpart of the serving-side `filter.exclude_asns`
-    /// ("hide", see [`FilterConfig::exclude_asns`]). Missing ASN is not a
-    /// hit (the same lenient contract as the exclude list).
+    /// Discard when the proxy's resolved AS number is in `asns`, the
+    /// "never store" counterpart of the serving-side
+    /// `filter.exclude_asns` ("hide"). Missing ASN is not a hit.
     Asn { asns: Vec<u32> },
 }
 
@@ -432,8 +411,7 @@ pub struct CompiledPipeline {
     exclude_statuses: Vec<ProxyStatus>,
     sort_by: SortBy,
     sort_desc: bool,
-    /// Output-size cap: keep at most this many proxies of the final list
-    /// `None` = no cap.
+    /// Output-size cap; `None` = no cap.
     limit_count: Option<usize>,
     /// Whether `sort` was set explicitly (used to pick the sort config when
     /// several pipelines are merged: profile wins, then the first source).
@@ -442,11 +420,9 @@ pub struct CompiledPipeline {
 }
 
 impl Default for CompiledPipeline {
-    /// Pass-through pipeline with the defaults: drop
-    /// insecure-allowing entries, geo-enrich, drop quarantine/removed,
-    /// dedup by fingerprint, keep source order. The hidden statuses are
-    /// the typed [`DEFAULT_EXCLUDED_STATUSES`], the same source of truth
-    /// [`default_exclude_statuses`] renders for the config side.
+    /// Pass-through pipeline with the defaults: drop insecure-allowing
+    /// entries, geo-enrich, drop quarantine/removed, dedup by fingerprint,
+    /// keep source order.
     fn default() -> Self {
         Self {
             filter_protocols: None,
@@ -469,23 +445,20 @@ impl Default for CompiledPipeline {
 
 /// One pipeline validation problem: a catalog key plus positional `{0}`,
 /// `{1}`… arguments. The admin layer renders it with `Lang::t_args` in the
-/// panel language (form errors, import validation); the serving layer only
-/// logs issues in their debug form.
+/// panel language; the serving layer only logs issues in their debug form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineIssue {
     /// Catalog key (`pipeline.*` section of `locales/*.toml`).
     pub key: &'static str,
     /// Positional arguments: field names and offending values. Embedded
-    /// diagnostics (serde/regex details) stay technical English, only the
-    /// sentence around them is localized.
+    /// diagnostics (serde/regex details) stay technical English.
     pub args: Vec<String>,
 }
 
 impl CompiledPipeline {
     /// Compile a pipeline JSON value, collecting every validation error
-    /// (field-level issues for the admin form).
-    ///
-    /// `NULL` and `{}` mean pass-through with defaults.
+    /// (field-level issues for the admin form). `NULL` and `{}` mean
+    /// pass-through with defaults.
     pub fn from_json(value: Option<&serde_json::Value>) -> Result<Self, Vec<PipelineIssue>> {
         let Some(value) = value else {
             return Ok(Self::default());
@@ -498,8 +471,7 @@ impl CompiledPipeline {
 
         let mut errors = Vec::new();
         // Deserialize straight from the reference: `&serde_json::Value` is
-        // itself a `Deserializer` (the admin pipeline editor's ingest
-        // works the same way), the document does not need to be cloned.
+        // itself a `Deserializer`, the document does not need to be cloned
         let config: PipelineConfig = match serde::Deserialize::deserialize(value) {
             Ok(config) => config,
             Err(err) => {
@@ -534,9 +506,7 @@ impl CompiledPipeline {
             compiled.compile_health(&health, &mut errors);
         }
 
-        // `dedup` is accepted and ignored: v1 deduplication is
-        // unconditional (see [`PipelineConfig::dedup`]), so every `by`
-        // value compiles and no validation error exists for it.
+        // `dedup` is accepted and ignored, see [`PipelineConfig::dedup`]
 
         if let Some(sort) = config.sort {
             compiled.sort_by = sort.by;
@@ -554,9 +524,8 @@ impl CompiledPipeline {
         }
     }
 
-    /// The `filter` section: the protocol allow/exclude lists, the ASN
-    /// lists and the insecure-TLS switch. Every list is validated field
-    /// by field, one bad entry is one issue, the section still compiles.
+    /// The `filter` section. Every list is validated field by field, one
+    /// bad entry is one issue, the section still compiles.
     fn compile_filter(&mut self, filter: FilterConfig, errors: &mut Vec<PipelineIssue>) {
         self.filter_protocols = parse_scheme_list(&filter.protocols, "filter.protocols", errors);
         self.exclude_protocols = parse_scheme_list(
@@ -587,10 +556,9 @@ impl CompiledPipeline {
 
     /// One compiled rename rule. A literal replacement that is itself an
     /// invalid host/port can only produce invalid values wherever the
-    /// rule fires; reject it here, instead of silently skipping the
-    /// rewrite for every entry at runtime. Replacements with capture
-    /// groups (`$1`, `${name}`) depend on the matched text and stay
-    /// exempt.
+    /// rule fires; reject it here instead of silently skipping the
+    /// rewrite at runtime. Replacements with capture groups (`$1`,
+    /// `${name}`) depend on the matched text and stay exempt.
     fn compile_rename_rule(
         &mut self,
         rule: &RenameRule,
@@ -638,9 +606,7 @@ impl CompiledPipeline {
 
     /// One `target: "asn"` drop rule: `match`/`flags` are meaningless,
     /// `asns` is required and non-empty. Each entry must parse through
-    /// [`asn_number`] (the same normaliser the serving-side
-    /// `filter.asns` uses); the rule only compiles when every entry
-    /// parsed.
+    /// [`asn_number`]; the rule only compiles when every entry parsed.
     fn compile_asn_drop_rule(
         &mut self,
         rule: &DropRule,
@@ -710,7 +676,7 @@ impl CompiledPipeline {
             return;
         }
         // An unknown placeholder is rendered verbatim, so the operator
-        // would see a literal brace in every proxy name.
+        // would see a literal brace in every proxy name
         for placeholder in fumox_core::geo::unknown_placeholders(&geo.template) {
             errors.push(PipelineIssue {
                 key: "pipeline.unknown_placeholder",
@@ -738,9 +704,8 @@ impl CompiledPipeline {
 
     /// The `limit` section: `null`/missing keeps the cap unset (the
     /// profile's explicit "defaults" reset); an integer of at least 1 is
-    /// the cap — fractional, zero, negative, or beyond the platform
-    /// `usize` (also anything the JSON number exceeds `i64` with) is a
-    /// field error, "no cap" is the absent section, not a magic number.
+    /// the cap, anything else (fractional, zero, negative, beyond the
+    /// platform `usize`) is a field error.
     fn compile_limit(&mut self, limit: LimitConfig, errors: &mut Vec<PipelineIssue>) {
         let Some(count) = limit.count else {
             return;
@@ -756,13 +721,11 @@ impl CompiledPipeline {
 
     /// [`Self::from_json`] behind the serving-side compile cache: every
     /// render re-compiles the same merged configs (source + profile), and
-    /// the compile rebuilds every regex from scratch. The cache key is a
-    /// 64-bit hash of the config document ([`config_cache_key`]):
-    /// any edit changes the hash and lands on a different key, though a
-    /// collision between two distinct configs is possible in principle and
-    /// undetected — one would silently be served the other's pipeline.
+    /// the compile rebuilds every regex. The cache key is a 64-bit hash of
+    /// the config document ([`config_cache_key`]); a collision between two
+    /// distinct configs would silently serve the other's pipeline.
     /// Validation errors are not cached: a broken config keeps failing
-    /// fast, and the fixed one recompiles.
+    /// fast.
     pub fn from_json_cached(
         value: Option<&serde_json::Value>,
     ) -> Result<Arc<Self>, Vec<PipelineIssue>> {
@@ -782,7 +745,7 @@ impl CompiledPipeline {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 // The key space is the distinct (source, profile) config
                 // pairs, small in practice; reset rather than grow without
-                // bound if an installation accumulates thousands of them.
+                // bound
                 if cache.len() >= 1024 {
                     cache.clear();
                 }
@@ -802,13 +765,11 @@ impl CompiledPipeline {
     }
 
     /// Per-entry verdicts of the drop rules, in input order. `asns` is the
-    /// pre-parsed ASN column (the caller parses the stored `AS{n}` spellings
-    /// once at its boundary) and may be shorter than `entries` (inactive
+    /// pre-parsed ASN column and may be shorter than `entries` (inactive
     /// resolver): unstamped entries keep their ASN rules unapplied and
     /// survive, zipping the two would truncate the batch. The mismatch is
-    /// a WARN only when the pipeline actually carries an ASN rule — that
-    /// is the case where a truncation silently changes what gets dropped —
-    /// and DEBUG otherwise.
+    /// a WARN only when the pipeline carries an ASN rule (the case where a
+    /// truncation silently changes what gets dropped), DEBUG otherwise.
     fn drop_survivors(
         &self,
         entries: &[ProxyEntry],
@@ -851,8 +812,7 @@ impl CompiledPipeline {
     }
 
     /// Drop rules, keeping every surviving entry paired with its own geo
-    /// stamp. The ASNs arrive pre-parsed (`asns`, the caller's boundary);
-    /// `facts` is the stamp column the ingest path persists *and* keeps
+    /// stamp. `facts` is the stamp column the ingest path keeps
     /// index-aligned, and `reconcile_source` pairs the two by index:
     /// returning the survivors alone would silently re-point every stamp
     /// after the first dropped entry at a host one or more positions
@@ -883,16 +843,14 @@ impl CompiledPipeline {
     }
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
-    /// fetch: a source with drop rules never keeps lingering
-    /// links, so a rule added later cannot be held off by still-alive rows ,
-    /// serving-side drop hides them instantly, the next refresh unlinks
-    /// them for good.
+    /// fetch: a source with drop rules never keeps lingering links, so a
+    /// rule added later cannot be held off by still-alive rows.
     pub fn has_drop_rules(&self) -> bool {
         !self.drop.is_empty()
     }
 
     /// Whether `sort` was set explicitly: the sort contest over the merged
-    /// profile reads it (profile wins, then the first source that set one).
+    /// profile reads it.
     pub fn sort_explicit(&self) -> bool {
         self.sort_explicit
     }
@@ -906,28 +864,25 @@ impl CompiledPipeline {
         mut candidates: Vec<Candidate>,
         geo: &G,
     ) -> Vec<Candidate> {
-        // filter
         self.filter_protocols_step(&mut candidates);
         self.filter_asns_step(&mut candidates, geo).await;
-        // forbid_insecure, before `rename`: the DB row is never touched.
+        // forbid_insecure, before `rename`: the DB row is never touched
         self.forbid_insecure_step(&mut candidates);
         // drop, deliberately before `rename`: a rewrite must never decide
-        // whether a proxy is stored.
+        // whether a proxy is stored
         self.drop_step(&mut candidates);
-        // rename
         self.apply_renames(&mut candidates);
         // forbid_insecure, again: the filter must see the final
-        // parameters, a rename rule can introduce an insecure switch.
+        // parameters, a rename rule can introduce an insecure switch
         self.forbid_insecure_step(&mut candidates);
         self.geo_enrich_step(&mut candidates, geo).await;
-        // health-filter
         self.health_step(&mut candidates);
         candidates
     }
 
     /// The `filter.protocols` / `filter.exclude_protocols` step: when
-    /// both keys are set, a proxy must pass both checks — the result is
-    /// the intersection of the two lists.
+    /// both keys are set, the result is the intersection of the two
+    /// lists.
     fn filter_protocols_step(&self, candidates: &mut Vec<Candidate>) {
         if self.filter_protocols.is_none() && self.exclude_protocols.is_none() {
             return;
@@ -943,14 +898,10 @@ impl CompiledPipeline {
     }
 
     /// The ASN step: the filters read `candidate.geo_asn`, which a row
-    /// ingested without geo does not carry — complete it before they run.
-    /// Only the ASN rules need it, so a pipeline without them pays no geo
-    /// lookup per request; the missing ASNs are filled on the ingest
-    /// side. The stored ASN, or the one the fill just resolved, is the
-    /// confirmed fact, the same contract as the profile country
-    /// allowlist. An allowlist drops proxies without a resolved ASN; an
-    /// exclude list only removes the named ASNs and keeps the unresolved
-    /// ones.
+    /// ingested without geo does not carry, so it is completed before they
+    /// run. Only the ASN rules need it, a pipeline without them pays no
+    /// geo lookup per request. An allowlist drops proxies without a
+    /// resolved ASN; an exclude list keeps the unresolved ones.
     async fn filter_asns_step<G: HostGeo + ?Sized>(
         &self,
         candidates: &mut Vec<Candidate>,
@@ -991,10 +942,8 @@ impl CompiledPipeline {
         log_filter_step("forbid_insecure", before, candidates.len());
     }
 
-    /// The `drop` step, discard rules. Any rule matching discards the
-    /// proxy (rules are OR-ed). ASN-targeted rules use the candidate's
-    /// typed `geo_asn`; missing ASN is not a hit (the same lenient
-    /// contract as `filter.exclude_asns`).
+    /// The `drop` step. Rules are OR-ed. ASN-targeted rules use the
+    /// candidate's typed `geo_asn`; missing ASN is not a hit.
     fn drop_step(&self, candidates: &mut Vec<Candidate>) {
         if self.drop.is_empty() {
             return;
@@ -1010,16 +959,12 @@ impl CompiledPipeline {
     }
 
     /// The `rename` step, rules apply in order. A rule's `target` picks
-    /// the field: the name (default, the classic behavior), the host, the
-    /// port or a parameter. Host/port results are guarded: a replacement
-    /// that would break the URI structure (empty host, non-numeric or
-    /// out-of-range port, URI delimiters in the host) is skipped with a
-    /// WARN, leaving the original intact, a broken rule must not produce
-    /// a broken subscription line for every proxy at once.
-    ///
-    /// The skips are counted per rule and reported once per rule: the
-    /// per-entry event stays at TRACE, a broken rule would otherwise
-    /// write a WARN line per proxy.
+    /// the field: the name (default), the host, the port or a parameter.
+    /// Host/port results are guarded: a replacement that would break the
+    /// URI structure is skipped with a WARN, leaving the original intact;
+    /// a broken rule must not produce a broken subscription line for
+    /// every proxy at once. Skips are counted per rule and reported once
+    /// per rule, the per-entry event stays at TRACE.
     fn apply_renames(&self, candidates: &mut [Candidate]) {
         let mut skips: Vec<SkippedRewrites> = vec![SkippedRewrites::default(); self.rename.len()];
         for candidate in candidates.iter_mut() {
@@ -1044,12 +989,10 @@ impl CompiledPipeline {
 
     /// The geo-enrich step: rewrite the display name from the template
     /// and keep the country code for sorting. No-op when the resolver is
-    /// inactive. The hosts resolve with bounded parallelism (a slow host
-    /// must not stall the whole pass) and under one wall-clock ceiling,
-    /// like the ingest pass; on expiry the names stay as stored. The
-    /// lookups are boxed futures collected up front, so no borrow of the
-    /// generic resolver rides the stream across the await — the boxes
-    /// stay `Send` whatever they borrow.
+    /// inactive. The hosts resolve with bounded parallelism under one
+    /// wall-clock ceiling, like the ingest pass; on expiry the names stay
+    /// as stored. The lookups are boxed futures collected up front, so no
+    /// borrow of the generic resolver rides the stream across the await.
     async fn geo_enrich_step<G: HostGeo + ?Sized>(&self, candidates: &mut [Candidate], geo: &G) {
         if !self.geo_enabled || !geo.is_active() {
             return;
@@ -1087,7 +1030,7 @@ impl CompiledPipeline {
     }
 
     /// The health-filter step, a defensive re-check; the serving layer
-    /// can load every status and rely on this step for exclusion.
+    /// can rely on this step for exclusion.
     fn health_step(&self, candidates: &mut Vec<Candidate>) {
         let excluded: HashSet<ProxyStatus> = self.exclude_statuses.iter().copied().collect();
         let before = candidates.len();
@@ -1095,9 +1038,8 @@ impl CompiledPipeline {
         log_filter_step("health", before, candidates.len());
     }
 
-    /// Drop the candidates that allow insecure TLS in any spelling: a
-    /// truthy certificate-verification alias. Falsy toggles (`insecure=0`)
-    /// and alias-free entries survive.
+    /// Drop candidates that allow insecure TLS in any spelling: a truthy
+    /// certificate-verification alias.
     fn retain_secure(candidates: &mut Vec<Candidate>) {
         candidates.retain(|c| {
             !c.entry
@@ -1107,19 +1049,19 @@ impl CompiledPipeline {
         });
     }
 
-    /// Post-merge steps: dedup by fingerprint, the first
-    /// occurrence wins, so the earlier source keeps the name it contributed ,
-    /// followed by the global sort. Speed-enrich is a stub until Phase 4:
-    /// latency comes from probe results already stored on the row.
+    /// Post-merge steps: dedup by fingerprint (the first occurrence wins,
+    /// so the earlier source keeps the name it contributed), followed by
+    /// the global sort. Speed-enrich is a stub until Phase 4: latency
+    /// comes from probe results already stored on the row.
     pub fn finalize(&self, candidates: &mut Vec<Candidate>) {
         let mut seen = HashSet::new();
         let before = candidates.len();
         candidates.retain(|c| seen.insert(c.entry.fingerprint()));
         log_filter_step("dedup", before, candidates.len());
         self.sort(candidates);
-        // Output cap: applied after dedup and sorting, so
-        // the list keeps its top in the chosen order, `sort: latency`
-        // yields the N fastest, `sort: source` the first N of the feed.
+        // The cap is applied after dedup and sorting, so the list keeps
+        // its top in the chosen order: `sort: latency` yields the N
+        // fastest, `sort: source` the first N of the feed
         if let Some(limit) = self.limit_count {
             let before = candidates.len();
             candidates.truncate(limit);
@@ -1143,10 +1085,9 @@ impl CompiledPipeline {
             }
             SortBy::Country => {
                 // Unknown countries always go last, ascending or
-                // descending: an absent fact is not a country code (the
-                // same contract as the NULL latency below), so the
-                // reversal rides the country comparison, not the
-                // known/unknown placement.
+                // descending: an absent fact is not a country code, so
+                // the reversal rides the country comparison, not the
+                // known/unknown placement
                 candidates.sort_by(|a, b| match (&a.geo_country, &b.geo_country) {
                     (Some(x), Some(y)) => {
                         let ord = x.cmp(y);
@@ -1158,7 +1099,7 @@ impl CompiledPipeline {
                 });
             }
             SortBy::Latency => {
-                // NULL latencies always go last, even when descending.
+                // NULL latencies always go last, even when descending
                 candidates.sort_by_key(|c| match c.latency_ms {
                     Some(ms) => (0u8, if self.sort_desc { -ms } else { ms }),
                     None => (1u8, 0),
@@ -1170,38 +1111,27 @@ impl CompiledPipeline {
 
 /// Wall-clock ceiling for one geo pass (the ASN fill and geo-enrich
 /// alike): every uncached host can cost a DNS round-trip, so the batch is
-/// bounded in time as well as in concurrency (the same contract as the
-/// ingest pass). On expiry the pass continues with the stored facts
-/// instead of blocking the render.
+/// bounded in time as well as in concurrency. On expiry the pass
+/// continues with the stored facts instead of blocking the render.
 const GEO_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Hard cap on the unique hosts one ASN fill resolves, the same contract
 /// as the ingest pass's geo budget: a feed with thousands of distinct
 /// un-stamped hosts would otherwise cost thousands of DNS round-trips on
-/// the public render path. The hosts beyond the cap keep "no ASN", the
-/// unresolved row's standing contract with the ASN rules (an exclude list
-/// keeps them, an allowlist drops them).
+/// the public render path. Hosts beyond the cap keep "no ASN", the
+/// unresolved row's standing contract with the ASN rules.
 const ASN_FILL_HOST_BUDGET: usize = 256;
 
 /// Give every candidate without a stored ASN the one the resolver can
 /// name now: an exclude list keeps what it cannot name, and the resolver
-/// caches an "unknown" verdict per host, so a row whose column stayed
-/// empty keeps reaching the output even when its host resolves fine.
-///
-/// The pass is bounded like the ingest one: one lookup per *unique* host
-/// up to [`ASN_FILL_HOST_BUDGET`], the whole batch under
-/// [`GEO_PASS_TIMEOUT`] with [`GEO_LOOKUP_CONCURRENCY`] lookups in
-/// flight. It runs on the public render path before geo-enrich, so on a
-/// cold resolver cache it is this pass that pays the DNS round-trips, and
-/// a feed full of hosts that do not resolve must fall back to the stored
-/// facts, not stall the render — on expiry or beyond the budget the
-/// candidates keep their stored ASNs, the same "keep what is stored"
-/// contract the ingest pass has. A stored ASN is never overwritten, the
-/// fill runs before `rename`, so the ASN belongs to the host as stored,
-/// and geo-enrich a few lines down hits the same resolver cache.
+/// caches an "unknown" verdict per host. The pass is bounded like the
+/// ingest one (one lookup per unique host up to [`ASN_FILL_HOST_BUDGET`],
+/// the batch under [`GEO_PASS_TIMEOUT`]), a stored ASN is never
+/// overwritten, and the fill runs before `rename` so the ASN belongs to
+/// the host as stored.
 async fn fill_missing_asns<G: HostGeo + ?Sized>(candidates: &mut [Candidate], geo: &G) {
-    // One lookup per unique host: a feed repeats the same host many times
-    // over, and the answer is a fact about the host, not about the row.
+    // One lookup per unique host: the answer is a fact about the host,
+    // not about the row
     let mut hosts: Vec<String> = Vec::new();
     for candidate in candidates.iter() {
         if candidate.geo_asn.is_none() && !hosts.contains(&candidate.entry.host) {
@@ -1219,8 +1149,7 @@ async fn fill_missing_asns<G: HostGeo + ?Sized>(candidates: &mut [Candidate], ge
 
     use futures_util::StreamExt;
     // `buffered` (not `buffer_unordered`) keeps the input order, which the
-    // candidate loop below relies on, while holding at most
-    // `GEO_LOOKUP_CONCURRENCY` lookups in flight.
+    // candidate loop below relies on
     let lookups = hosts
         .iter()
         .map(|host| geo.resolve_host(host))
@@ -1258,13 +1187,12 @@ async fn fill_missing_asns<G: HostGeo + ?Sized>(candidates: &mut [Candidate], ge
 }
 
 /// The profile-level country allowlist as one filtering step, the matcher
-/// `/sub` applies per source. It runs *before* the pipeline's own steps
-/// (`CompiledPipeline::apply`): the allowlist is about confirmed geo facts,
-/// not a pipeline rule, so it also runs on the tiers the live-filter would
-/// drop later, and its own order is fixed — proxies without a determined
-/// country stay out while the filter is active, "only these countries"
-/// means confirmed facts, not guesses (the same semantics as
-/// `filter_asns`). The country codes come in pre-normalized (uppercase).
+/// `/sub` applies per source. It runs *before* the pipeline's own steps:
+/// the allowlist is about confirmed geo facts, not a pipeline rule, so it
+/// also runs on the tiers the live-filter would drop later. Proxies
+/// without a determined country stay out while it is active, the same
+/// semantics as `filter_asns`. The country codes come in pre-normalized
+/// (uppercase).
 pub(crate) fn retain_allowed_countries(
     candidates: &mut Vec<Candidate>,
     allowed: &std::collections::HashSet<String>,
@@ -1287,17 +1215,15 @@ pub fn merge_configs(
         (Some(s), None) | (None, Some(s)) => Some(s.clone()),
         (Some(s), Some(p)) => {
             // A `NULL` profile pipeline overrides nothing: the source's
-            // sections stay in place. Without this the profile's `null`
-            // would replace every section with "nothing configured".
+            // sections stay in place
             if *p == serde_json::Value::Null {
                 return Some(s.clone());
             }
             let (Some(s_map), Some(p_map)) = (s.as_object(), p.as_object()) else {
                 // Non-object configs are invalid, so the merged result
                 // fails `from_json` one way or another. The profile side
-                // wins, its form gets the error; when the source is the
-                // non-object one while the profile is a valid object, a
-                // WARN names the source config as the broken side.
+                // wins, its form gets the error; a WARN names the source
+                // config as the broken side
                 if p.as_object().is_some() {
                     tracing::warn!(
                         source = %s,
@@ -1316,16 +1242,16 @@ pub fn merge_configs(
     }
 }
 
-/// The outcome of one rewrite: the value was applied, or it was rejected
-/// and the original stayed. The rejected value travels back to the caller,
-/// which counts the skips per rule instead of logging one line per entry.
+/// The outcome of one rewrite: applied, or rejected with the original
+/// kept. The rejected value travels back to the caller, which counts the
+/// skips per rule instead of logging one line per entry.
 enum Rewrite {
     Applied,
     Rejected(String),
 }
 
-/// The rejected rewrites of one rule: how many entries kept their original
-/// and one example of the rejected value, truncated for the log.
+/// The rejected rewrites of one rule: the count and one example of the
+/// rejected value, truncated for the log.
 #[derive(Clone, Default)]
 struct SkippedRewrites {
     count: usize,
@@ -1341,8 +1267,8 @@ impl SkippedRewrites {
     }
 }
 
-/// A log value is truncated: a rejected rewrite can be a whole proxy name,
-/// not a field the log has to carry in full.
+/// A rejected rewrite can be a whole proxy name, not a field the log has
+/// to carry in full.
 fn truncate_for_log(value: &str) -> String {
     const LIMIT: usize = 128;
     if value.chars().count() <= LIMIT {
@@ -1353,10 +1279,10 @@ fn truncate_for_log(value: &str) -> String {
     out
 }
 
-/// Whether a drop rule's regex matches its target on the entry. The same
+/// Whether a drop rule's regex matches its target on the entry, the same
 /// selector semantics as [`apply_rename_rule`]: the raw (percent-encoded)
-/// stored form, the first parameter on a case-insensitive key. A proxy that
-/// matches anywhere is discarded whole, the rule never rewrites anything.
+/// stored form, the first parameter on a case-insensitive key. A proxy
+/// that matches anywhere is discarded whole.
 fn matches_target(entry: &ProxyEntry, regex: &Regex, target: &RenameTarget) -> bool {
     match target {
         RenameTarget::Name => regex.is_match(&entry.name),
@@ -1369,11 +1295,10 @@ fn matches_target(entry: &ProxyEntry, regex: &Regex, target: &RenameTarget) -> b
     }
 }
 
-/// Whether one drop rule hits this entry — the single evaluation both drop
+/// Whether one drop rule hits this entry, the single evaluation both drop
 /// passes share. The ASN source stays with the caller: the ingest pass
 /// reads the pre-parsed stamp column, the serving pass reads the
-/// candidate's typed `geo_asn`; a missing ASN is not a hit (the same
-/// lenient contract as `filter.exclude_asns`).
+/// candidate's typed `geo_asn`; a missing ASN is not a hit.
 fn drop_rule_hits(rule: &CompiledDrop, entry: &ProxyEntry, asn: Option<u32>) -> bool {
     match rule {
         CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
@@ -1382,9 +1307,9 @@ fn drop_rule_hits(rule: &CompiledDrop, entry: &ProxyEntry, asn: Option<u32>) -> 
 }
 
 /// One filtering step's bookkeeping: a DEBUG event with the in/out counts
-/// and the removals, so a subscription that shrank can be traced to the
-/// step that shrank it, plus a WARN when the step emptied a non-empty
-/// input — a misconfigured rule must not quietly blank the feed.
+/// so a subscription that shrank can be traced to the step that shrank
+/// it, plus a WARN when the step emptied a non-empty input, a
+/// misconfigured rule must not quietly blank the feed.
 fn log_filter_step(step: &str, before: usize, after: usize) {
     tracing::debug!(
         step,
@@ -1406,9 +1331,9 @@ fn log_filter_step(step: &str, before: usize, after: usize) {
 ///
 /// Parameter values are stored percent-encoded (byte-faithful round-trip,
 /// models.rs `Param.value`); the regex matches that raw form, exactly what
-/// the admin sees in the URI, and the replacement is stored raw as well.
-/// This keeps `path=%2Fws` rewritable through its encoded spelling only,
-/// which is the honest, predictable contract (documented in USERGUIDE).
+/// the admin sees in the URI, and the replacement is stored raw as well,
+/// so `path=%2Fws` is rewritable through its encoded spelling only. The
+/// honest, predictable contract (documented in USERGUIDE).
 fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
     let rewritten = |value: &str| -> String {
         rule.regex
@@ -1423,8 +1348,9 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
         RenameTarget::Host => {
             let host = rewritten(&entry.host);
             // The host is embedded verbatim into the output URI, so it
-            // cannot carry the URI delimiters or whitespace. IPv6 literals
-            // stay bracket-free in storage (parse_hostport strips them).
+            // cannot carry the URI delimiters or whitespace. IPv6
+            // literals stay bracket-free in storage (`parse_hostport`
+            // strips them)
             if valid_rewritten_host(&host) {
                 entry.host = host;
                 Rewrite::Applied
@@ -1440,10 +1366,10 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
         RenameTarget::Port => {
             let port = rewritten(&entry.port.to_string());
             match port.parse::<u16>() {
-                // Port 0 is not a dialable endpoint: the parsers drop it and
-                // the schema CHECK (migration 0018) refuses the row at the
-                // upsert, so a rewrite that produced one is rejected like a
-                // junk value instead of failing the whole ingest batch.
+                // Port 0 is not a dialable endpoint: the parsers drop it
+                // and the schema CHECK (migration 0018) refuses the row,
+                // so a rewrite that produced one is rejected like a junk
+                // value instead of failing the whole ingest batch
                 Ok(parsed) if parsed != 0 => {
                     entry.port = parsed;
                     Rewrite::Applied
@@ -1459,10 +1385,10 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
             }
         }
         RenameTarget::Param(key) => {
-            // Case-insensitive: feeds mix spellings (headerType/headertype).
-            // Only the first occurrence is rewritten, the parser also keeps
-            // the first on re-parse, so a rewritten later duplicate would be
-            // silently dropped at the next ingest round-trip anyway.
+            // Case-insensitive: feeds mix spellings. Only the first
+            // occurrence is rewritten, the parser also keeps the first on
+            // re-parse, so a rewritten later duplicate would be dropped at
+            // the next ingest round-trip anyway
             let Some(param) = entry
                 .params
                 .iter_mut()
@@ -1479,8 +1405,8 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
 /// A rewritten host must survive the output URI verbatim: non-empty, no
 /// URI delimiters, no whitespace, no percent-encoding (the host is not
 /// encoded by the serializer, so a raw `%` would corrupt the address).
-/// A colon is legal only as part of an IPv6 literal, hosts are stored
-/// unbracketed (`2001:db8::1`), so a colon-bearing rewrite must parse as
+/// A colon is legal only as part of an IPv6 literal (hosts are stored
+/// unbracketed, `2001:db8::1`), so a colon-bearing rewrite must parse as
 /// a plain IPv6 address, not smuggle a port or userinfo in.
 fn valid_rewritten_host(host: &str) -> bool {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -1515,8 +1441,7 @@ fn parse_scheme_list(
 
 /// The AS number carried by a stored `geo_asn` value (`"AS24940"`), or any
 /// `AS{n}` / `24940` spelling accepted from a pipeline config. `pub(crate)`
-/// because the DB boundaries (`rows_to_candidates`, the ingest drop pass)
-/// parse the column exactly once, on their side.
+/// because the DB boundaries parse the column exactly once, on their side.
 pub(crate) fn asn_number(raw: &str) -> Option<u32> {
     let digits = raw
         .trim()
@@ -1529,7 +1454,7 @@ pub(crate) fn asn_number(raw: &str) -> Option<u32> {
 /// Validate an ASN list field (`filter.asns` / `filter.exclude_asns`):
 /// every entry must be a plain AS number, bare (`24940`) or with the `AS`
 /// prefix (`AS24940`). Like [`parse_scheme_list`], `None` means "not set"
-/// while an empty array stays empty, an allowlist that keeps nothing.
+/// while an empty array stays empty.
 fn parse_asn_list(
     raw: &Option<Vec<String>>,
     field: &str,
@@ -1563,25 +1488,23 @@ pub struct Candidate {
     /// Country code stored on the proxy row by earlier enrichment.
     pub geo_country: Option<String>,
     /// Autonomous system stored on the proxy row, parsed to its number
-    /// once at the DB boundary (`rows_to_candidates`); the filters and
-    /// drop rules compare plain numbers, never `AS{n}` strings.
+    /// once at the DB boundary; the filters and drop rules compare plain
+    /// numbers, never `AS{n}` strings.
     pub geo_asn: Option<u32>,
 }
 
-/// The compile cache of [`CompiledPipeline::from_json_cached`], keyed by
-/// [`config_cache_key`]. A module-level static so the test module can
-/// poison it and pin the poison-recovery contract.
+/// The compile cache of [`CompiledPipeline::from_json_cached`]. A
+/// module-level static so the test module can poison it and pin the
+/// poison-recovery contract.
 static COMPILE_CACHE: LazyLock<Mutex<HashMap<u64, Arc<CompiledPipeline>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The [`CompiledPipeline::from_json_cached`] cache key: a 64-bit
-/// `DefaultHasher` (SipHash) digest of the config document, hashed
-/// through `Value`'s derived `Hash`. Identical documents hash
-/// identically, any edit produces a different document and lands on a
-/// different key, and a missing config keys apart from an empty one (the
-/// hashed `Option` discriminant separates them); a collision would hand
-/// one config the other's pipeline silently, its probability on the
-/// handful of keys a process ever uses is negligible (~2^-64 per pair).
+/// `DefaultHasher` (SipHash) digest of the config document. Identical
+/// documents hash identically, and a missing config keys apart from an
+/// empty one (the hashed `Option` discriminant separates them); a
+/// collision would hand one config the other's pipeline, its probability
+/// on the handful of keys a process uses is negligible.
 fn config_cache_key(value: Option<&serde_json::Value>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
@@ -1618,7 +1541,7 @@ mod tests {
 
     fn inactive_geo() -> GeoResolver {
         // Explicitly disabled: the default config would open the local
-        // mmdb files and rewrite names mid-test.
+        // mmdb files and rewrite names mid-test
         let cfg = fumox_core::config::GeoConfig {
             enabled: false,
             ..Default::default()
@@ -1629,8 +1552,6 @@ mod tests {
     /// The mmdb-backed resolver the geo tests share, or `None` when the
     /// GeoLite2 files are absent (gitignored, so a fresh checkout has
     /// none): the caller skips instead of testing a disabled resolver.
-    /// The tests are also marked `#[ignore = "requires GeoLite2 mmdb"]`,
-    /// so the skip is explicit even before this guard runs.
     fn active_geo_with_dbs() -> Option<GeoResolver> {
         let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
         if !db_dir.join("GeoLite2-ASN.mmdb").exists() || !db_dir.join("GeoLite2-City.mmdb").exists()
@@ -1648,14 +1569,10 @@ mod tests {
     }
 
     /// Capture log lines of one scope at `max` level and above: the
-    /// observability assertions read them back instead of matching on
-    /// internals. Returns the buffer and the subscriber guard, which must
-    /// stay alive for the capture to run.
-    ///
-    /// The call-site-interest caveat is the same as in the scheduler tests:
-    /// a call site first executed under another test's empty dispatcher
-    /// caches as `never` for the whole process, so the registry is pinned
-    /// to multi-dispatcher and the interests are rebuilt.
+    /// observability assertions read them back. The call-site-interest
+    /// caveat: a call site first executed under another test's empty
+    /// dispatcher caches as `never` for the whole process, so the registry
+    /// is pinned to multi-dispatcher and the interests are rebuilt.
     fn capture_logs(
         max: tracing::Level,
     ) -> (
@@ -1684,7 +1601,7 @@ mod tests {
             compiled.exclude_statuses,
             vec![ProxyStatus::Quarantine, ProxyStatus::Removed]
         );
-        // No `sort` section: source order is the default, not a choice.
+        // No `sort` section: source order is the default, not a choice
         assert!(!compiled.sort_explicit());
     }
 
@@ -1749,7 +1666,6 @@ mod tests {
         );
     }
 
-    /// The known placeholders are accepted.
     #[test]
     fn the_known_geo_placeholders_are_accepted() {
         CompiledPipeline::from_json(Some(&json!({
@@ -1851,7 +1767,7 @@ mod tests {
         assert_eq!(err[0].args[0], "rename[0]");
         assert_eq!(err[0].args[1], "bogus");
 
-        // `param:` with an empty key is the same unknown-form error.
+        // `param:` with an empty key is the same unknown-form error
         let err = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": "a", "replace": "b", "target": "param: " }]
@@ -1861,7 +1777,7 @@ mod tests {
 
         // The four valid spellings (and the absent target) compile. The
         // replacement must be a valid literal of its target: `1` for the
-        // port, a plain word for the rest.
+        // port, a plain word for the rest
         for (target, replace) in [
             (None, "b"),
             (Some("name"), "b"),
@@ -1891,17 +1807,17 @@ mod tests {
     }
 
     /// A candidate carrying stored geo facts, as `rows_to_candidates`
-    /// loads them from the DB (the `AS{n}` column parsed to its number at
-    /// the boundary). The host is derived from the name so the candidates
-    /// differ by fingerprint and survive `finalize`'s dedup.
+    /// loads them from the DB. The host is derived from the name so the
+    /// candidates differ by fingerprint and survive `finalize`'s dedup.
     fn candidate_with_asn(name: &str, asn: Option<u32>) -> Candidate {
         let mut c = candidate(name, Scheme::Vless, &format!("{name}.example.com"));
         c.geo_asn = asn;
         c
     }
 
-    /// Build a `ProxyEntry` for ingestion-side tests: scheme is fixed,
-    /// credential too, the drop rules only look at the chosen fields.
+    /// Build a `ProxyEntry` for ingestion-side tests: scheme and
+    /// credential are fixed, the drop rules only look at the chosen
+    /// fields.
     fn entry(name: &str, host: &str) -> ProxyEntry {
         candidate(name, Scheme::Vless, host).entry
     }
@@ -1942,11 +1858,8 @@ mod tests {
     }
 
     /// The one resolver fake of the pipeline tests, standing in for the
-    /// shared [`HostGeo`] seam: it answers one ASN for every host (per-host
-    /// overrides first), counts its lookups, tracks how many ran
-    /// concurrently, and can report itself inactive — everything the fill,
-    /// the exclude list and the geo-enrich assertions need without a
-    /// MaxMind database.
+    /// shared [`HostGeo`] seam: one ASN for every host (per-host overrides
+    /// first), lookup and concurrency counters, and an inactive switch.
     #[derive(Default)]
     struct FakeGeo {
         /// The blanket answer for hosts without a `by_host` override.
@@ -1987,7 +1900,7 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // The counter moves inside the future, on its first poll:
                 // building a future starts no work, so the peak reflects
-                // lookups actually running, not ones merely created.
+                // lookups actually running
                 let running = self
                     .in_flight
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2075,8 +1988,7 @@ mod tests {
 
     /// The fill's host budget is hard: the pass runs on the public render
     /// path and must not fan out into a DNS round-trip per row of a huge
-    /// feed. The hosts beyond the cap keep "no ASN", the unresolved row's
-    /// standing contract with the ASN rules.
+    /// feed.
     #[tokio::test]
     async fn the_fill_host_budget_is_capped() {
         let mut candidates: Vec<Candidate> = (0..ASN_FILL_HOST_BUDGET + 10)
@@ -2091,18 +2003,17 @@ mod tests {
         );
     }
 
-    /// The reported failure: the exclude list was honoured for every row
-    /// whose ingest stamped an ASN and silently kept the rest, while
-    /// geo-enrich printed the excluded AS in the output name. The fake
-    /// resolver covers the mechanics without a database; the mmdb variant
-    /// below exercises the real resolver end to end.
+    /// The reported failure: the exclude list silently kept rows whose
+    /// ingest stamped no ASN while geo-enrich printed the excluded AS in
+    /// the output name. The fake resolver covers the mechanics; the mmdb
+    /// variant below exercises the real resolver end to end.
     #[tokio::test]
     async fn the_exclude_list_drops_a_resolved_asn_without_a_stored_one() {
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "filter": { "exclude_asns": ["13335"] },
             // Geo enrichment off: the names stay as stored, the assertion
-            // reads them back verbatim.
+            // reads them back verbatim
             "geo": { "enabled": false }
         })))
         .unwrap();
@@ -2111,7 +2022,7 @@ mod tests {
             ..Default::default()
         };
         // Neither candidate carries a stored ASN: the exclude list acts on
-        // the ASN the fill just resolved.
+        // the ASN the fill just resolved
         let out = compiled
             .apply_per_source(
                 vec![
@@ -2126,8 +2037,7 @@ mod tests {
     }
 
     /// The same exclusion against the real resolver: 1.1.1.1 is AS13335
-    /// (excluded), 8.8.8.8 is AS15169, and neither candidate carries a
-    /// stored ASN.
+    /// (excluded), 8.8.8.8 is AS15169.
     #[tokio::test]
     #[ignore = "requires GeoLite2 mmdb"]
     async fn a_proxy_without_a_stored_asn_still_honours_the_exclude_list() {
@@ -2170,7 +2080,7 @@ mod tests {
     #[test]
     fn empty_asns_allowlist_keeps_nothing_and_compiles() {
         // An explicit empty allowlist means "output nothing", a real
-        // config, kept (the editor routes it to raw mode).
+        // config
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "filter": { "asns": [] }
@@ -2181,8 +2091,6 @@ mod tests {
 
     #[tokio::test]
     async fn rename_rewrites_param_host_and_port() {
-        // The rule set from the design: name rewrite plus the parameter,
-        // host and port targets.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [
@@ -2217,7 +2125,7 @@ mod tests {
         assert_eq!(out[0].entry.host, "invalid.tr");
         assert_eq!(out[0].entry.port, 456);
         assert_eq!(out[0].entry.params[0].value, "firefox");
-        // An untouched parameter keeps its value.
+        // An untouched parameter keeps its value
         assert_eq!(out[0].entry.params[1].value, "s.example.com");
     }
 
@@ -2233,7 +2141,7 @@ mod tests {
             "h.example.com",
             443,
             vec![
-                // Feeds mix spellings; the rule key must match them all.
+                // Feeds mix spellings; the rule key must match them all
                 Param {
                     key: "path".into(),
                     value: "/ws".into(),
@@ -2256,8 +2164,7 @@ mod tests {
     #[tokio::test]
     async fn rename_host_target_guards_invalid_results() {
         // A literal replacement that is never a valid host is a
-        // compile-time field error: wherever the rule fires, the rewrite
-        // would be invalid and silently skipped.
+        // compile-time field error
         let err = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": ".*", "replace": "evil.tr/../../x", "target": "host" }]
@@ -2273,7 +2180,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err[0].key, "pipeline.never_valid_host");
 
-        // "99999" is a valid host in shape: it compiles and rewrites.
+        // "99999" is a valid host in shape: it compiles and rewrites
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": ".*", "replace": "99999", "target": "host" }]
@@ -2284,8 +2191,7 @@ mod tests {
         assert_eq!(out[0].entry.host, "99999");
 
         // A capture-group replacement depends on the matched text, so the
-        // guard is the runtime one: a delimiter-bearing result is rejected
-        // and the original host kept.
+        // guard is the runtime one
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [
@@ -2301,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn rename_host_target_allows_ipv6_literals_only_as_whole_hosts() {
         // Hosts are stored unbracketed; a colon-bearing rewrite must be a
-        // plain IPv6 literal, this one is legal.
+        // plain IPv6 literal
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [
@@ -2314,8 +2220,7 @@ mod tests {
         assert_eq!(out[0].entry.host, "2001:db8::2");
 
         // A colon pair that is not an IPv6 address (a smuggled port) is
-        // rejected and the original host kept. The rule carries a capture
-        // group, so the replacement is only guarded at runtime.
+        // rejected and the original host kept
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [
@@ -2331,7 +2236,7 @@ mod tests {
     #[test]
     fn drop_rules_reject_replace_and_unknown_keys() {
         // A copied rewrite rule carries `replace`, the strict schema
-        // rejects it: a discard rule only selects, never rewrites.
+        // rejects it: a discard rule only selects
         let err = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "match": "a", "replace": "b" }]
@@ -2341,7 +2246,7 @@ mod tests {
         assert!(err[0].args[0].contains("replace"), "{err:?}");
 
         // Flags/target/bad-regex errors reuse the rename keys, with the
-        // drop[i] field name.
+        // drop[i] field name
         let err = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "match": "(", "flags": "" }]
@@ -2410,10 +2315,9 @@ mod tests {
 
     #[tokio::test]
     async fn drop_runs_before_rename_so_both_see_original_values() {
-        // The same pattern dropped on the name and rewritten by rename: the
-        // drop sees the original name (matching), the rename never runs for
-        // the discarded proxy. Ingest applies only the drop on the same
-        // original value, the two sides cannot disagree.
+        // The drop sees the original name, the rename never runs for the
+        // discarded proxy; ingest applies only the drop on the same
+        // original value, so the two sides cannot disagree
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "match": "^free" }],
@@ -2425,8 +2329,6 @@ mod tests {
             candidate("regular node", Scheme::Vless, "h2.example.com"),
         ];
         let out = compiled.apply(candidates, &inactive_geo()).await;
-        // The "free node" matched the drop on its original name and is gone;
-        // the survivor is untouched by the rename.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].entry.name, "regular node");
     }
@@ -2439,8 +2341,8 @@ mod tests {
         })))
         .unwrap();
         let candidates = vec![
-            // Feeds mix spellings; the value stays percent-encoded in
-            // storage, the rule matches the raw form, as documented.
+            // The value stays percent-encoded in storage, the rule matches
+            // the raw form, as documented
             candidate_with_params(
                 "a",
                 "h1.example.com",
@@ -2494,10 +2396,8 @@ mod tests {
 
     #[test]
     fn drop_by_asn_discards_matching_proxies() {
-        // The pipeline-level helper (`drop_entries_with_geo`) runs before
-        // any DB interaction, so it is the cheapest place to exercise ASN
-        // drop. The ASNs arrive pre-parsed, the stamps ride along
-        // index-aligned; an empty stamp is "unknown".
+        // The ASNs arrive pre-parsed, the stamps ride along
+        // index-aligned; an empty stamp is "unknown"
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["24940"] }]
@@ -2519,7 +2419,7 @@ mod tests {
             .0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h2.example.com");
-        // Verify the geometry contract: empty stamps leave entries alone.
+        // Empty stamps leave entries alone
         let no_geo: Vec<Option<fumox_core::repo::proxies::GeoStamp>> = vec![None; entries.len()];
         let untouched = compiled
             .drop_entries_with_geo(entries, &stamp_asns(&no_geo), &no_geo, "test-source")
@@ -2529,11 +2429,10 @@ mod tests {
 
     #[test]
     fn drop_entries_keeps_the_batch_when_the_geo_slice_is_short() {
-        // The resolver is inactive (geo disabled, or the `.mmdb` files are
-        // missing on disk, the default configuration), so the ingest
-        // caller resolves no stamps at all and passes an empty slice. The
-        // batch must survive intact: a truncated zip would drop every
-        // proxy and make reconcile retire the whole source.
+        // The resolver is inactive (geo disabled, or the `.mmdb` files
+        // missing on disk), so the ingest caller passes an empty slice
+        // The batch must survive intact: a truncated zip would drop every
+        // proxy and make reconcile retire the whole source
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [
@@ -2558,7 +2457,7 @@ mod tests {
             ["p1", "p2", "p3"]
         );
         // Regex rules need no stamp, so they still fire on a stamp-less
-        // batch: only the ASN lookups are skipped.
+        // batch
         let with_cn = compiled
             .drop_entries_with_geo(
                 vec![entry("p1", "h1.example.com"), entry("cn", "h.cn")],
@@ -2569,7 +2468,7 @@ mod tests {
             .0;
         assert_eq!(names(with_cn), ["p1"]);
         // A partially resolved slice behaves the same for the tail: the
-        // entries past its end are unstamped, not dropped.
+        // entries past its end are unstamped, not dropped
         let partial_stamps = vec![stamp("AS13335")];
         let partial = compiled
             .drop_entries_with_geo(
@@ -2584,9 +2483,8 @@ mod tests {
 
     #[test]
     fn drop_by_asn_accepts_both_with_and_without_prefix() {
-        // `24940` and `AS24940` in the same `asns` list both match a
-        // stored `AS24940`, the validator normalises through
-        // `asn_number`.
+        // `24940` and `AS24940` both match a stored `AS24940`, the
+        // validator normalises through `asn_number`
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["24940", "AS13335"] }]
@@ -2604,8 +2502,8 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h3.example.com");
 
-        // The lowercase spelling compiles too and matches the same stored
-        // `AS24940`: `asn_number` strips the prefix in either case.
+        // The lowercase spelling compiles too: `asn_number` strips the
+        // prefix in either case
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["as24940"] }]
@@ -2622,7 +2520,7 @@ mod tests {
 
     #[test]
     fn drop_by_asn_keeps_unresolved_proxies() {
-        // Missing ASN stamp is not a hit (matches `filter.exclude_asns`).
+        // Missing ASN stamp is not a hit (matches `filter.exclude_asns`)
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["24940"] }]
@@ -2639,7 +2537,7 @@ mod tests {
     #[test]
     fn drop_with_text_and_asn_rules_combined() {
         // Regex over `host` plus ASN list, the same `drop` array holds
-        // both flavours and both fire on a matching entry.
+        // both flavours and both fire on a matching entry
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [
@@ -2665,8 +2563,7 @@ mod tests {
     #[test]
     fn drop_asn_target_requires_asns() {
         // An ASN rule without `asns` is a field error, never a silent
-        // match-all. The compile path fails closed: no `CompiledPipeline`
-        // is produced.
+        // match-all
         let result = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn" }]
@@ -2721,9 +2618,8 @@ mod tests {
 
     #[test]
     fn unknown_target_is_a_field_error() {
-        // The validator rejects an unknown target with the shared
-        // `pipeline.unknown_target` key; the rendered copy (the `asn`
-        // entry in the allowed list) is pinned by the admin/i18n tests.
+        // The rendered copy (the `asn` entry in the allowed list) is
+        // pinned by the admin/i18n tests
         let issues = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "foo", "match": "." }]
@@ -2737,9 +2633,8 @@ mod tests {
 
     #[test]
     fn drop_by_asn_invalid_asn_number_is_a_field_error() {
-        // `asns` accepts only digits with optional `AS` prefix. A typo
-        // becomes `pipeline.unknown_asn` and skips the rule rather than
-        // partially compiling it.
+        // A typo becomes `pipeline.unknown_asn` and skips the rule rather
+        // than partially compiling it
         let result = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["24940", "not-a-number"] }]
@@ -2753,9 +2648,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_by_asn_applies_on_serving_side_too() {
-        // The serving-side drop pass must also fire on ASN-targeted
-        // rules. Build candidates with explicit `geo_asn` and check the
-        // post-apply list.
+        // The serving-side drop pass must also fire on ASN-targeted rules
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["24940"] }]
@@ -2777,8 +2670,7 @@ mod tests {
     #[tokio::test]
     async fn rename_port_target_guards_invalid_results() {
         // A literal replacement that is never a valid port is a
-        // compile-time field error: the rewrite could only be skipped for
-        // every entry it matches.
+        // compile-time field error
         for replace in ["70000", "443:evil"] {
             let err = CompiledPipeline::from_json(Some(&json!({
                 "version": 1,
@@ -2788,10 +2680,9 @@ mod tests {
             assert_eq!(err[0].key, "pipeline.never_valid_port", "{replace}");
         }
 
-        // Zero is refused at runtime like any other unusable value: the
-        // parsers drop it and the schema CHECK (migration 0018) would
-        // reject the row at the upsert. "0" parses as u16, so the rule
-        // compiles and the guard is the runtime one.
+        // "0" parses as u16, so the rule compiles and the guard is the
+        // runtime one (the parsers drop port 0 and the schema CHECK
+        // (migration 0018) would reject the row)
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": ".*", "replace": "0", "target": "port" }]
@@ -2831,19 +2722,16 @@ mod tests {
             return;
         };
 
-        // The resolver merges every database in db_dir, so one template can
-        // draw country and ASN facts at once, the one-database era could
-        // not render this. 8.8.8.8 is anycast (no city): the missing city
-        // must collapse away, not break the name.
+        // The resolver merges every database in db_dir, so one template
+        // can draw country and ASN facts at once. 8.8.8.8 is anycast (no
+        // city): the missing city must collapse away, not break the name
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "geo": { "enabled": true, "template": "{country} {city} · {asn} {name}" }
         })))
         .unwrap();
         // Literal IP → no DNS round-trip. The country/city wording is the
-        // database's, so the assert pins only the shape: facts merged
-        // around the `·` separator, the ASN as `AS<n>` and the original
-        // name kept.
+        // database's, so the assert pins only the shape
         let out = compiled
             .apply(vec![candidate("Node-1", Scheme::Vless, "8.8.8.8")], &geo)
             .await;
@@ -2883,8 +2771,8 @@ mod tests {
     }
 
     /// The health exclusion list is the operator's choice, both ways: an
-    /// empty list hides nothing (a quarantined proxy is served), a list
-    /// that names `unknown` hides the never-probed tier too.
+    /// empty list hides nothing, a list that names `unknown` hides the
+    /// never-probed tier too.
     #[tokio::test]
     async fn health_exclude_statuses_is_the_operators_choice() {
         let compiled = CompiledPipeline::from_json(Some(&json!({
@@ -2930,7 +2818,7 @@ mod tests {
         })))
         .unwrap();
         // An explicit `sort` section is the sort contest's "was chosen"
-        // marker.
+        // marker
         assert!(by_name.sort_explicit());
         let candidates = vec![
             candidate("beta", Scheme::Vless, "h1.example.com"),
@@ -2954,7 +2842,6 @@ mod tests {
             .apply(vec![fast, slow, unmeasured], &inactive_geo())
             .await;
         let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
-        // Descending, but the NULL latency stays last.
         assert_eq!(names, vec!["slow", "fast", "unknown"]);
     }
 
@@ -3025,13 +2912,12 @@ mod tests {
             logs.contains(r#"step="health""#),
             "the health step must log its counts: {logs}"
         );
-        // `apply` ends with `finalize`: the dedup step logs there too (the
-        // limit step only fires with a configured cap).
+        // `apply` ends with `finalize`: the dedup step logs there too
         assert!(logs.contains(r#"step="dedup""#), "{logs}");
         let warnings = logs.lines().filter(|line| line.contains("WARN")).count();
         assert_eq!(warnings, 0, "a partial removal must not warn: {logs}");
 
-        // A rule that removes everything of a non-empty input warns.
+        // A rule that removes everything of a non-empty input warns
         let (logs, _guard) = capture_logs(tracing::Level::DEBUG);
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
@@ -3053,8 +2939,8 @@ mod tests {
     }
 
     /// The geo pass resolves hosts with bounded parallelism: more than one
-    /// lookup is in flight at a time (the old strictly serial loop peaked
-    /// at 1) and the peak stays within [`GEO_LOOKUP_CONCURRENCY`].
+    /// lookup in flight at a time, the peak within
+    /// [`GEO_LOOKUP_CONCURRENCY`].
     #[tokio::test]
     async fn geo_enrich_resolves_hosts_with_bounded_concurrency() {
         let compiled = CompiledPipeline::from_json(Some(&json!({
@@ -3092,7 +2978,7 @@ mod tests {
 
     #[tokio::test]
     async fn limit_truncates_after_sort_to_the_top() {
-        // `sort: latency` + `limit: 2` yields the two fastest proxies.
+        // `sort: latency` + `limit: 2` yields the two fastest proxies
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "sort": { "by": "latency" },
@@ -3121,8 +3007,7 @@ mod tests {
 
     #[tokio::test]
     async fn limit_null_keeps_everything() {
-        // The explicit "defaults" reset (the profile tri-state): a present
-        // section with `count: null` must not cap anything.
+        // A present section with `count: null` must not cap anything
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "limit": { "count": null }
@@ -3178,14 +3063,12 @@ mod tests {
             "sort": { "by": "latency" }
         });
         let merged = merge_configs(Some(&source), Some(&profile)).unwrap();
-        // Profile replaced sort; source filter survived.
         assert_eq!(merged["sort"]["by"], "latency");
         assert_eq!(merged["filter"]["protocols"][0], "vless");
     }
 
-    /// A `NULL` profile pipeline overrides nothing: the source's sections
-    /// stay in place. The profile's `null` is "no override", not "every
-    /// section reset to nothing configured".
+    /// A `NULL` profile pipeline overrides nothing: the profile's `null`
+    /// is "no override", not "every section reset to nothing configured".
     #[test]
     fn a_null_profile_pipeline_overrides_nothing() {
         let source = json!({
@@ -3200,27 +3083,21 @@ mod tests {
     /// The merge table: absent sides pass through, a non-object profile
     /// wins so the error surfaces against the profile form, and a
     /// non-object source merged with a valid object profile is replaced
-    /// by it — with a WARN naming the source config as the broken side,
-    /// since only the source could have caused the mismatch.
+    /// by it, with a WARN naming the source config as the broken side.
     #[test]
     fn merge_configs_table() {
         assert_eq!(merge_configs(None, None), None);
         let source = json!({ "version": 1, "sort": { "by": "name" } });
         let profile = json!({ "version": 1, "limit": { "count": 5 } });
 
-        // (Some(obj), None) → the source, untouched.
         assert_eq!(merge_configs(Some(&source), None), Some(source.clone()));
-        // (None, Some(p)) → the profile.
         assert_eq!(merge_configs(None, Some(&profile)), Some(profile.clone()));
-        // (Some(obj), Some(non-object)) → the profile wins.
         for broken in [json!("oops"), json!(42)] {
             assert_eq!(
                 merge_configs(Some(&source), Some(&broken)),
                 Some(broken.clone())
             );
         }
-        // (Some(non-object), Some(obj)) → the profile's object, merged
-        // over nothing, with a WARN that names the source.
         let (logs, _guard) = capture_logs(tracing::Level::WARN);
         let merged = merge_configs(Some(&json!("oops")), Some(&profile));
         let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
@@ -3231,8 +3108,8 @@ mod tests {
         );
     }
 
-    /// The ASN fill is a geo lookup per candidate: only the ASN rules need
-    /// it, a pipeline without one resolves nothing.
+    /// The ASN fill is a geo lookup per candidate: only the ASN rules
+    /// need it.
     #[tokio::test]
     async fn a_pipeline_without_an_asn_rule_resolves_no_asn() {
         let compiled = CompiledPipeline::from_json(Some(&json!({
@@ -3246,7 +3123,6 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(geo.calls(), 0);
 
-        // With an ASN rule the fill runs.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "filter": { "asns": ["13335"] }
@@ -3344,7 +3220,7 @@ mod tests {
             ("allow_insecure", "1"),
             ("INSECURE", " TRUE "),
             // The yes/on spellings of the one shared toggle vocabulary: a
-            // `yes` node must drop like a `1` one, not survive the filter.
+            // `yes` node must drop like a `1` one, not survive the filter
             ("allowInsecure", "yes"),
             ("skip-cert-verify", "on"),
         ] {
@@ -3387,7 +3263,7 @@ mod tests {
                 .await;
             assert_eq!(out.len(), 1, "falsy {key}=0 must survive");
         }
-        // No alias at all, untouched by the filter.
+        // No alias at all, untouched by the filter
         let plain = candidate("plain", Scheme::Vless, "plain.example.com");
         let out = CompiledPipeline::from_json(None)
             .unwrap()
@@ -3419,7 +3295,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_normalize_params_name_still_compiles_as_the_same_switch() {
         // Old exports carry "normalize_params": false, the v1 name of the
-        // switch, accepted via serde alias so imports keep working.
+        // switch, accepted via serde alias so imports keep working
         let legacy = json!({
             "version": 1,
             "filter": { "normalize_params": false }
@@ -3440,9 +3316,9 @@ mod tests {
 
     #[test]
     fn typed_config_serializes_omitting_defaults() {
-        // The Serialize side is the builder emit's policy. A config with
-        // every section unset serializes to bare `{"version": 1}`: the
-        // JSON that makes the builder emit collapse to NULL.
+        // A config with every section unset serializes to bare
+        // `{"version": 1}`: the JSON that makes the builder emit collapse
+        // to NULL
         let bare = PipelineConfig {
             version: 1,
             filter: None,
@@ -3460,9 +3336,7 @@ mod tests {
         );
 
         // Sections present but carrying only schema defaults serialize to
-        // the explicit empty blocks the profile tri-state pins: `{}` for
-        // the object sections, `[]` for the rule lists, `{"count": null}`
-        // for the cap. Fields at their schema default are never written.
+        // the explicit empty blocks the profile tri-state pins
         let defaults = PipelineConfig {
             filter: Some(FilterConfig {
                 protocols: None,
@@ -3508,7 +3382,7 @@ mod tests {
         // Every section at a non-default value: the serialized document
         // must parse back to a config that serializes identically (no
         // asymmetry between the skip predicates and the deserialize
-        // defaults) and must pass the strict validator.
+        // defaults) and must pass the strict validator
         let full = PipelineConfig {
             version: 1,
             filter: Some(FilterConfig {
@@ -3565,7 +3439,7 @@ mod tests {
         );
         // `limit: {"count": null}` serializes explicitly (the no-cap
         // reset); `limit: null` deserializes as `None` (no section), not
-        // as the reset.
+        // as the reset
         let no_cap = PipelineConfig {
             limit: Some(LimitConfig { count: None }),
             ..full
@@ -3576,11 +3450,10 @@ mod tests {
         );
     }
 
-    /// A panic in one request while the compile cache's lock is held
-    /// poisons the std mutex; the panel must keep rendering: the cache
-    /// holds no invariant a poison would break, so the lock recovers
-    /// through `into_inner` (the module-wide discipline) instead of
-    /// turning every later render into a panic.
+    /// A panic while the compile cache's lock is held poisons the std
+    /// mutex; the cache holds no invariant a poison would break, so the
+    /// lock recovers through `into_inner` instead of taking every later
+    /// render down.
     #[test]
     fn a_poisoned_compile_cache_keeps_compiling() {
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

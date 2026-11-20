@@ -124,7 +124,7 @@ const VLESS_SPEC: ClashTypeSpec = ClashTypeSpec {
 const SOCKS5_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Socks5,
     credential_fields: &["username", "password"],
-    // Every part is optional: the writers skip an empty one.
+    // Every part is optional: the writers skip an empty one
     optional_credential_fields: true,
     known_fields: &["udp"],
 };
@@ -143,7 +143,7 @@ const SNELL_SPEC: ClashTypeSpec = ClashTypeSpec {
         "obfs",
         "obfs-host",
         // The nested block a Clash feed spells obfs in; kept known so the
-        // Clash writer can re-emit it as a block rather than a scalar.
+        // Clash writer can re-emit it as a block rather than a scalar
         "obfs-opts",
     ],
 };
@@ -183,10 +183,9 @@ struct ClashRoot {
 
 /// Parse a full Clash YAML subscription payload.
 pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
-    // Alias references are refused before parsing: the whole payload is
-    // attacker-controlled feed content and `serde_norway` re-materializes
-    // the anchor's subtree for every reference, an alias bomb amplifies
-    // quadratic memory out of a small payload (see `reject_yaml_aliases`).
+    // Alias references are refused before parsing: `serde_norway`
+    // re-materializes the anchor's subtree for every reference, an alias
+    // bomb amplifies quadratic memory out of a small feed payload
     super::reject_yaml_aliases(payload).map_err(|e| format!("clash: {e}"))?;
     let root: ClashRoot =
         serde_norway::from_str(payload).map_err(|e| format!("clash: invalid YAML: {e}"))?;
@@ -199,8 +198,8 @@ pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
     };
     for (index, item) in root.proxies.iter().enumerate() {
         if result.entries.len() >= super::MAX_ENTRIES {
-            // The cap is reached: the rest of the payload is counted instead
-            // of parsed, so the load stays bounded and the truncation shows.
+            // Past the cap: the rest is counted instead of parsed, so the
+            // truncation shows
             result.skipped += 1;
             continue;
         }
@@ -218,7 +217,7 @@ pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
         }
     }
     // One summary line for the whole payload: the element loop only counts
-    // its skips, so this is where the truncation becomes visible.
+    // its skips, so this is where the truncation becomes visible
     if result.unsupported > 0 || result.invalid > 0 {
         tracing::warn!(
             entries = result.entries.len(),
@@ -256,7 +255,7 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     };
 
     // A number/bool name becomes its literal text, like every parameter
-    // value: the name is display data, never worth failing the item.
+    // value: the name is display data, never worth failing the item
     let name = map
         .get("name")
         .map(yaml_to_string)
@@ -265,7 +264,7 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
 
     // Every error formed after the name is read carries it: the name is the
     // label an operator finds the broken item by in the feed (the loop
-    // index of `parse_payload` does not survive into the log).
+    // index of `parse_payload` does not survive into the log)
     let named = |message: String| match message.strip_prefix("clash: ") {
         Some(rest) => format!("clash: item {name:?}: {rest}"),
         None => format!("clash: item {name:?}: {message}"),
@@ -277,25 +276,23 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     let host = super::normalize_host(&host);
     let port = numeric_field(map, "port").map_err(named)?;
 
-    // The `:`-joined credential, the contract the output writers read.
+    // The `:`-joined credential, the contract the output writers read
     let credential = credential_value(spec, map).map_err(named)?;
 
     // A YAML scalar may legally contain a line break, but the URI
     // serializers emit these two fields verbatim, one would split this proxy
     // into several output lines and smuggle a foreign scheme past the
-    // source's protocol allowlist. Reject the item; the caller counts it.
-    // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,
-    // `reality-opts`, …) as multi-line YAML text, so they are sanitized at
-    // serialization time instead.
+    // source's protocol allowlist. Parameter values are exempt: Clash keeps
+    // structured blocks (`ws-opts`, `reality-opts`, …) as multi-line YAML
+    // text, so they are sanitized at serialization time instead
     super::reject_line_breaks("clash: server", &host).map_err(named)?;
     super::reject_line_breaks("clash: credential", &credential).map_err(named)?;
 
     let params = collect_params(spec, map);
-    // Field-size cap: Clash
-    // params bypass `parse_query`, so the caps are enforced here.
+    // Clash params bypass `parse_query`, so the caps are enforced here
     super::validate_params("clash", &params).map_err(named)?;
     // The host, the credential and the name are persisted verbatim, so they
-    // are capped like the parameters.
+    // are capped like the parameters
     super::check_field_size("clash: server", &host).map_err(named)?;
     super::check_field_size("clash: credential", &credential).map_err(named)?;
     super::check_field_size("clash: name", &name).map_err(named)?;
@@ -360,7 +357,7 @@ fn credential_value(spec: &ClashTypeSpec, map: &serde_norway::Mapping) -> Result
     // item stores the default cipher with it, so every reader gets the
     // complete `method:password` shape and the row merges with its
     // explicit-cipher twin; an item with no credential at all is unusable,
-    // not a no-auth proxy, and is counted as invalid.
+    // not a no-auth proxy, and is counted as invalid
     if spec.scheme != Scheme::Ss {
         return Ok(credential);
     }
@@ -494,7 +491,7 @@ proxy-groups:
         assert!(hy2.params.iter().find(|p| p.key == "sni").unwrap().known);
 
         // snell: the psk is the whole credential, and the nested obfs block
-        // survives as a mapping the Clash writer can re-emit.
+        // survives as a mapping the Clash writer can re-emit
         let snell = &result.entries[2];
         assert_eq!(snell.scheme, Scheme::Snell);
         assert_eq!(snell.host, "1.2.3.4");
@@ -671,8 +668,6 @@ proxy-groups:
         assert!(result.entries.is_empty());
     }
 
-    /// A payload with a pathological number of items stops at the cap, and
-    /// the remainder is counted as skipped.
     #[test]
     fn a_payload_with_too_many_items_is_capped() {
         let items: String = (0..crate::parsers::MAX_ENTRIES + 5)

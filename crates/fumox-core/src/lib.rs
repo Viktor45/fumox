@@ -1,8 +1,5 @@
-//! fumox-core, shared library for the Fumox proxy-subscription service.
-//!
-//! Contains configuration loading, database access helpers, domain models,
-//! fingerprinting, protocol parsers, geo enrichment and output-format
-//! encoders used by both `fumox-server` and `fumox-probe`.
+//! fumox-core, shared library for the Fumox proxy-subscription service, used
+//! by both `fumox-server` and `fumox-probe`.
 
 pub mod bootstrap;
 pub mod config;

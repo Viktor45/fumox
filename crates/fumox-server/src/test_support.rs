@@ -8,18 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Keep ≥2 dispatchers permanently alive in tracing's global dispatcher
-/// registry, for the log-capturing test modules (auth, scheduler): a call
-/// site's interest is cached against the dispatchers live at its FIRST
-/// execution, and when the registry holds fewer than two, tracing consults
-/// the *registering thread's* thread-local default (in a parallel test
-/// suite usually no subscriber at all) so call sites get cached as
-/// `Interest::never` and their events go silently nowhere for the rest of
-/// the process (an intermittent failure that depends purely on test
-/// scheduling). With the registry permanently multi-dispatcher, every
-/// registration is evaluated against all live dispatchers and lands on
-/// `Interest::sometimes`, so capture tests always see their lines. Runtime
-/// dispatch is unaffected: threads without a scoped default still resolve
-/// to the empty global default and drop their events as before.
+/// registry, for the log-capturing test modules: a call site's interest
+/// is cached against the dispatchers live at its FIRST execution, and
+/// with fewer than two the registry consults the registering thread's
+/// thread-local default (usually no subscriber in a parallel suite), so
+/// call sites get cached as `Interest::never` and their events go
+/// silently nowhere for the rest of the process (an intermittent failure
+/// depending purely on test scheduling). With the registry permanently
+/// multi-dispatcher, every registration lands on `Interest::sometimes`,
+/// so capture tests always see their lines. Runtime dispatch is
+/// unaffected: threads without a scoped default still resolve to the
+/// empty global default and drop their events as before.
 ///
 /// Call once before the first capture; the two subscribers leak on
 /// purpose: the permanently-live registrars are the point.
@@ -39,7 +38,7 @@ pub(crate) fn stabilize_callsite_interests() {
 
 /// A local HTTP upstream for the fetch tests (ingest, scheduler): answers
 /// every request with `HTTP/1.1 200 OK` carrying the next body from
-/// `bodies` — a request beyond the list gets the last body again — and
+/// `bodies` (a request beyond the list gets the last body again) and
 /// counts the requests it received. Requests are answered sequentially,
 /// and the counter increments on accept, doubling as the index of the body
 /// the current request is answered with: the tests drive one fetch at a
@@ -60,7 +59,7 @@ pub(crate) async fn one_shot_upstream(bodies: Vec<&'static str>) -> (SocketAddr,
             // bytes makes the kernel send RST, which can clobber the
             // client's buffered read of the response; the fetcher then
             // retries, opening a second connection the counter sees, and
-            // the exact-fetch-count assertions would flake.
+            // the exact-fetch-count assertions would flake
             let mut received = Vec::with_capacity(1024);
             loop {
                 let mut scratch = [0u8; 1024];

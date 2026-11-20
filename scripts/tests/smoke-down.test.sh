@@ -32,8 +32,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/fumox-smoke-down-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 # The oldest bash available: /bin/bash on macOS is 3.2, the version the
-# empty-array guard exists for. BASH_BIN overrides, to point the test at a
-# specific one.
+# empty-array guard exists for. BASH_BIN overrides for a specific one
 BASH_BIN="${BASH_BIN:-}"
 for candidate in $BASH_BIN /bin/bash bash; do
     if [[ -n "$candidate" ]] && command -v "$candidate" >/dev/null 2>&1; then
@@ -45,8 +44,7 @@ done
 BASH_MAJOR="$("$BASH_BIN" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null || echo '?')"
 
 # Whether this bash is the kind the guard is for: 3.2 fails the expansion
-# outright, later ones do not. Either way the script must produce the same
-# compose command.
+# outright, later ones do not. Either way the compose command must be the same
 if "$BASH_BIN" -uc 'arr=(); printf "%s\n" "${arr[@]}"' >/dev/null 2>&1; then
     note "bash ${BASH_MAJOR} tolerates empty arrays; the guard is checked for args only"
 else
@@ -81,10 +79,9 @@ run_down() { # expected compose command line, then script args
     note "compose ran: $got"
 }
 
-# Default: the stand's volumes are kept -- deleting them is opt-in.
+# Default: the stand's volumes are kept -- deleting them is opt-in
 run_down "compose -p fumox-smoke down --remove-orphans"
-# --purge-volumes: the volumes go with it, and nothing else about the
-# command moves.
+# --purge-volumes: the volumes go with it, nothing else about the command moves
 run_down "compose -p fumox-smoke down --remove-orphans -v" --purge-volumes
 
 set +e
@@ -95,7 +92,7 @@ set -e
 note "unknown flag exits 64"
 
 # A project name outside the smoke stand's own naming scheme is refused
-# before anything is torn down: this script can delete volumes.
+# before anything runs: this script can delete volumes
 : >"$WORK/compose.args"
 set +e
 OUT="$(PATH="$STUB:$PATH" SMOKE_PROJECT=fumox "$BASH_BIN" "$SCRIPT" 2>&1)"
@@ -105,12 +102,10 @@ set -e
 [[ ! -s "$WORK/compose.args" ]] || fail "a refused project name still ran compose"
 note "a project name outside the allow-list is refused"
 
-# podman-compose and --remove-orphans
-# The standalone front-end grew the flag late; a version that does not
-# know it must not be handed it, or the whole down call is rejected and
-# the stand never goes away. The engine decision is driven through stubs:
-# docker's daemon is down, `podman compose` has no provider, so the run
-# falls through to podman-compose itself.
+# podman-compose and --remove-orphans: the front-end grew the flag late, and
+# a version without it must not be handed it or the whole down call is
+# rejected. The engine decision is driven through stubs (docker's daemon is
+# down, `podman compose` has no provider, so the run falls through)
 STUB2="$WORK/bin-podman"
 mkdir -p "$STUB2"
 cat >"$STUB2/docker" <<'STUB'

@@ -1,8 +1,7 @@
-//! Admin screen handlers. The list screens and card reads go through the
-//! typed `fumox_core::repo` layer (their dynamic filters live there, in
-//! one place); the dashboard's cross-table aggregates are the remaining
-//! read queries specific to the admin UI, and shared mutations go through
-//! `fumox_core::repo`.
+//! Admin screen handlers. List screens and card reads go through the typed
+//! `fumox_core::repo` layer (their dynamic filters live there); dashboard
+//! cross-table aggregates are the remaining admin-specific reads, and
+//! shared mutations also go through `fumox_core::repo`.
 
 mod import_export;
 mod logs;
@@ -38,11 +37,6 @@ use axum::response::{IntoResponse, Redirect, Response};
 use crate::admin::dash_top_n::{self, DashTopN};
 use fumox_core::models::ProxyStatus;
 
-/// Dashboard (merged with the former statistics screen,
-/// aggregate counters, source errors (the
-/// operator's most actionable block, rendered first), per-source health,
-/// probe summary, latency aggregates, ingest dynamics and the
-/// protocol/country splits.
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
@@ -60,23 +54,18 @@ struct DashboardTemplate {
     proxy_counts: Vec<(String, i64)>,
     fetch_total_24h: i64,
     fetch_ok_24h: i64,
-    /// Age in seconds of the last scheduler sweep start (stamped into
-    /// `meta.server_cycle` in `scheduler::sweep`), rendered as a sub-line
-    /// of the fetches card. `None` until the first sweep ever ran. A
-    /// stamp that exists but does not parse is a different fact: it sets
-    /// [`Self::server_cycle_corrupt`] instead of collapsing into the
-    /// clean "no sweep yet" state.
+    /// Seconds since the last scheduler sweep start (stamped into
+    /// `meta.server_cycle` in `scheduler::sweep`). `None` until the first
+    /// sweep; an unparseable stamp sets [`Self::server_cycle_corrupt`]
+    /// instead of reading as "no sweep yet".
     server_cycle_age_secs: Option<i64>,
-    /// The `server_cycle` stamp exists but does not parse: a cut-short
-    /// write or a format the reader does not know. Rendered as its own
-    /// "corrupt" state, so a broken stamp is never read as "no sweep yet".
+    /// The `server_cycle` stamp exists but does not parse, rendered as its
+    /// own "corrupt" state so it is never read as "no sweep yet".
     server_cycle_corrupt: bool,
     recent_errors: Vec<SourceErrorRow>,
     /// The source-errors read failed: the block renders empty with an
-    /// inline note instead of failing the whole page (the rest of the
-    /// dashboard is independent of that one query).
+    /// inline note instead of failing the whole page.
     recent_errors_unavailable: bool,
-    /// Per-source health counters (the former stats screen table).
     sources: Vec<SourceStatRow>,
     /// The per-source health read failed; same degradation as
     /// [`Self::recent_errors_unavailable`].
@@ -88,12 +77,10 @@ struct DashboardTemplate {
     latency_min: Option<i64>,
     latency_avg: Option<i64>,
     latency_median: Option<i64>,
-    /// `(total probes in 24h, successful probes in 24h)`. Speed probes
-    /// are excluded: they measure transfer bandwidth, not liveness, so
-    /// they are not a check that can succeed or fail.
+    /// `(total probes in 24h, successful probes in 24h)`. Speed probes are
+    /// excluded: they measure transfer bandwidth, not liveness.
     probes_total_24h: i64,
     probes_ok_24h: i64,
-    /// Counters of the probe summary panel.
     unprobeable: i64,
     quarantine_second_chance: i64,
     in_quarantine: i64,
@@ -108,8 +95,7 @@ struct DashboardTemplate {
     /// split's display cap.
     top_n: DashTopN,
     /// Top failure reasons (error message, hit count) over the last 24h,
-    /// ordered by hit count descending. Populated by
-    /// `fumox_core::repo::probe::top_failure_reasons`.
+    /// ordered by hit count descending.
     top_failures: Vec<(String, i64)>,
 }
 
@@ -122,7 +108,6 @@ struct SourceErrorRow {
     last_fetched_at: Option<i64>,
 }
 
-/// Row of the per-source health table (the former stats screen).
 #[derive(Debug, sqlx::FromRow)]
 struct SourceStatRow {
     id: String,
@@ -185,9 +170,8 @@ struct IngestDayRow {
     created: i64,
 }
 
-// Formatting helpers exposed to the dashboard template. askama passes
-// call arguments by reference, so every helper takes &T. The timestamp
-// helpers (`ts`, `opt_ts`) come from `impl_i18n!`.
+// askama passes call arguments by reference, so every helper takes &T.
+// The timestamp helpers (`ts`, `opt_ts`) come from `impl_i18n!`.
 impl DashboardTemplate {
     /// Calendar day of an ingest-chart bucket, date only (the chart's
     /// columns are midnight UTC and a timestamp does not fit them).
@@ -226,15 +210,12 @@ impl DashboardTemplate {
     }
 }
 
-/// Percentage of `part` relative to `whole` (0 when whole is 0). The
-/// arithmetic of [`DashboardTemplate::pct`], free so it is testable
+/// The arithmetic of [`DashboardTemplate::pct`], free so it is testable
 /// without a template instance.
 fn pct_of(part: i64, whole: i64) -> i64 {
     if whole == 0 { 0 } else { (part * 100) / whole }
 }
 
-/// Width in percent of one distribution bar (relative to the largest
-/// bucket of its group); 1 is the floor so non-zero counts stay visible.
 /// The arithmetic of [`DashboardTemplate::bar_width`], free so it is
 /// testable without a template instance.
 fn bar_width_of(count: i64, max: i64) -> i64 {
@@ -250,15 +231,14 @@ impl_i18n!(DashboardTemplate);
 pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let started = std::time::Instant::now();
     let lang = state.locales.lang_from_headers(&headers);
-    // `dashboard_inner` carries the `?`-style flow and answers either the
-    // rendered model or the finished error response; the only match on
-    // the error path stays here.
+    // `dashboard_inner` answers either the rendered model or the finished
+    // error response; the only error-path match stays here
     let template = match dashboard_inner(&state, &headers, &lang).await {
         Ok(template) => template,
         Err(response) => return response,
     };
     // One timing line per render: a slow dashboard is visible in the log
-    // without reproducing it.
+    // without reproducing it
     tracing::debug!(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "dashboard rendered"
@@ -266,12 +246,10 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     render_html(lang.clone(), "dashboard.html", &template, StatusCode::OK)
 }
 
-/// The dashboard's reads. The orchestration below keeps the transaction
-/// and the template assembly; the queries themselves live in the section
-/// helpers after it, each mapping its own query errors to the finished
-/// 500 response with the name of the failed query in the log, so the
-/// `?`s stay one-liners; the two widgets the operator triages from
-/// (source errors, per-source health) degrade on their own instead
+/// The dashboard's reads. Each section helper maps its own query errors
+/// to the finished 500 response with the failed query's name in the log,
+/// so the `?`s stay one-liners; the two triage widgets (source errors,
+/// per-source health) degrade on their own instead
 /// ([`DashboardTemplate::recent_errors_unavailable`]).
 #[allow(clippy::result_large_err)] // the Err is a finished Response, by design
 async fn dashboard_inner(
@@ -283,11 +261,10 @@ async fn dashboard_inner(
     let top_n = dash_top_n::from_headers(headers);
     let pool = &state.pool;
 
-    // One read transaction for the whole screen: every counter and every
-    // list below is read from the same snapshot, so a proxy that changes
-    // state between two queries cannot make the page contradict itself.
-    // The transaction also holds one connection instead of taking one per
-    // query.
+    // One read transaction: every counter and list below is read from the
+    // same snapshot, so a proxy changing state between queries cannot make
+    // the page contradict itself; it also holds one connection instead of
+    // one per query
     let mut tx = pool
         .begin()
         .await
@@ -355,10 +332,8 @@ async fn dashboard_inner(
     })
 }
 
-/// The dashboard's scalar counters, one snapshot: the source totals
-/// (with the errored-source count), the profile count, the per-status
-/// aggregates the breakdown and the panel counters come from, and the
-/// 24h fetch pair.
+/// The dashboard's scalar counters, one snapshot: source totals, profile
+/// count, per-status aggregates and the 24h fetch pair.
 #[allow(clippy::result_large_err)] // the Err is a finished Response, by design
 async fn dashboard_counters(
     state: &AdminState,
@@ -388,7 +363,7 @@ async fn dashboard_counters(
         .map_err(|err| server_error(state, headers, "dashboard.profiles", &err))?;
 
     // The proxy counters come from one grouped pass over the table, so
-    // the breakdown by status and the scalar counters cannot disagree.
+    // the breakdown by status and the scalar counters cannot disagree
     let aggregates = fumox_core::repo::proxies::status_aggregates(&mut *conn)
         .await
         .map_err(|err| server_error(state, headers, "dashboard.status_aggregates", &err))?;
@@ -406,11 +381,9 @@ async fn dashboard_counters(
     ))
 }
 
-/// The two widgets the operator triages from: the source-errors block
-/// and the per-source health table. They read the same snapshot but
-/// degrade independently: a failed read leaves its block empty with an
-/// inline note (`*_unavailable`) instead of taking the whole screen
-/// down.
+/// The two triage widgets: they read the same snapshot but degrade
+/// independently; a failed read leaves its block empty with an inline
+/// note (`*_unavailable`) instead of taking the screen down.
 async fn dashboard_triage_widgets(
     conn: &mut sqlx::SqliteConnection,
     limit: i64,
@@ -432,7 +405,6 @@ async fn dashboard_triage_widgets(
             }
         };
 
-    // Per-source health counters (single aggregate over the join table).
     let (sources, sources_unavailable): (Vec<SourceStatRow>, bool) = match source_health_split(
         &mut *conn,
     )
@@ -451,8 +423,6 @@ async fn dashboard_triage_widgets(
     )
 }
 
-/// The dashboard's distribution tables: the longest-living ready
-/// proxies top and the per-scheme and per-country splits.
 #[allow(clippy::result_large_err)] // the Err is a finished Response, by design
 async fn dashboard_splits(
     state: &AdminState,
@@ -460,14 +430,11 @@ async fn dashboard_splits(
     conn: &mut sqlx::SqliteConnection,
     limit: i64,
 ) -> Result<(Vec<TopAliveRow>, Vec<SchemeSplitRow>, Vec<CountrySplitRow>), Response> {
-    // Longest-living ready proxies: oldest `created_at` first, the
-    // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
-    // only by a successful T2, so showing the top-N there surfaces the
-    // proxies that have stayed end-to-end working the longest. The tier
-    // is bound like every status value on this screen: no inline status
-    // literal survives in the dashboard's SQL. The picked ids come from
-    // a CTE, so the LIMIT applies before the source-links fan-out joins
-    // in their names.
+    // `ready` is the tunnel-verified tier (strict subset of `alive`, set
+    // only by a successful T2), so the oldest-`created_at` top surfaces
+    // the proxies that have stayed end-to-end working the longest. The
+    // picked ids come from a CTE, so the LIMIT applies before the
+    // source-links fan-out joins in their names
     let top_alive: Vec<TopAliveRow> = sqlx::query_as(
         "WITH picked AS (
              SELECT id FROM proxies WHERE status = ?
@@ -499,8 +466,6 @@ async fn dashboard_splits(
     Ok((top_alive, schemes, countries))
 }
 
-/// The probe-side figures of the dashboard: the latency median, the 24h
-/// probe success pair and the top failure reasons.
 #[allow(clippy::result_large_err)] // the Err is a finished Response, by design
 async fn dashboard_probe_stats(
     state: &AdminState,
@@ -509,24 +474,19 @@ async fn dashboard_probe_stats(
     day_ago: i64,
     limit: i64,
 ) -> Result<(Option<i64>, (i64, i64), Vec<(String, i64)>), Response> {
-    // Latency of the live pool (`alive` and `ready`): the same set the
-    // dashboard's other widgets count. SQLite has no median builtin, so
-    // the median is a separate window-function query.
+    // Latency of the live pool (`alive` and `ready`). SQLite has no
+    // median builtin, so it is a separate window-function query
     let latency_median = fumox_core::repo::proxies::latency_median(&mut *conn)
         .await
         .map_err(|err| server_error(state, headers, "dashboard.latency_median", &err))?;
 
-    // Probe success rate over the last 24 hours. Speed probes are
-    // excluded (see `probe::success_counts_since`): they measure
-    // transfer bandwidth, not liveness.
+    // Speed probes are excluded (see `probe::success_counts_since`): they
+    // measure transfer bandwidth, not liveness
     let (probes_total_24h, probes_ok_24h): (i64, i64) =
         fumox_core::repo::probe::success_counts_since(&mut *conn, day_ago)
             .await
             .map_err(|err| server_error(state, headers, "dashboard.probes_24h", &err))?;
 
-    // Top failure reasons over the rolling 24h window, the operator's
-    // most actionable signal after the source-errors block at the top:
-    // "what kind of probe failure is happening most often right now?"
     let top_failures: Vec<(String, i64)> =
         fumox_core::repo::probe::top_failure_reasons(&mut *conn, day_ago, limit)
             .await
@@ -619,12 +579,11 @@ fn fill_ingest_days(rows: &[IngestDayRow], now: i64) -> Vec<(i64, i64)> {
     ingest_days
 }
 
-/// The per-status SUM columns the split queries select: one bound
-/// `COALESCE(SUM(...), 0)` per status, aliased with the status name the
-/// row structs and the dashboard template key on. Generated from
-/// [`ProxyStatus::all`], so a new status joins every split instead of
-/// silently dropping out of the buckets (the bucket-sum test in this
-/// module fails until the row struct grows the matching column).
+/// The per-status SUM columns the split queries select, one bound
+/// `COALESCE(SUM(...), 0)` per status, generated from [`ProxyStatus::all`]
+/// so a new status joins every split instead of silently dropping out of
+/// the buckets (the bucket-sum test in this module fails until the row
+/// struct grows the matching column).
 fn status_sum_sql(column: &str) -> String {
     ProxyStatus::all()
         .iter()
@@ -634,9 +593,6 @@ fn status_sum_sql(column: &str) -> String {
 }
 
 /// Per-source health counters (single aggregate over the join table).
-/// The status literals travel as bound parameters: the SUM predicate set
-/// is generated from `ProxyStatus::all()`, so a new status joins the
-/// table instead of silently dropping out of the buckets.
 async fn source_health_split<'e, E>(executor: E) -> Result<Vec<SourceStatRow>, fumox_core::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -731,9 +687,8 @@ pub fn fmt_bytes(lang: &Lang, bytes: i64) -> String {
     }
 }
 
-/// A byte count that may not be there, as the cards render it: the
-/// formatted size, or the neutral `common.na` placeholder for a reading
-/// the row does not carry. One definition for every card and fragment,
+/// A byte count that may not be there: the formatted size or the neutral
+/// `common.na` placeholder. One definition for every card and fragment,
 /// so the empty state cannot drift between them.
 pub(super) fn fmt_opt_bytes(lang: &Lang, bytes: Option<i64>) -> String {
     bytes
@@ -774,7 +729,7 @@ fn error_id() -> String {
     static SEQUENCE: AtomicU32 = AtomicU32::new(0);
     // Sub-second clock plus a process-wide sequence (mixed with a fixed
     // odd constant, so two ids never collide by cancellation): no crypto
-    // is wanted here, only uniqueness within the deployment's log.
+    // is wanted here, only uniqueness within the deployment's log
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0u32, |d| d.subsec_nanos());
@@ -784,12 +739,11 @@ fn error_id() -> String {
 
 /// Standard 500 for unexpected failures. `ctx` names the read or write
 /// that failed, so the log line says which query broke without the
-/// reader reverse-engineering the call stack, and `error_id` ties the
-/// line to the response the operator saw. The shape follows the client:
-/// an HTMX request keeps the 500 (htmx does not swap error bodies, so
-/// the page survives) with the failure delivered as an error toast
-/// through `HX-Trigger`; a plain browser gets the error page in the
-/// common layout, with the correlation id and a way back to the panel.
+/// reader reverse-engineering the call stack; [`error_id`] ties the line
+/// to the response the operator saw. HTMX requests keep the 500 (htmx
+/// does not swap error bodies, so the page survives) with the failure
+/// delivered as an error toast through `HX-Trigger`; a plain browser
+/// gets the error page in the common layout.
 pub fn server_error(
     state: &AdminState,
     headers: &HeaderMap,
@@ -855,12 +809,8 @@ pub(super) enum FormError {
 }
 
 /// The response for a form whose row could not be read: a missing entity
-/// is a 404, a database failure is a 500.
-///
-/// The two used to travel as one (`Option::None` for both), so a broken
-/// database answered "not found" and a client could not tell a deleted
-/// row from a failed query. `not_found_key` doubles as the log context:
-/// it already names the entity the read was for.
+/// is a 404, a database failure is a 500. `not_found_key` doubles as the
+/// log context: it already names the entity the read was for.
 pub(super) fn row_error_response(
     state: &AdminState,
     headers: &HeaderMap,
@@ -903,11 +853,10 @@ pub(super) fn header_safe(value: &str) -> String {
     out
 }
 
-/// A [`HeaderValue`] from a string this module has made wire-safe: the
-/// flash message is percent-encoded by [`header_safe`], the toast level
-/// is a code word and the toast envelope is built from their output.
-/// Such bytes are always visible ASCII, which `HeaderValue::from_str`
-/// cannot refuse — the `Err` arm exists only because the type system
+/// A [`HeaderValue`] from a string this module has made wire-safe
+/// ([`header_safe`], a toast level code word, the toast envelope). Such
+/// bytes are always visible ASCII, which `HeaderValue::from_str` cannot
+/// actually refuse; the `Err` arm exists only because the type system
 /// cannot see that, and it degrades by dropping the header (with a log
 /// line) instead of panicking a live request handler.
 fn wire_safe_header_value(value: &str) -> Option<HeaderValue> {
@@ -936,10 +885,9 @@ pub fn action_response(
     action_response_with_level(is_htmx, redirect_to, fragment_html, toast, "ok")
 }
 
-/// [`action_response`] with a rejected toast: same shape, but the toast
-/// carries level `error` so the client renders it with the error style.
-/// Used when a form-driven action fails validation and the browser path
-/// still lands back on the list.
+/// [`action_response`] with an `error`-level toast, for form-driven
+/// actions that fail validation and still land the browser back on the
+/// list.
 pub fn action_response_err(
     is_htmx: bool,
     redirect_to: &str,
@@ -970,7 +918,7 @@ fn action_response_with_level(
     } else {
         // Plain-browser path: an HTMX-only toast would be lost here, so
         // the message rides back on the redirect URL and the layout shows
-        // it once on load (see base.html).
+        // it once on load (see base.html)
         flash_redirect(redirect_to, toast, level)
     }
 }
@@ -1004,7 +952,7 @@ pub(super) fn toast_trigger(level: &str, message: &str) -> HeaderValue {
     );
     // An empty object parses as JSON for the client but carries no toast
     // event: the degradation of an envelope that (impossibly) was refused
-    // as a header value, so a broken toast cannot break the response.
+    // as a header value, so a broken toast cannot break the response
     wire_safe_header_value(&payload).unwrap_or_else(|| HeaderValue::from_static("{}"))
 }
 
@@ -1044,10 +992,9 @@ pub const PAGE_SIZE: i64 = 50;
 pub const MAX_PAGE_SIZE: i64 = 200;
 
 /// Field/count caps for admin-stored input. A single POST is bounded by
-/// the CSRF buffer (1 MiB) and the
-/// router-wide `DefaultBodyLimit`; these caps keep what actually reaches
-/// SQLite, and every later re-render of it, proportionate to what the
-/// forms legitimately hold.
+/// the CSRF buffer (1 MiB) and the router-wide `DefaultBodyLimit`; these
+/// caps keep what actually reaches SQLite, and every later re-render of
+/// it, proportionate to what the forms legitimately hold.
 pub mod caps {
     /// Source/profile URL length (matches the fetcher's `MAX_URL_LEN`).
     pub const URL: usize = 2048;
@@ -1059,7 +1006,7 @@ pub mod caps {
     pub const TTL_MIN: i64 = 60;
     /// Longest cache TTL a source may carry, in seconds.
     pub const TTL_MAX: i64 = 86_400;
-    /// One profile access token.
+    /// Access token cap, in bytes.
     pub const ACCESS_TOKEN: usize = 128;
     /// Minimum length of an access token, in characters. The profile
     /// form and the import path apply the same floor: the token guards a
@@ -1086,22 +1033,17 @@ pub mod caps {
     /// URLs DNS-vetted per import request; the rest are re-vetted at fetch
     /// time (the fetch path re-vets every request anyway).
     pub const IMPORT_DNS_VET: usize = 25;
-    /// Overall deadline of the DNS-vetting window of one import.
-    ///
-    /// The per-URL timeout alone does not bound the window: 25 lookups of
-    /// the per-URL timeout each add up. This caps the total time the
-    /// request may spend on name resolution.
+    /// Overall deadline of one import's DNS-vetting window: per-URL
+    /// timeouts alone do not bound it, 25 lookups add up.
     pub const IMPORT_DNS_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 }
 
 /// Slug rules shared by the source and profile forms and the import
 /// validation: starts alphanumeric, then `[A-Za-z0-9_-]`, total length
-/// 2–64. A plain predicate, equivalent to the former
-/// `^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$` regex: both classes are
-/// ASCII-only and anchored to the whole input, so a match is pure ASCII
-/// and byte length equals character length. The rules are fixed
-/// literals, so there is nothing to fail at runtime (a `Regex::new`
-/// behind an `expect` had no error path to propagate into anyway).
+/// 2–64. Plain predicate, equivalent to
+/// `^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$`: ASCII-only and anchored, so a
+/// match is pure ASCII and byte length equals character length; fixed
+/// literals, so there is no runtime failure to propagate.
 fn is_valid_slug(slug: &str) -> bool {
     let b = slug.as_bytes();
     (2..=64).contains(&b.len())
@@ -1131,11 +1073,11 @@ impl RowId for fumox_core::models::Profile {
 }
 
 /// Validate the optional `slug` field shared by the source and profile
-/// forms: format rules ([`is_valid_slug`]), then uniqueness. `lookup` resolves
-/// the row of one slug table already holding the value; the future is
-/// built eagerly but only awaited after the format check passes, and a DB
-/// error counts as "free" (a slug that sneaks through still fails the
-/// table's UNIQUE constraint at save time, as before). A row that is not
+/// forms: format rules ([`is_valid_slug`]), then uniqueness. `lookup`
+/// resolves the row of one slug table already holding the value; the
+/// future is built eagerly but only awaited after the format check
+/// passes, and a DB error counts as "free" (the slug still fails the
+/// table's UNIQUE constraint at save time). A row that is not
 /// `existing_id` (the row being edited) means the slug is taken. Empty
 /// input yields `None`; problems are pushed as `slug`-field errors.
 async fn validate_slug<T, F>(
@@ -1161,10 +1103,9 @@ where
             errors.push(("slug".into(), lang.t("val.slug_taken").into()));
         }
         Ok(_) => {}
-        // A DB failure counts as "free" (the slug still fails the table's
-        // UNIQUE constraint at save time), but a persistently broken
-        // lookup must stay visible instead of silently disabling the
-        // check.
+        // A DB failure counts as "free" (the UNIQUE constraint still holds
+        // at save time), but the warn keeps a persistently broken lookup
+        // visible instead of silently disabling the check
         Err(err) => {
             tracing::warn!(error = %err, "slug uniqueness lookup failed, skipping check");
         }
@@ -1172,13 +1113,11 @@ where
     Some(slug_raw.to_string())
 }
 
-/// Shared field validators.
-///
-/// The source form, the profile form and the import path enforce the
-/// same rules, so a configuration file cannot plant an object the form
-/// would refuse (and the other way round). Each validator answers with
-/// the localized message: the form attaches it to its field, the import
-/// prefixes it with the offending row.
+/// Shared field validators: the source form, the profile form and the
+/// import path enforce the same rules, so a configuration file cannot
+/// plant an object the form would refuse (and the other way round). Each
+/// validator answers with the localized message; the form attaches it to
+/// its field, the import prefixes it with the offending row.
 ///
 /// Validate a display name: not empty, at most [`caps::NAME_MAX`]
 /// characters.
@@ -1319,16 +1258,11 @@ pub(super) fn validate_countries(countries: &[String], lang: &Lang) -> Result<Ve
 
 /// Compact size of a pipeline document, the measure both form builders
 /// apply to the *generated* JSON and the import path to every stored
-/// document: the stored JSON is re-rendered into every edit form and
+/// document (the stored JSON is re-rendered into every edit form and
 /// recompiled by the preview, so a form or a file could otherwise plant a
-/// pipeline up to the 1 MiB body limit (16× the form cap).
-///
-/// The raw form mode and the import path measure the same document: the
-/// compact JSON, which is what the database stores. The textarea of the
-/// raw mode holds the pretty rendering of that document, and a pretty
-/// text is longer than the compact one, so measuring the text instead
-/// would refuse documents the import accepts and reject them again on
-/// every later save.
+/// pipeline up to the 1 MiB body limit, 16× the form cap). Measuring the
+/// raw mode's pretty textarea text instead would refuse documents the
+/// import accepts and reject them again on every later save.
 fn pipeline_size(pipeline: &serde_json::Value) -> usize {
     serde_json::to_string(pipeline).map_or(usize::MAX, |text| text.len())
 }
@@ -1337,17 +1271,16 @@ fn pipeline_size(pipeline: &serde_json::Value) -> usize {
 /// widget fields (`pipeline_mode`, the widget rows, the raw `pipeline`
 /// textarea) of the source and profile forms. In builder mode the JSON is
 /// generated from the widget fields server-side (a stale `pipeline`
-/// textarea, if any, is ignored); in raw mode the textarea is the input,
-/// as before. Problems are pushed onto `errors` as `pipeline`-field
-/// messages; `None` means no stored pipeline (or one that failed
-/// validation).
+/// textarea, if any, is ignored); in raw mode the textarea is the input.
+/// Problems are pushed onto `errors` as `pipeline`-field messages; `None`
+/// means no stored pipeline (or one that failed validation).
 fn pipeline_from_form(
     form: &[(String, String)],
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) -> Option<serde_json::Value> {
-    // The last value of a repeated key wins — the same semantics as
-    // `FormMap`.
+    // The last value of a repeated key wins, the same semantics as
+    // `FormMap`
     let get = |key: &str| -> String {
         form.iter()
             .rev()
@@ -1357,13 +1290,12 @@ fn pipeline_from_form(
     };
     if get("pipeline_mode") == "builder" {
         let emitted = BuilderState::from_form(form).emit()?;
-        // The field issues name the input to fix, the validator reads the
-        // document without the values the typed schema could not hold:
-        // one unreadable value must not mask the problems in the rest of
-        // the pipeline.
+        // The issues name the input to fix; the validator reads the
+        // document without the values the typed schema could not hold, so
+        // one unreadable value does not mask the rest of the pipeline
         let issues = emitted.issues().to_vec();
         // The builder carries its own wording of the oversize message:
-        // the fix is to drop widget rows, not to shorten a text field.
+        // the fix is to drop widget rows, not to shorten a text field
         pipeline_document(
             emitted.document(),
             emitted.readable(),
@@ -1399,15 +1331,14 @@ fn pipeline_from_form(
 }
 
 /// The tail both form modes share: the cap is measured on the compact
-/// JSON first — the stored form, the same measure the import path
-/// applies, so a document of an accepted size is not refused again on
-/// every later save — and an oversized document is refused before the
-/// validator reads it, symmetric in both modes. Then the document is
-/// compiled and every issue lands on the `pipeline` field. `readable`
-/// is what the validator reads (the builder strips the values its typed
-/// schema cannot hold); `issues` carries the field issues collected
-/// before the compile pass; `too_long_key` is the mode's own wording of
-/// the oversize message.
+/// JSON (the stored form, the same measure the import path applies, so a
+/// document of an accepted size is not refused again on every later
+/// save), an oversized document is refused before the validator reads
+/// it, then the document is compiled and every issue lands on the
+/// `pipeline` field. `readable` is what the validator reads (the builder
+/// strips the values its typed schema cannot hold); `issues` carries the
+/// field issues collected before the compile pass; `too_long_key` is the
+/// mode's own oversize wording.
 fn pipeline_document(
     value: &serde_json::Value,
     readable: &serde_json::Value,
@@ -1475,7 +1406,7 @@ mod tests {
     #[test]
     fn toast_header_is_ascii_and_decodes_to_the_message() {
         // Russian text (raw UTF-8 would mojibake in a Latin-1 header) plus
-        // JSON-breaking characters.
+        // JSON-breaking characters
         let message = "источник включён, \"quote\" \\ backslash";
         let response = action_response(true, "/admin/sources/x", String::new(), message);
 
@@ -1487,7 +1418,7 @@ mod tests {
             .expect("header must be visible ASCII")
             .to_string();
 
-        // Undo the percent-encoding exactly like the admin JS does.
+        // Undo the percent-encoding exactly like the admin JS does
         let bytes: Vec<u8> = {
             let mut out = Vec::new();
             let mut rest = header.as_bytes();
@@ -1515,7 +1446,7 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
         // The toast rides in a response header, not in the URL: the
         // redirect target stays clean, so nothing of the message ends up
-        // in the address bar or the history.
+        // in the address bar or the history
         let location = response
             .headers()
             .get(header::LOCATION)
@@ -1529,7 +1460,7 @@ mod tests {
             .expect("the toast must ride along")
             .to_str()
             .unwrap();
-        // Percent-encoded so the wire stays ASCII.
+        // Percent-encoded so the wire stays ASCII
         assert_eq!(flash, "%D0%B3%D0%BE%D1%82%D0%BE%D0%B2%D0%BE");
         assert!(
             response
@@ -1539,8 +1470,6 @@ mod tests {
         );
     }
 
-    /// The redirect target keeps its own query parameters: the flash
-    /// does not touch the URL at all.
     #[test]
     fn flash_redirect_keeps_the_target_query() {
         let response = flash_redirect("/admin/proxies?page=2", "done", "error");
@@ -1560,9 +1489,6 @@ mod tests {
         );
     }
 
-    /// The dashboard's percent/bar arithmetic at the boundaries: zero
-    /// whole, and the 1%-floor that keeps a non-zero bar visible while
-    /// zero counts stay zero.
     #[test]
     fn pct_and_bar_width_hold_at_the_boundaries() {
         assert_eq!(pct_of(1, 0), 0);
@@ -1572,14 +1498,11 @@ mod tests {
         assert_eq!(bar_width_of(100, 0), 0);
     }
 
-    /// The ingest series is seven pairs oldest-first, contiguous by day;
-    /// a day without creations is zero, not skipped, and the bar scale
-    /// takes the largest value of the series.
     #[test]
     fn ingest_days_are_oldest_first_and_zero_filled() {
         let now = 10 * 86_400 + 3_600; // mid of the last day
         let today = 10 * 86_400;
-        // Rows for today and two days ago; yesterday has no row at all.
+        // Rows for today and two days ago; yesterday has no row at all
         let rows = [
             IngestDayRow {
                 day: today - 2 * 86_400,
@@ -1592,23 +1515,19 @@ mod tests {
         ];
         let days = fill_ingest_days(&rows, now);
         assert_eq!(days.len(), 7);
-        // Oldest first, one calendar day per pair.
         assert_eq!(days[0].0, today - 6 * 86_400);
         assert_eq!(days[6].0, today);
         for pair in days.windows(2) {
             assert_eq!(pair[1].0, pair[0].0 + 86_400);
         }
-        // The skipped day is zero; the present days carry their counts.
+        // The skipped day is zero; the present days carry their counts
         assert_eq!(days[4], (today - 2 * 86_400, 5));
         assert_eq!(days[5], (today - 86_400, 0));
         assert_eq!(days[6], (today, 9));
-        // The bar scale is the maximum of the series.
         let ingest_max = days.iter().map(|(_, count)| *count).max().unwrap_or(0);
         assert_eq!(ingest_max, 9);
     }
 
-    /// A `HashMap` keeps only the last value of a repeating key, which broke
-    /// the proxy list's multi-select status filter.
     #[test]
     fn query_pairs_keep_every_value_of_a_repeating_key() {
         use axum::extract::Query;
@@ -1622,17 +1541,16 @@ mod tests {
             pairs.all("status").collect::<Vec<_>>(),
             vec!["unknown", "alive", "quarantine"]
         );
-        // Single-valued lookups keep HashMap-like semantics.
+        // Single-valued lookups keep HashMap-like semantics
         assert_eq!(pairs.get("page").map(String::as_str), Some("2"));
         assert_eq!(pairs.get("missing"), None);
 
-        // The old FormMap behavior, for contrast: last value wins.
+        // For contrast: `FormMap` keeps only the last value
         let Query(map) = Query::<FormMap>::try_from_uri(&uri).expect("query parses");
         assert_eq!(map.get("status").map(String::as_str), Some("quarantine"));
     }
 
-    /// The language the shared form-validation helpers translate with: the
-    /// embedded catalogs, without touching a locales directory.
+    /// The embedded catalogs, without touching a locales directory.
     fn test_lang() -> Lang {
         crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent")).default_lang()
     }
@@ -1644,12 +1562,11 @@ mod tests {
     fn pipeline_from_form_accepts_raw_json_and_reports_bad_input() {
         let lang = test_lang();
 
-        // No mode field = raw mode; an empty textarea stores no pipeline.
+        // No mode field = raw mode; an empty textarea stores no pipeline
         let mut errors = Vec::new();
         assert_eq!(pipeline_from_form(&[], &lang, &mut errors), None);
         assert!(errors.is_empty(), "{errors:?}");
 
-        // A well-formed minimal document is accepted verbatim.
         let form = vec![("pipeline".to_string(), r#"{"version": 1}"#.to_string())];
         let mut errors = Vec::new();
         let pipeline = pipeline_from_form(&form, &lang, &mut errors);
@@ -1659,8 +1576,7 @@ mod tests {
             Some(&serde_json::json!({ "version": 1 }))
         );
 
-        // Broken JSON is reported on the pipeline field (the message
-        // carries the localized prefix plus the serde detail).
+        // Broken JSON is reported on the pipeline field
         let form = vec![("pipeline".to_string(), "{oops".to_string())];
         let mut errors = Vec::new();
         assert_eq!(pipeline_from_form(&form, &lang, &mut errors), None);
@@ -1669,8 +1585,7 @@ mod tests {
         assert!(errors[0].1.contains("key must be a string"), "{errors:?}");
 
         // The cap fires on the compact JSON, the measure the import path
-        // applies: a document whose compact form is over `PIPELINE_BYTES`
-        // is refused, and the message names the limit.
+        // applies
         let oversized = serde_json::json!({
             "version": 1,
             "rename": [{
@@ -1689,9 +1604,7 @@ mod tests {
             "{errors:?}"
         );
 
-        // A document that fits is accepted in its pretty rendering too:
-        // the text field is longer than the compact measure, and the two
-        // must not disagree.
+        // A document that fits is accepted in its pretty rendering too
         let fits = serde_json::json!({
             "version": 1,
             "rename": [{
@@ -1719,13 +1632,12 @@ mod tests {
         let lang = test_lang();
 
         // No widget rows: the generated document is only `{"version": 1}`,
-        // which the builder drops (nothing configured).
+        // which the builder drops (nothing configured)
         let form = vec![("pipeline_mode".to_string(), "builder".to_string())];
         let mut errors = Vec::new();
         assert_eq!(pipeline_from_form(&form, &lang, &mut errors), None);
         assert!(errors.is_empty(), "{errors:?}");
 
-        // One rename row generates a stored pipeline.
         let form: Vec<(String, String)> = [
             ("pipeline_mode", "builder"),
             ("ped_rename_0_match", "chrome"),
@@ -1742,7 +1654,7 @@ mod tests {
         let pipeline = pipeline.expect("a filled widget row must store a pipeline");
         assert_eq!(pipeline["rename"][0]["match"], "chrome");
 
-        // The builder ignores a stale raw textarea, as before.
+        // The builder ignores a stale raw textarea
         let form: Vec<(String, String)> = [
             ("pipeline_mode", "builder"),
             ("pipeline", "{oops"),
@@ -1761,10 +1673,8 @@ mod tests {
             "the stale textarea must be ignored: {errors:?}"
         );
 
-        // Enough rename rows to push the generated compact JSON past the
-        // cap: the document is refused with the builder's own wording of
-        // the limit (the fix is to drop widget rows), like the raw mode
-        // refuses an oversized textarea.
+        // Enough rows to push the generated compact JSON past the cap:
+        // refused with the builder's own oversize wording
         let mut form: Vec<(String, String)> =
             vec![("pipeline_mode".to_string(), "builder".to_string())];
         for i in 0..256usize {
@@ -1832,7 +1742,6 @@ mod tests {
             |row: Option<Row>| std::future::ready::<fumox_core::Result<Option<Row>>>(Ok(row));
         let lang = test_lang();
 
-        // The row found is the row being edited: no error.
         let mut errors = Vec::new();
         let slug = validate_slug(
             "same",
@@ -1845,7 +1754,6 @@ mod tests {
         assert_eq!(slug, Some("same".to_string()));
         assert!(errors.is_empty(), "{errors:?}");
 
-        // The row found belongs to another row: the slug is taken.
         let mut errors = Vec::new();
         validate_slug(
             "taken",
@@ -1860,7 +1768,6 @@ mod tests {
             vec![("slug".to_string(), lang.t("val.slug_taken").to_string())]
         );
 
-        // The lookup itself failed: no error, the save re-checks.
         let mut errors = Vec::new();
         validate_slug(
             "any",
@@ -1906,7 +1813,7 @@ mod tests {
 
         // One proxy of every status, split over two schemes and two
         // countries, all linked to one source (the per-source table joins
-        // through the links).
+        // through the links)
         sqlx::query(
             "INSERT INTO sources (id, name, url, enabled, created_at, updated_at)
              VALUES ('src-1', 'one', 'https://one.example/list', 1, 1, 1)",
@@ -1998,11 +1905,9 @@ mod tests {
                 "source {} must bucket every proxy",
                 row.name
             );
-            // The oldest-ready stamp rides the same bound parameters.
+            // The oldest-ready stamp rides the same bound parameters
             assert!(row.oldest_ready_at.is_some(), "{row:?}");
         }
-        // One proxy per status: every bucket holds exactly one across
-        // the split rows.
         for status in ProxyStatus::all() {
             let counted: i64 = schemes
                 .iter()

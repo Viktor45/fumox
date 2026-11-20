@@ -2,12 +2,11 @@
 # Integration test for scripts/revive-xhttp-proxies.sh, the one-shot
 # revival of vless/xhttp rows meow 0.22 can tunnel again.
 #
-# The script is operational tooling with real write paths (revive,
-# adoption, restore), and the restore's integrity/liveness guards are
-# exactly what commit 78ad528 hardened. This test drives the script
-# against a scratch SQLite database carrying the column subset the script
-# touches, and asserts on both the data and the exit codes. It needs only
-# bash and the sqlite3 CLI, so CI runs it right after `cargo test`.
+# The script is operational tooling with real write paths (revive, adoption,
+# restore), so this test drives it against a scratch SQLite database carrying
+# the column subset the script touches, and asserts on both the data and the
+# exit codes. Needs only bash and the sqlite3 CLI, so CI runs it right after
+# `cargo test`.
 #
 # Run directly:  bash scripts/tests/revive-xhttp-proxies.test.sh
 
@@ -65,10 +64,9 @@ $1"
     note "no output matches /$2/"
 }
 
-# Scratch database
 # Mirrors the production column names/types the script reads and writes
 # (proxies, sources, proxy_source_links, probe_requests), not the whole
-# schema: the tool must keep working against exactly what it queries.
+# schema: the tool must keep working against exactly what it queries
 sqlite3 -cmd ".timeout 5000" "$DB" <<'SQL'
 CREATE TABLE proxies (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +113,6 @@ INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
 VALUES (1, 'srcA0000000', 500);
 SQL
 
-# --help
 OUT="$("$SCRIPT" --help)"
 assert_output "$OUT" "revive-xhttp-proxies.sh"
 
@@ -158,7 +155,7 @@ expect_eq "restore brings the row back" "$(q "SELECT status FROM proxies WHERE i
 expect_eq "restore reverts fail_count" "$(q "SELECT fail_count FROM proxies WHERE id = 1")" "7"
 expect_eq "restore drops the enqueue" "$(q "SELECT COUNT(*) FROM probe_requests")" "0"
 
-# A damaged backup is refused before anything is touched.
+# A damaged backup is refused before anything is touched
 printf 'not a sqlite database' >"$WORK/garbage.db"
 set +e
 OUT="$("$SCRIPT" --restore "$WORK/garbage.db" "$DB" 2>&1)"
@@ -168,7 +165,7 @@ expect_eq "damaged backup exit code" "$CODE" "67"
 assert_output "$OUT" "does not pass PRAGMA integrity_check"
 expect_eq "refusal leaves the database alone" "$(q "SELECT status FROM proxies WHERE id = 1")" "removed"
 
-# Revival options and --restore are mutually exclusive.
+# Revival options and --restore are mutually exclusive
 set +e
 OUT="$("$SCRIPT" --restore "$BACKUP" --include-unlinked "$DB" 2>&1)"
 CODE=$?
@@ -176,10 +173,8 @@ set -e
 expect_eq "conflicting options exit code" "$CODE" "64"
 assert_output "$OUT" "takes none of the revival options"
 
-# the adoption flags need --include-unlinked
-# They only have a subject together with it: the linked half keeps the
-# link it already has. A flag that is silently ignored is worse than a
-# refusal, because the operator believes a target was chosen.
+# the adoption flags need --include-unlinked: silently ignoring them would
+# leave the operator believing a target was chosen
 set +e
 OUT="$("$SCRIPT" --adopt-source srcA0000000 "$DB" 2>&1)"
 CODE=$?
@@ -206,14 +201,13 @@ expect_eq "unlinked row adopted into the source" \
 expect_eq "both rows enqueued" "$(q "SELECT COUNT(*) FROM probe_requests")" "2"
 expect_eq "non-xhttp row still untouched" "$(q "SELECT status FROM proxies WHERE id = 3")" "removed"
 
-# --adopt-source never reaches SQL raw
-# A fresh unlinked removed row so the adoption block runs below; every run
-# in this block is dry, so it survives all of them.
+# --adopt-source never reaches SQL raw (every run in this block is dry, so
+# row 5 survives them)
 q "INSERT INTO proxies (id, scheme, params, status, fail_count, removed_at, updated_at)
    VALUES (5, 'vless', '{\"type\":\"xhttp\"}', 'removed', 1, 500, 500)"
 
 # The injection payload: interpolated raw this dropped the proxies table
-# before any backup was taken, even in a dry run.
+# before any backup was taken, even in a dry run
 set +e
 OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source "x'; DROP TABLE proxies;--" "$DB" 2>&1)"
 CODE=$?
@@ -223,7 +217,7 @@ assert_output "$OUT" "no source matches"
 expect_eq "injection left the proxies table in place" "$(q 'SELECT COUNT(*) FROM proxies')" "5"
 
 # Escaping rather than refusing: a legitimate name that carries quotes must
-# still match, or every source with an apostrophe would become unadoptable.
+# still match, or every source with an apostrophe would become unadoptable
 q "INSERT INTO sources (id, slug, name, enabled, pipeline, created_at)
    VALUES ('srcC0000000', 'quoted', 'O''Brien''s list', 1, NULL, 1200)"
 OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source "O'Brien's list" "$DB" 2>&1)" || fail "quoted-name run failed:
@@ -233,21 +227,18 @@ assert_output "$OUT" "enabled, no drop rules"
 assert_output "$OUT" "would revive 1 row\(s\)"
 expect_eq "dry run still writes no backup" "$(count_backups)" "2"
 
-# a pipe in a source name cannot shift the report's split
-# The name rides last in the sqlite3 rows so the fields the classification
-# reads (enabled, drops) cannot be pushed out of place by a 'foo|bar' name.
+# a pipe in a source name cannot shift the report's split: the name rides
+# last in the sqlite3 rows so the classification fields cannot move
 q "INSERT INTO sources (id, slug, name, enabled, pipeline, created_at)
    VALUES ('srcB0000000', 'beta', 'Beta|Gamma', 1, NULL, 900)"
 
-# a source id that carries a quote is never interpolated
-# The id reaches a SQL string literal, so only a plain nanoid may be used.
-# The ranked path has to skip such a source rather than paste its id
-# into the statement; created_at 800 puts it first in the ranking, so a
-# ranked run that ignored the rule would adopt it.
+# a source id that carries a quote is never interpolated: the id reaches a
+# SQL string literal, and created_at 800 puts this source first in the
+# ranking, so a ranked run that ignored the rule would adopt it
 q "INSERT INTO sources (id, slug, name, enabled, pipeline, created_at)
    VALUES ('src''D000000', 'quoted-id', 'Quoted Id', 1, NULL, 800)"
 
-# Ranked path: the quoted id is skipped, the pipe-named source is next.
+# Ranked path: the quoted id is skipped, the pipe-named source is next
 OUT="$("$SCRIPT" --dry-run --include-unlinked "$DB" 2>&1)" || fail "ranked adoption run failed:
 $OUT"
 assert_output "$OUT" "adopt into: Beta|Gamma \(srcB0000000\)"
@@ -255,7 +246,7 @@ assert_output "$OUT" "enabled, no drop rules"
 assert_no_output "$OUT" "has 1 drop rule"
 assert_no_output "$OUT" "Quoted Id"
 
-# Explicit path: named directly, the id is refused rather than used.
+# Explicit path: named directly, the id is refused rather than used
 set +e
 OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source "src'D000000" "$DB" 2>&1)"
 CODE=$?
@@ -265,24 +256,23 @@ assert_output "$OUT" "is not a plain nanoid"
 expect_eq "the quoted id was not adopted into" \
     "$(q "SELECT COUNT(*) FROM proxy_source_links WHERE source_id = 'src''D000000'")" "0"
 
-# Explicit path: matched by the pipe-bearing name itself.
+# Explicit path: matched by the pipe-bearing name itself
 OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source 'Beta|Gamma' "$DB" 2>&1)" || fail "pipe-name run failed:
 $OUT"
 assert_output "$OUT" "adopt into: Beta|Gamma \(srcB0000000\)"
 assert_output "$OUT" "enabled, no drop rules"
 assert_no_output "$OUT" "has 1 drop rule"
 
-# a database the script cannot read is a hard error
-# An exclusive lock used to leave the census empty and the run saying
-# "Nothing to revive." with exit 0, with no hint anything had gone wrong.
+# a database the script cannot read is a hard error: an exclusive lock once
+# left the census empty and the run saying "Nothing to revive." with exit 0
 LOCK_FIFO="$WORK/census-lock.fifo"
 mkfifo "$LOCK_FIFO"
 sqlite3 "$DB" <"$LOCK_FIFO" >/dev/null 2>&1 &
 LOCK_PID=$!
 exec 9>"$LOCK_FIFO"
-# The BEGIN is re-issued until the lock actually bites: the locker's own
-# busy timeout is 0, so one that races a lock the previous scenario was
-# still releasing fails once and would otherwise idle for good.
+# The BEGIN is re-issued until the lock actually bites: the locker's own busy
+# timeout is 0, so one that races a lock the previous scenario was still
+# releasing would fail once and idle for good
 LOCKED=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
     kill -0 "$LOCK_PID" 2>/dev/null || break
@@ -304,13 +294,13 @@ wait "$LOCK_PID" 2>/dev/null || true
 expect_eq "locked census exit code" "$CODE" "75"
 assert_output "$OUT" "could not read the census"
 # The success verdict as its own line must be gone (the error text itself
-# mentions the phrase, so the pattern is anchored to the whole line).
+# mentions the phrase, so the pattern is anchored to the whole line)
 assert_no_output "$OUT" '^Nothing to revive\.$'
 expect_eq "locked run left the row removed" "$(q 'SELECT status FROM proxies WHERE id = 5')" "removed"
 
-# the error path cannot offer the bare cp the header forbids
-# A stub sqlite3 that corrupts exactly the revival batch drives the run
-# down the count-parse-failure exit, whose undo advice must not be a bare cp.
+# the error path cannot offer the bare cp the header forbids: a stub sqlite3
+# that corrupts exactly the revival batch drives the run down the
+# count-parse-failure exit
 REAL_SQLITE3="$(command -v sqlite3)"
 mkdir -p "$WORK/stub"
 cat >"$WORK/stub/sqlite3" <<STUB
@@ -335,14 +325,11 @@ BACKUP_PATH="$(grep -oE "$DB\.pre-xhttp-revival-[0-9]+-[0-9]+" <<<"$OUT" | head 
 note "the undo advice names a backup that exists"
 expect_eq "parse failure left row 5 removed" "$(q 'SELECT status FROM proxies WHERE id = 5')" "removed"
 
-# the backup is not readable by anyone else
-# It holds the whole database, credentials included.
+# the backup is not readable by anyone else (it holds credentials too)
 BACKUP_MODE="$(stat -f '%Lp' "$BACKUP" 2>/dev/null || stat -c '%a' "$BACKUP" 2>/dev/null || echo '')"
 expect_eq "backup permissions" "$BACKUP_MODE" "600"
 
 # the restore refuses the paths it must not follow
-# A symlink at the database path is a link to something else, and a
-# symlink at the backup path would restore whatever it points at.
 ln -s "$DB" "$WORK/link.db"
 set +e
 OUT="$("$SCRIPT" --restore "$BACKUP" "$WORK/link.db" 2>&1)"
@@ -359,7 +346,7 @@ set -e
 expect_eq "symlinked backup exit code" "$CODE" "66"
 assert_output "$OUT" "is a symlink"
 
-# An empty file is not a database.
+# An empty file is not a database
 : >"$WORK/empty.db"
 set +e
 OUT="$("$SCRIPT" --restore "$WORK/empty.db" "$DB" 2>&1)"
@@ -368,8 +355,8 @@ set -e
 expect_eq "empty backup exit code" "$CODE" "67"
 assert_output "$OUT" "is empty"
 
-# A valid database that is not Fumox's: restoring it would leave the
-# daemon with a schema it cannot query.
+# A valid database that is not Fumox's: restoring it would leave the daemon
+# with a schema it cannot query
 sqlite3 "$WORK/foreign.db" "CREATE TABLE something_else (id TEXT);"
 set +e
 OUT="$("$SCRIPT" --restore "$WORK/foreign.db" "$DB" 2>&1)"
@@ -379,10 +366,8 @@ expect_eq "foreign schema exit code" "$CODE" "67"
 assert_output "$OUT" "does not carry the Fumox schema"
 expect_eq "the refusals left the row alone" "$(q 'SELECT status FROM proxies WHERE id = 1')" "unknown"
 
-# a database that carries a write-ahead log
-# The log belongs to the file the restore replaces, so it goes with it.
-# The restore reports the branch it took, because a database that was
-# not closed cleanly is worth knowing about.
+# a database that carries a write-ahead log: the log belongs to the file the
+# restore replaces, and the restore reports the branch it took
 WAL_DB="$WORK/wal.db"
 cp "$DB" "$WAL_DB"
 sqlite3 -cmd ".timeout 5000" "$WAL_DB" 'PRAGMA journal_mode=WAL;' >/dev/null
@@ -392,8 +377,8 @@ sqlite3 -cmd ".timeout 5000" "$WAL_DB" "UPDATE proxies SET status = 'quarantine'
 expect_eq "the row changed before the restore" \
     "$(q_on "$WAL_DB" 'SELECT status FROM proxies WHERE id = 1;')" "quarantine"
 
-# A writer that dies mid-transaction leaves the log behind: the frames
-# are uncommitted and the connection is gone.
+# A writer that dies mid-transaction leaves the log behind: the frames are
+# uncommitted and the connection is gone
 WAL_FIFO="$WORK/wal-writer.fifo"
 mkfifo "$WAL_FIFO"
 sqlite3 -cmd ".timeout 5000" "$WAL_DB" <"$WAL_FIFO" >/dev/null 2>&1 &
@@ -418,9 +403,8 @@ expect_eq "the write-ahead log is gone" \
 expect_eq "the shared memory file is gone" \
     "$([[ -e "${WAL_DB}-shm" ]] && echo yes || echo no)" "no"
 
-# a database that is still open is not restored over
-# A restore under a live writer is what produces "database disk image
-# is malformed", or a restore that quietly changes nothing.
+# a database that is still open is not restored over: a restore under a live
+# writer produces "database disk image is malformed", or changes nothing quietly
 HOLD_DB="$WORK/hold.db"
 cp "$DB" "$HOLD_DB"
 sqlite3 -cmd ".timeout 5000" "$HOLD_DB" 'PRAGMA journal_mode=WAL;' >/dev/null
@@ -429,8 +413,8 @@ mkfifo "$HOLD_FIFO"
 sqlite3 -cmd ".timeout 5000" "$HOLD_DB" <"$HOLD_FIFO" >/dev/null 2>&1 &
 HOLD_PID=$!
 exec 9>"$HOLD_FIFO"
-# The statement is what makes the connection touch the file: without it
-# the CLI waits for input with the database still unopened.
+# The statement is what makes the connection touch the file: without it the
+# CLI waits for input with the database still unopened
 printf 'SELECT count(*) FROM proxies;\n' >&9
 sleep 0.5
 HOLD_BEFORE="$(q_on "$HOLD_DB" 'SELECT status FROM proxies WHERE id = 1;')"
@@ -446,11 +430,9 @@ assert_output "$OUT" "still has"
 expect_eq "the held database was not touched" \
     "$(q_on "$HOLD_DB" 'SELECT status FROM proxies WHERE id = 1;')" "$HOLD_BEFORE"
 
-# relative paths resolve against the invocation directory
-# The script cd's to the repository root before it parses the arguments,
-# so a relative db or backup path must be expanded against the caller's
-# cwd — a run from another directory must not silently open the
-# repository's own fumox.db.
+# relative paths resolve against the invocation directory: the script cd's
+# to the repository root before parsing arguments, so a run from another
+# directory must not silently open the repository's own fumox.db
 REL="$WORK/rel"
 mkdir -p "$REL"
 cp "$DB" "$REL/test.db"

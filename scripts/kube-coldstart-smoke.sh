@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# Cold-start e2e test for the kube layout (podman kube play).
-#
-# What it proves on an EMPTY volume:
-#   1. `podman kube play` brings both pods up;
-#   2. the server reaches the running state and /healthz answers 200;
-#   3. the probe reaches the running state as well;
-#   4. neither container restarted: the probe does not depend on the server,
-#      both apply the schema on startup and the loser of the SQLite lock
-#      retries instead of dying, so a restart count above zero means the
-#      cold start is NOT race-free.
-#
-# The point of the test is the empty volume: a second run starts against a
-# populated database and would hide a broken cold start.
+# Cold-start e2e test for the kube layout (podman kube play), on an EMPTY
+# volume (a second run starts against a populated database and would hide a
+# broken cold start):
+#   1. `podman kube play` brings both pods up
+#   2. the server reaches the running state and /healthz answers 200
+#   3. the probe reaches the running state as well
+#   4. neither container restarted: both apply the schema on startup and the
+#      loser of the SQLite lock retries instead of dying, so a restart count
+#      above zero means the cold start is NOT race-free
 #
 # Usage:
 #   scripts/kube-coldstart-smoke.sh
@@ -38,8 +34,8 @@ if [ ! -f "$MANIFEST" ]; then
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fumox-kube-coldstart.XXXXXX")"
-# The volumes behind the PVCs get their own names, so the test never
-# touches the volumes of a real deployment on the same machine.
+# The PVC volumes get their own names, so the test never touches the volumes
+# of a real deployment on the same machine
 DATA_VOLUME="fumox-coldstart-data-$$"
 GEO_VOLUME="fumox-coldstart-geo-$$"
 MEOW_VOLUME="fumox-coldstart-meow-$$"
@@ -63,12 +59,9 @@ fail() {
     exit 1
 }
 
-# the manifest, with the hostPath and the images pointed at the test
-# The shipped manifest names /opt/fumox/config as the hostPath of the config
-# directory; the test uses its own directory instead, so it never touches the
-# configuration of a real deployment. The PVC names are suffixed too: the
-# volumes are named volumes on the host, and a test must not create, let
-# alone delete, the ones a real deployment uses.
+# The shipped manifest's /opt/fumox/config hostPath is repointed at the test
+# directory and the PVC claim names at the suffixed volumes, so nothing of a
+# real deployment is touched
 mkdir -p "$WORK/config"
 cp "$ROOT/config/app.toml" "$WORK/config/app.toml"
 sed -e "s|path: /opt/fumox/config|path: ${WORK}/config|" \
@@ -86,26 +79,23 @@ printf 'FUMOX_ADMIN__TOKEN=%s\n' "$(openssl rand -hex 32)" \
 printf 'FUMOX_MEOW__API_TOKEN=%s\n' "$(openssl rand -hex 32)" \
     | podman secret create fumox-env - >/dev/null
 
-# The named volumes behind the PVCs. They are created and chowned here
-# instead of being left to `podman kube play`: the containers run as uid
-# 999 (the kernel as uid 998, gid 999) and the SQLite database directory
-# must be writable by them. `kube play` does not apply the pod's
-# runAsUser to the volume root, so an unprepared volume would fail the
-# startup with a permission error instead of a real result.
+# Created and chowned here instead of left to `podman kube play`: the
+# containers run as uid 999 (the kernel as uid 998, gid 999), and `kube play`
+# does not apply the pod's runAsUser to the volume root, so an unprepared
+# volume would fail startup with a permission error instead of a real result
 for volume in "$DATA_VOLUME" "$GEO_VOLUME" "$MEOW_VOLUME"; do
     podman volume rm -f "$volume" >/dev/null 2>&1 || true
     podman volume create "$volume" >/dev/null
 done
-# The data and the geo volume belong to the server/probe (uid 999); the
-# exchange volume is group-writable for gid 999, so the probe (uid 999)
-# writes the config and the kernel (uid 998, gid 999) reads it.
+# The data and geo volumes belong to server/probe (uid 999); the exchange
+# volume is group-writable for gid 999, so the probe writes and the kernel
+# reads it
 podman run --rm -v "${DATA_VOLUME}:/v" alpine chown 999:999 /v
 podman run --rm -v "${GEO_VOLUME}:/v" alpine chown 999:999 /v
 podman run --rm -v "${MEOW_VOLUME}:/v" alpine sh -c 'chown 999:999 /v && chmod 0770 /v'
 
-# The config directory is a hostPath: the container runs as uid 999 and
-# must be able to read app.toml. The test only reads it (the admin editor
-# is not exercised), so world-readable is enough.
+# The config hostPath must be readable by uid 999; the test only reads it
+# (the admin editor is not exercised), so world-readable is enough
 chmod 755 "$WORK" "$WORK/config"
 chmod 644 "$WORK/config/app.toml"
 
@@ -115,7 +105,6 @@ echo ">> image:  $FUMOX_MEOW_IMAGE"
 echo ">> podman kube play"
 podman kube play "$WORK/fumox-pod.yaml" >/dev/null
 
-# the server comes up and answers
 echo ">> waiting for /healthz on 127.0.0.1:8080"
 deadline=$((SECONDS + TIMEOUT))
 until curl -fsS --max-time 3 "http://127.0.0.1:8080/healthz" >/dev/null 2>&1; do
@@ -126,7 +115,6 @@ until curl -fsS --max-time 3 "http://127.0.0.1:8080/healthz" >/dev/null 2>&1; do
 done
 echo ">> /healthz answers 200"
 
-# the probe comes up too, and neither container restarted
 deadline=$((SECONDS + TIMEOUT))
 probe=""
 while [ "$SECONDS" -lt "$deadline" ]; do

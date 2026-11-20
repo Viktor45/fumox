@@ -1,20 +1,15 @@
-//! Startup download of the GeoLite2 databases.
+//! Startup download of the GeoLite2 databases (the `.mmdb` files are
+//! gitignored, never shipped).
 //!
-//! Fumox never ships the `.mmdb` files (they are gitignored). Until
-//! now the operator had to fetch them by hand; this module closes that gap:
-//! before the listeners bind, each GeoLite2 database in `[geo].db_dir` is
-//! checked and, when missing or implausible (a truncated, broken or
-//! wrongly typed download from an earlier attempt) or older than
-//! [`MAX_AGE`], re-downloaded from the configured mirror into a temporary
-//! file that is atomically renamed into place. The resolver therefore
-//! always finds either a complete file or nothing, never a half-written
-//! one, and a failed download simply retries on the next start.
-//!
-//! The wait is bounded by the caller (`[geo].startup_download_budget_secs`,
-//! read in `main`): past that budget startup continues and the download
-//! finishes in the background, so the resolver this run opens without a
-//! database and the next start picks it up. The atomic rename is what makes
-//! that safe.
+//! Before the listeners bind, each database in `[geo].db_dir` is checked
+//! and, when missing or implausible (truncated, broken or wrongly typed)
+//! or older than [`MAX_AGE`], re-downloaded from the configured mirror
+//! into a temporary file that is atomically renamed into place: the
+//! resolver always finds either a complete file or nothing, never a
+//! half-written one, and a failed download simply retries on the next
+//! start. The wait is bounded by the caller
+//! (`[geo].startup_download_budget_secs`, read in `main`); past that
+//! budget startup continues and the download finishes in the background.
 //!
 //! Everything here is best-effort: a failure (unwritable directory, no
 //! network, mirror down) is logged and skipped, geo enrichment is an
@@ -26,9 +21,8 @@
 //!
 //! Three knobs make the channel the operator's own: `[geo].auto_download`
 //! off keeps the "files by hand only" model, `[geo].download_urls` names
-//! the mirrors, and `[geo].sha256` pins the checksum of a file whose
-//! download must match it (a mismatch leaves the previous database in
-//! place).
+//! the mirrors, and `[geo].sha256` pins a checksum (a mismatch leaves the
+//! previous database in place).
 
 use fumox_core::config::{AppConfig, GeoConfig, GeoDbKind};
 use std::path::{Path, PathBuf};
@@ -43,8 +37,8 @@ const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Overall budget for one download. The City database is ~70 MB and the
 /// mirrors throttle, so the ceiling has to cover a slow link: a download
-/// that runs past it simply retries on the next start (the partial
-/// temporary file is removed, nothing partial is ever installed).
+/// past it simply retries on the next start (the partial temporary file
+/// is removed, nothing partial is ever installed).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Redirect hops allowed between the shortlink and the release asset.
 const MAX_REDIRECTS: usize = 5;
@@ -60,14 +54,12 @@ const METADATA_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";
 const MARKER_WINDOW: u64 = 128 * 1024;
 /// Hosts a redirect may lead to, besides `*.githubusercontent.com` (the
 /// release-asset CDN, whose exact subdomain varies). The default mirror
-/// URLs are hardcoded public GitHub release links, which answer with a
-/// redirect to one of these; nothing else may follow. A redirect to any
-/// other host (or off https) is refused rather than fetched, so a hijacked
-/// release or a mis-typed URL cannot deliver a foreign file: the content
-/// check is a format check, not provenance. The host of the mirror the
-/// operator configured is allowed as well: that URL is the operator's own
-/// choice, and a mirror that redirects to its own CDN would otherwise be
-/// unusable.
+/// URLs are public GitHub release links that redirect to one of these;
+/// anything else (or off https) is refused rather than fetched, so a
+/// hijacked release or a mis-typed URL cannot deliver a foreign file: the
+/// content check is a format check, not provenance. The operator's
+/// configured mirror host is allowed as well, or a mirror that redirects
+/// to its own CDN would be unusable.
 const REDIRECT_HOSTS: &[&str] = &["github.com"];
 
 /// CDN suffix the release-asset redirect is allowed to land on.
@@ -120,8 +112,7 @@ pub async fn ensure_geo_databases(config: &AppConfig) {
 
 /// The early exits that do not depend on the directory: geo enrichment
 /// switched off, or `[geo].auto_download` off (the files are then the
-/// operator's to provide). Each reason is logged where it is found, and
-/// `true` means the round is skipped.
+/// operator's to provide). `true` means the round is skipped.
 fn skip_by_config(geo: &GeoConfig) -> bool {
     if !geo.enabled {
         tracing::debug!("geo enrichment disabled, skipping GeoLite2 database download");
@@ -136,8 +127,7 @@ fn skip_by_config(geo: &GeoConfig) -> bool {
 
 /// The `[geo].db_dir` checks: an empty directory has nowhere to install
 /// the files, and one that cannot be written to would fail at the rename
-/// anyway. Each reason is logged where it is found, and `true` means the
-/// round is skipped.
+/// anyway. `true` means the round is skipped.
 fn skip_bad_dir(geo: &GeoConfig) -> bool {
     if geo.db_dir.as_os_str().is_empty() {
         tracing::debug!("[geo].db_dir is empty, skipping GeoLite2 database download");
@@ -250,7 +240,7 @@ async fn ensure_one(
     }
     // The reason travels with the start of the download, so the log tells a
     // first install (file is absent) from a routine refresh (stale) and
-    // from a repair (failed the content check).
+    // from a repair (failed the content check)
     tracing::info!(
         file = file.kind.file_name(),
         reason = freshness.label(),
@@ -294,12 +284,11 @@ impl Freshness {
 ///
 /// A missing, empty or markerless file (an HTML error page served with
 /// HTTP 200, a truncated download) is replaced whatever its age. A file
-/// that carries the MaxMind metadata block is kept even when it declares
+/// carrying the MaxMind metadata block is kept even when it declares
 /// another `database_type`: that is a database from another provider or
-/// another product, and replacing it with the built-in mirror's file
-/// would silently drop the operator's choice. Age is only consulted for a
-/// file that passes the content check, so a stale database is refreshed
-/// instead of being kept for another month.
+/// product, and replacing it with the built-in mirror's file would
+/// silently drop the operator's choice. Age is only consulted for a file
+/// that passes the content check.
 fn freshness(path: &Path, db_type: &str) -> Freshness {
     let Ok(meta) = std::fs::metadata(path) else {
         return Freshness::Absent;
@@ -321,7 +310,7 @@ fn freshness(path: &Path, db_type: &str) -> Freshness {
         );
         return Freshness::Fresh;
     }
-    // A future mtime (clock skew) counts as fresh: it cannot be a month old.
+    // A future mtime (clock skew) counts as fresh: it cannot be a month old
     match SystemTime::now().duration_since(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)) {
         Ok(age) if age > MAX_AGE => Freshness::Stale,
         _ => Freshness::Fresh,
@@ -329,13 +318,11 @@ fn freshness(path: &Path, db_type: &str) -> Freshness {
 }
 
 /// Content check for one slot: non-empty, the MaxMind metadata marker in
-/// the file tail, and the metadata block declaring `db_type`. Catches HTML
-/// error pages, empty and truncated files, and a database installed under
-/// the wrong name (which would tag every proxy with the wrong facts).
-/// It is deliberately a *format and identity* check, not a trust
-/// guarantee: the mirrors publish no checksum to pin here, so what this
-/// buys is "never silently install the wrong database", not provenance.
-/// An operator who pins a checksum (`[geo].sha256`) gets provenance too.
+/// the file tail, and the metadata block declaring `db_type`. Deliberately
+/// a *format and identity* check, not a trust guarantee: the mirrors
+/// publish no checksum to pin here, so what this buys is "never silently
+/// install the wrong database", not provenance. An operator who pins a
+/// checksum (`[geo].sha256`) gets provenance too.
 fn verified_mmdb(path: &Path, db_type: &str) -> bool {
     let Some(tail) = read_tail(path) else {
         return false;
@@ -343,7 +330,7 @@ fn verified_mmdb(path: &Path, db_type: &str) -> bool {
     match naive_find(&tail, METADATA_MARKER) {
         // The type only counts when it sits in the metadata block, i.e.
         // after the marker: a city name appearing in the data section is
-        // not a declaration of what the file is.
+        // not a declaration of what the file is
         Some(marker) => naive_find(&tail[marker..], db_type.as_bytes()).is_some(),
         None => false,
     }
@@ -456,13 +443,12 @@ async fn download_and_install(
 ) -> Result<u64, String> {
     let tmp = tmp_path(dest);
     // The download runs unattended for minutes, so the start is an info
-    // event, not silence until the outcome: `bytes_hint` is the ceiling
-    // the stream is cut at ([`MAX_MMDB_BYTES`]), the size the operator
-    // should expect to move, not the exact file size.
+    // event, not silence until the outcome; `bytes_hint` is the ceiling
+    // the stream is cut at ([`MAX_MMDB_BYTES`]), not the exact file size
     tracing::info!(
         file = %dest.display(),
         // The mirror URL may carry a credential in its query (`?key=`,
-        // `?token=`); redact.rs owns every URL that reaches the log.
+        // `?token=`); redact.rs owns every URL that reaches the log
         url = %redact_url(url),
         bytes_hint = MAX_MMDB_BYTES,
         "downloading GeoLite2 database, this may take a few minutes"
@@ -489,7 +475,7 @@ async fn download_and_install(
             ));
         }
     }
-    // Same-directory rename: atomic on POSIX and Windows.
+    // Same-directory rename: atomic on POSIX and Windows
     std::fs::rename(&tmp, dest).map_err(|err| {
         drop(std::fs::remove_file(&tmp));
         format!("cannot move the file into place: {err}")
@@ -546,9 +532,9 @@ async fn download_body_capped(
     max_bytes: u64,
 ) -> Result<u64, String> {
     // reqwest is compiled without a crypto provider and panics when a
-    // client is built before one is installed.
+    // client is built before one is installed
     fumox_core::tls::install_crypto_provider();
-    // The mirror the operator configured is trusted for its own redirects.
+    // The mirror the operator configured is trusted for its own redirects
     let mirror_host = reqwest::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
@@ -572,7 +558,7 @@ async fn download_body_capped(
         // `create_new` (O_EXCL): the name carries a random suffix, so a
         // collision is impossible in practice, and a name that does exist
         // (a symlink planted by someone else) fails instead of truncating
-        // the file it points at.
+        // the file it points at
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -581,10 +567,10 @@ async fn download_body_capped(
             .map_err(|err| format!("cannot create the temporary file: {err}"))?;
         use tokio::io::AsyncWriteExt;
         let mut total = 0u64;
-        // `chunk()` streams the body without pulling in a Stream extension.
+        // `chunk()` streams the body without pulling in a Stream extension
         // The running total is checked before the write: a rogue mirror
         // streaming an endless body is cut at MAX_MMDB_BYTES, not bounded
-        // only by the download budget.
+        // only by the download budget
         while let Some(chunk) = response
             .chunk()
             .await
@@ -649,7 +635,7 @@ mod tests {
                 // Read the request before answering: a server that replies
                 // to a request it has not read yet sends an "early
                 // response", and hyper cancels such a connection instead
-                // of parsing it.
+                // of parsing it
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
                 let head = format!(
@@ -677,11 +663,9 @@ mod tests {
     }
 
     /// Capture log lines at `max` level and above: the redaction
-    /// assertions read them back instead of matching on internals. Same
-    /// pattern as in the pipeline tests, and the same call-site-interest
-    /// caveat: the registry is pinned to multi-dispatcher and the interests
-    /// rebuilt, so a call site first executed under another test's empty
-    /// dispatcher still logs here.
+    /// assertions read them back. The registry is pinned to
+    /// multi-dispatcher and the interests rebuilt, so a call site first
+    /// executed under another test's empty dispatcher still logs here.
     fn capture_logs(
         max: tracing::Level,
     ) -> (
@@ -706,7 +690,7 @@ mod tests {
         assert!(naive_find(&tail, METADATA_MARKER).is_some());
         assert!(naive_find(b"no marker here", METADATA_MARKER).is_none());
         assert!(naive_find(b"", METADATA_MARKER).is_none());
-        // A needle longer than the haystack never matches.
+        // A needle longer than the haystack never matches
         assert!(naive_find(METADATA_MARKER, b"\xab\xcd\xefMaxMind.com!!").is_none());
         assert!(naive_find(b"ab", b"").is_none());
     }
@@ -716,22 +700,22 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.join("x.mmdb");
 
-        // Absent file.
+        // Absent file
         assert_eq!(freshness(&path, CITY), Freshness::Absent);
 
-        // Empty file (a broken download).
+        // Empty file (a broken download)
         std::fs::write(&path, b"").unwrap();
         assert_eq!(freshness(&path, CITY), Freshness::NotADatabase);
 
-        // Markerless content (an HTML error page served with HTTP 200).
+        // Markerless content (an HTML error page served with HTTP 200)
         std::fs::write(&path, b"<html>not a database</html>").unwrap();
         assert_eq!(freshness(&path, CITY), Freshness::NotADatabase);
 
-        // A plausible, fresh file stays.
+        // A plausible, fresh file stays
         std::fs::write(&path, fake_mmdb(b"db-body", CITY)).unwrap();
         assert_eq!(freshness(&path, CITY), Freshness::Fresh);
 
-        // Older than a month, refresh.
+        // Older than a month, refresh
         let month_ago = SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
         std::fs::File::options()
             .write(true)
@@ -753,7 +737,7 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.join("GeoLite2-City.mmdb");
 
-        // ASN content sitting in the City slot.
+        // ASN content sitting in the City slot
         std::fs::write(&path, fake_mmdb(b"asn-body", ASN)).unwrap();
         assert_eq!(
             freshness(&path, CITY),
@@ -764,14 +748,14 @@ mod tests {
 
         // The type string before the marker is data-section text, not a
         // declaration, and does not satisfy the check: the file declares
-        // ASN, so the City slot keeps it.
+        // ASN, so the City slot keeps it
         let mut smuggled = b"GeoLite2-City".to_vec();
         smuggled.extend_from_slice(&fake_mmdb(b"body", ASN));
         std::fs::write(&path, smuggled).unwrap();
         assert_eq!(freshness(&path, CITY), Freshness::Fresh);
 
         // A file without the metadata block is not a database at all (an
-        // HTML error page, a truncated download) and is replaced.
+        // HTML error page, a truncated download) and is replaced
         std::fs::write(&path, b"<html>not a database</html>").unwrap();
         assert_eq!(freshness(&path, CITY), Freshness::NotADatabase);
 
@@ -780,20 +764,20 @@ mod tests {
 
     #[test]
     fn redirect_targets_are_limited_to_the_mirror_hosts() {
-        // The release shortlink and the CDN it redirects to are allowed.
+        // The release shortlink and the CDN it redirects to are allowed
         assert!(host_allowed_for_redirect("github.com", None));
         assert!(host_allowed_for_redirect("GitHub.com", None));
         assert!(host_allowed_for_redirect(
             "release-assets.githubusercontent.com",
             None
         ));
-        // Anything else is not.
+        // Anything else is not
         assert!(!host_allowed_for_redirect("evil.example", None));
         assert!(!host_allowed_for_redirect("github.com.evil.example", None));
         assert!(!host_allowed_for_redirect("notgithubusercontent.com", None));
         assert!(!host_allowed_for_redirect("", None));
         // The mirror the operator configured is trusted for its own
-        // redirects, and only for its own host.
+        // redirects, and only for its own host
         assert!(host_allowed_for_redirect(
             "mirror.example",
             Some("mirror.example")
@@ -815,13 +799,13 @@ mod tests {
             "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb"
         ));
         assert!(ok("https://release-assets.githubusercontent.com/x.mmdb"));
-        // https, but a host nobody vouched for.
+        // https, but a host nobody vouched for
         assert!(!ok("https://evil.example/x.mmdb"));
-        // The right host, but off https.
+        // The right host, but off https
         assert!(!ok("http://github.com/x.mmdb"));
-        // A host that merely ends like an allowed one.
+        // A host that merely ends like an allowed one
         assert!(!ok("https://github.com.evil.example/x.mmdb"));
-        // The mirror the operator configured is allowed on its own.
+        // The mirror the operator configured is allowed on its own
         assert!(redirect_target_ok(
             &reqwest::Url::parse("https://mirror.example/x.mmdb").unwrap(),
             Some("mirror.example")
@@ -832,12 +816,10 @@ mod tests {
     /// would re-download ~78 MB for nothing. Skips itself when the
     /// gitignored `.mmdb` files are absent (CI runs without them).
     ///
-    /// Only the content half of `needs_download` is asserted: the
-    /// freshness half reads the files' mtime, so a developer's own copies
-    /// age out of the 30-day window on their own and used to turn this
-    /// test red on untouched machines. Freshness is covered
-    /// deterministically (with `set_modified`) by the fresh/stale test
-    /// above.
+    /// Only the content half is asserted: the freshness half reads the
+    /// files' mtime, which ages a developer's own copies out of the
+    /// 30-day window. Freshness is covered deterministically (with
+    /// `set_modified`) by the fresh/stale test above.
     #[test]
     fn real_workspace_databases_pass_the_content_check() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
@@ -857,13 +839,13 @@ mod tests {
         let dir = scratch_dir();
         assert!(ensure_writable_dir(&dir).is_ok());
 
-        // Missing directories are created (the default db_dir is relative).
+        // Missing directories are created (the default db_dir is relative)
         let nested = dir.join("a/b");
         assert!(ensure_writable_dir(&nested).is_ok());
         assert!(nested.is_dir());
 
         // A regular file in the place of the directory is not writable, and
-        // the error text names what went wrong (the caller's log line).
+        // the error text names what went wrong (the caller's log line)
         let as_file = dir.join("occupied");
         std::fs::write(&as_file, b"x").unwrap();
         let reason = ensure_writable_dir(&as_file).unwrap_err();
@@ -880,7 +862,7 @@ mod tests {
         let name = tmp.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("GeoLite2-City.mmdb."), "name was: {name}");
         assert!(name.ends_with(".tmp"));
-        // Two calls never collide: the suffix is random, not the pid.
+        // Two calls never collide: the suffix is random, not the pid
         assert_ne!(tmp, tmp_path(dest));
     }
 
@@ -909,10 +891,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A mirror streaming more than the cap must be cut off with an error
-    /// and the destination kept intact.
-    /// Exercised with a tiny cap through [`download_body_capped`] so the
-    /// test does not actually write half a gigabyte to disk.
+    /// A mirror streaming more than the cap is cut off with an error and
+    /// the destination kept intact. Exercised with a tiny cap through
+    /// [`download_body_capped`] so the test does not write half a
+    /// gigabyte to disk.
     #[tokio::test]
     async fn oversized_download_is_cut_off_at_the_cap() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -929,14 +911,14 @@ mod tests {
                 // to a request it has not read yet sends an "early
                 // response", and hyper cancels such a connection instead
                 // of parsing it (the request is still being written when
-                // the answer arrives).
+                // the answer arrives)
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {SERVE}\r\nconnection: close\r\n\r\n"
                 );
                 let _ = sock.write_all(head.as_bytes()).await;
-                // Keep streaming until the client hangs up on the cap.
+                // Keep streaming until the client hangs up on the cap
                 let zeros = vec![0u8; SERVE];
                 loop {
                     if sock.write_all(&zeros).await.is_err() {
@@ -948,7 +930,7 @@ mod tests {
 
         let dir = scratch_dir();
         let dest = dir.join("GeoLite2-City.mmdb");
-        // A plausible previous database must survive the failed refresh.
+        // A plausible previous database must survive the failed refresh
         std::fs::write(&dest, fake_mmdb(b"previous", CITY)).unwrap();
 
         let err = download_body_capped(
@@ -963,7 +945,7 @@ mod tests {
 
         // The temp file was cleaned up by the caller contract (checked by
         // download_and_install in production); here only the error and the
-        // intact destination matter.
+        // intact destination matter
         assert_eq!(std::fs::read(&dest).unwrap(), fake_mmdb(b"previous", CITY));
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1035,14 +1017,14 @@ mod tests {
         std::fs::write(&served, &body).unwrap();
         let digest = sha256_hex(&served).unwrap();
 
-        // The wrong checksum refuses the install and keeps the old file.
+        // The wrong checksum refuses the install and keeps the old file
         let err = download_and_install(&dest, &url, CITY, Some(&"0".repeat(64)), "fumox-test")
             .await
             .unwrap_err();
         assert!(err.contains("checksum mismatch"), "{err}");
         assert_eq!(std::fs::read(&dest).unwrap(), previous);
 
-        // The right one installs the download.
+        // The right one installs the download
         download_and_install(&dest, &url, CITY, Some(&digest), "fumox-test")
             .await
             .unwrap();
@@ -1058,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn a_redirect_off_the_mirror_hosts_is_refused() {
         // A server that redirects to a second server, which would happily
-        // serve a body if it were ever reached.
+        // serve a body if it were ever reached
         let payload_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let payload_addr = payload_server.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1102,7 +1084,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("redirect"), "{err}");
 
-        // Nothing was installed.
+        // Nothing was installed
         assert!(!dest.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1111,7 +1093,7 @@ mod tests {
     /// The same rule with the scheme on the safe side: a redirect to an
     /// https URL of a host nobody vouched for is refused by the host rule
     /// alone. The target is unresolvable, so the request fails before any
-    /// network call — the refusal is the policy's, not the resolver's.
+    /// network call (the refusal is the policy's, not the resolver's).
     #[tokio::test]
     async fn a_redirect_to_an_unexpected_https_host_is_refused() {
         let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1142,11 +1124,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The start-of-download log line names the mirror URL, and the URL the
-    /// operator configured may carry a credential in its query (`?key=`,
-    /// `?token=`): the line must name the redacted URL, like the fetcher's
-    /// log lines do — [`crate::redact`] mandates the redaction on every
-    /// path where a URL reaches the tracing log.
+    /// The start-of-download log line names the mirror URL, and the URL
+    /// the operator configured may carry a credential in its query
+    /// (`?key=`, `?token=`): the line must name the redacted URL, like the
+    /// fetcher's log lines do ([`crate::redact`] mandates the redaction
+    /// on every path where a URL reaches the tracing log).
     #[tokio::test]
     async fn the_download_log_line_redacts_the_mirror_url() {
         let (captured, _guard) = capture_logs(tracing::Level::INFO);
@@ -1181,7 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_download_redacts_the_url_in_the_reason() {
         // A closed local port: the connect fails fast and deterministically,
-        // and the reqwest error carries the requested URL.
+        // and the reqwest error carries the requested URL
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);

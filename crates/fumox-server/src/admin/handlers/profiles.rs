@@ -1,6 +1,6 @@
-//! Profile screens: list, create/edit form with source composition
-//!, card with dedup stats and an in-process output
-//! preview, toggle / delete actions.
+//! Profile screens: list, create/edit form with source composition, card
+//! with dedup stats and an in-process output preview, toggle / delete
+//! actions.
 
 use super::{
     FormError, action_response, caps, flash_redirect, is_htmx, mask_secret, not_found,
@@ -48,8 +48,6 @@ pub(super) fn token_placeholder(stored: Option<&str>) -> String {
 fn is_token_placeholder(value: &str) -> bool {
     value == TOKEN_PLACEHOLDER || value == "••••" || value.ends_with("…••••")
 }
-
-// List
 
 #[derive(Template)]
 #[template(path = "profiles/list.html")]
@@ -118,8 +116,6 @@ pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) 
         StatusCode::OK,
     )
 }
-
-// Form (create / edit)
 
 /// Display/edit values of the profile form (all as strings, as typed). The
 /// pipeline is carried by the widget HTML, not by these values.
@@ -259,9 +255,9 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
             formats,
             source_picks: picks,
             token_masked_note: false,
-            // New profile: nothing stored yet, so no slug can be broken.
+            // New profile: nothing stored yet, so no slug can be broken
             slug_warning: false,
-            // New profile: nothing stored yet, an empty builder widget.
+            // New profile: nothing stored yet, an empty builder widget
             widget_html: widget_from_stored(
                 lang,
                 &state.csrf_for(&headers),
@@ -334,7 +330,7 @@ pub async fn profile_edit_form(
             token_masked_note: profile.access_token.is_some(),
             // The stored slug is part of the public link: a change breaks
             // the links the subscribers hold, so the form says so before
-            // the operator types.
+            // the operator types
             slug_warning: profile.slug.is_some(),
             widget_html,
         },
@@ -379,7 +375,7 @@ fn composition_from_form(form: &[(String, String)]) -> Vec<(String, i64)> {
         })
         .collect();
     ordered.sort_by_key(|(position, index, _)| (*position, *index));
-    // Deduplicate defensively, then normalize positions.
+    // Deduplicate defensively, then normalize positions
     let mut seen = std::collections::HashSet::new();
     ordered
         .into_iter()
@@ -458,11 +454,11 @@ fn resolve_access_token(
         Some(token_raw.to_string())
     };
     // Token format cap: the token guards a public
-    // endpoint, so it is URL-safe and bounded like every other field.
+    // endpoint, so it is URL-safe and bounded like every other field
     if !unchanged && let Some(token) = access_token.as_ref() {
         // The same floor the import path applies (L-194): a token that
         // guards a public endpoint must not be guessable, so the form
-        // does not accept a shorter one either.
+        // does not accept a shorter one either
         if token.chars().count() < caps::TOKEN_MIN {
             errors.push((
                 "access_token".into(),
@@ -516,7 +512,7 @@ async fn validate_composition(
         Ok(by_id) => by_id,
         // A failed query is not a bad choice of sources: it is a
         // broken database, and it must not be rendered as a field
-        // error the operator can "fix".
+        // error the operator can "fix"
         Err(err) => return Err(FormError::Server(err)),
     };
     for (source_id, _) in composition {
@@ -559,7 +555,7 @@ async fn build_profile_from_form(
 
     // The placeholder is resolved before validation: `…`/`•` are outside
     // the token charset, so an unchanged placeholder must never be
-    // checked as typed.
+    // checked as typed
     let stored = stored_profile_row(state, existing_id).await?;
     let stored_token = stored.as_ref().and_then(|p| p.access_token.as_deref());
     let access_token = resolve_access_token(
@@ -580,7 +576,7 @@ async fn build_profile_from_form(
 
     // Pipeline: the shared form validation. The tri-state radios let a
     // profile explicitly reset a source's section to the built-in defaults
-    // by emitting an empty section.
+    // by emitting an empty section
     let pipeline = pipeline_from_form(form, lang, &mut errors);
 
     let countries = countries_from_form(form, lang, &mut errors);
@@ -604,17 +600,17 @@ async fn build_profile_from_form(
             countries,
             // The form has no input for the geo-unknown flag yet; an edit
             // keeps whatever the stored profile carries instead of
-            // silently resetting it.
+            // silently resetting it
             include_unknown_country: stored
                 .as_ref()
                 .map(|p| p.include_unknown_country)
                 .unwrap_or(false),
             // Same checkbox read as the source form's save
             // (`is_checkbox_on`): the flag follows the value, not the
-            // field's presence.
+            // field's presence
             enabled: is_checkbox_on(form, "enabled"),
             // `stored` is the row read above for the mask, so `created_at`
-            // carries over without a second query.
+            // carries over without a second query
             created_at: stored.as_ref().map(|p| p.created_at).unwrap_or(now),
             updated_at: now,
         },
@@ -629,7 +625,7 @@ fn form_values_from(form: &[(String, String)]) -> ProfileFormValues {
         output_format: form_get(form, "output_format"),
         countries: form_get(form, "countries"),
         // Same read as the save: the replayed form shows the checkbox
-        // exactly the way the row would be saved.
+        // exactly the way the row would be saved
         enabled: is_checkbox_on(form, "enabled"),
     }
 }
@@ -647,13 +643,13 @@ async fn form_error_response(
     let composition = composition_from_form(form);
     // A failed read is not an empty checklist: an operator who sees no
     // source would read it as "the profile has no sources" and save the
-    // wrong composition.
+    // wrong composition
     let picks = match source_picks(state, &composition).await {
         Ok(picks) => picks,
         Err(err) => return server_error(state, headers, "profiles.form_extras", &err),
     };
     // The edited row's slug decides whether the form has to warn about a
-    // broken link. The row is read again here (the error path only).
+    // broken link. The row is read again here (the error path only)
     let slug_warning = match &form_id {
         Some(id) => match profiles::get(&state.pool, id).await {
             Ok(Some(profile)) => profile.slug.is_some(),
@@ -718,7 +714,7 @@ pub async fn profile_create(
     };
     // The profile row and its composition are one object: they are
     // written in one transaction, so a failed composition cannot leave a
-    // profile without its sources behind.
+    // profile without its sources behind
     if let Err(err) =
         profiles::upsert_with_sources(&state.pool, &profile.profile, &composition, true).await
     {
@@ -748,7 +744,7 @@ pub async fn profile_update(
     };
     // The row and the composition are written together; the cached
     // rendering of the old composition is dropped right after, so the
-    // next public request already serves the saved profile.
+    // next public request already serves the saved profile
     if let Err(err) =
         profiles::upsert_with_sources(&state.pool, &profile.profile, &composition, false).await
     {
@@ -756,7 +752,7 @@ pub async fn profile_update(
     }
     state.caches.invalidate_profile(&profile.id).await;
     // A changed slug breaks the links the subscribers hold: the old
-    // /sub/{slug} stops answering at once, so the outcome says so.
+    // /sub/{slug} stops answering at once, so the outcome says so
     if slug_changed(
         profile.saved_slug.as_deref(),
         profile.profile.slug.as_deref(),
@@ -790,8 +786,6 @@ pub async fn profile_update(
     tracing::info!(profile = %profile.id, "profile updated");
     Redirect::to(&format!("/admin/profiles/{}", profile.id)).into_response()
 }
-
-// Card
 
 #[derive(Template)]
 #[template(path = "profiles/detail.html")]
@@ -858,17 +852,17 @@ pub async fn profile_detail(
         };
 
     // Dedup statistics across the composition:
-    // total link rows vs distinct fingerprints.
+    // total link rows vs distinct fingerprints
     let stats = match profiles::dedup_stats(&state.pool, &id).await {
         Ok(stats) => stats,
         Err(err) => return server_error(&state, &headers, "profiles.detail", &err),
     };
     let (stats_total, stats_unique) = (stats.total, stats.unique);
 
-    // Output preview: render in-process exactly what /sub would serve.
+    // Output preview: render in-process exactly what /sub would serve
     // The factory assembles the state next to the fields it fills; the
     // preview never crosses the public rate-limit middleware (fresh,
-    // unlimited counters).
+    // unlimited counters)
     let app_state = crate::serve::AppState::for_preview(&state);
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {
@@ -889,7 +883,7 @@ pub async fn profile_detail(
     // The token is stored as a hash: the panel cannot show it and the
     // copyable link cannot carry it, so the endpoint answers only with
     // `?token=…` (or a Bearer header). The operator appends the token
-    // they set.
+    // they set
     let base = match state.serve_base(peer, &headers) {
         Ok(b) => b,
         Err(err) => {
@@ -952,8 +946,6 @@ pub async fn profile_detail(
         StatusCode::OK,
     )
 }
-
-// Actions
 
 /// The enabled badge of the profile card, as a standalone fragment: the
 /// detail page includes the same file, and the toggle action re-renders it
@@ -1030,7 +1022,7 @@ pub async fn profile_toggle(
     let lang = state.locales.lang_from_headers(&headers);
     // A targeted UPDATE: the flip does not depend on the row the caller
     // read a moment earlier and does not write back fields it never
-    // looked at.
+    // looked at
     let enabled = match profiles::toggle_enabled(&state.pool, &id).await {
         Ok((enabled, _)) => enabled,
         Err(fumox_core::Error::NotFound(_)) => return not_found(lang, "err.profile_not_found"),
@@ -1048,10 +1040,10 @@ pub async fn profile_toggle(
         &format!("/admin/profiles/{id}"),
         // The wrapper id must survive the swap (the form's hx-target points
         // at it), and the toggle button must flip with the state, it lives
-        // outside the badge, so it travels along as an out-of-band swap.
+        // outside the badge, so it travels along as an out-of-band swap
         // Both elements are rendered from the same fragment templates the
         // detail page includes, so the swap cannot drop the aria attributes
-        // or drift from the initial markup.
+        // or drift from the initial markup
         toggle_swap_fragment(&lang, &id, enabled, &state.csrf_for(&headers)),
         message,
     )
@@ -1139,7 +1131,7 @@ mod tests {
         for off in ["false", "0", "off", ""] {
             assert!(!case(&[("enabled", off)]), "{off:?} must read as unchecked");
         }
-        // The unchecked spelling: the field is absent entirely.
+        // The unchecked spelling: the field is absent entirely
         assert!(!case(&[]));
     }
 
@@ -1159,7 +1151,7 @@ mod tests {
             )
         };
 
-        // An explicit position wins over the checkbox order.
+        // An explicit position wins over the checkbox order
         assert_eq!(
             case(&[
                 ("sources", "a"),
@@ -1169,22 +1161,22 @@ mod tests {
             ]),
             vec![("b".into(), 0), ("a".into(), 1)]
         );
-        // No pos_ field at all: the checkbox order stands.
+        // No pos_ field at all: the checkbox order stands
         assert_eq!(
             case(&[("sources", "a"), ("sources", "b")]),
             vec![("a".into(), 0), ("b".into(), 1)]
         );
-        // An unparseable position falls back to the checkbox order too.
+        // An unparseable position falls back to the checkbox order too
         assert_eq!(
             case(&[("sources", "a"), ("sources", "b"), ("pos_a", "first")]),
             vec![("a".into(), 0), ("b".into(), 1)]
         );
-        // A repeated id is stored once.
+        // A repeated id is stored once
         assert_eq!(
             case(&[("sources", "a"), ("sources", "a"), ("pos_a", "1")]),
             vec![("a".into(), 0)]
         );
-        // Equal positions: the checkbox order breaks the tie.
+        // Equal positions: the checkbox order breaks the tie
         assert_eq!(
             case(&[
                 ("sources", "a"),
@@ -1194,7 +1186,7 @@ mod tests {
             ]),
             vec![("a".into(), 0), ("b".into(), 1)]
         );
-        // A negative position sorts first and comes out renumbered.
+        // A negative position sorts first and comes out renumbered
         assert_eq!(
             case(&[("sources", "a"), ("sources", "b"), ("pos_b", "-7")]),
             vec![("b".into(), 0), ("a".into(), 1)]
@@ -1214,7 +1206,7 @@ mod tests {
         let stored = stored_profile(Some(secret));
         profiles::create(&state.pool, &stored).await.unwrap();
 
-        // The row holds the hash, never the secret.
+        // The row holds the hash, never the secret
         let stored_row = profiles::get(&state.pool, &stored.id)
             .await
             .unwrap()
@@ -1226,7 +1218,7 @@ mod tests {
         assert_ne!(stored_hash, secret, "the secret must not be at rest");
         assert!(fumox_core::token::is_hashed(&stored_hash));
 
-        // Exactly what GET /admin/profiles/{id}/edit hands the browser.
+        // Exactly what GET /admin/profiles/{id}/edit hands the browser
         let placeholder = token_placeholder(Some(&stored_hash));
         assert_eq!(placeholder, TOKEN_PLACEHOLDER);
         let form: Vec<(String, String)> = vec![
@@ -1245,10 +1237,10 @@ mod tests {
             Some(stored_hash.as_str()),
             "the unchanged placeholder must keep the stored token"
         );
-        // The other fields of the same save did change.
+        // The other fields of the same save did change
         assert_eq!(built.name, "renamed");
 
-        // An empty field still clears the token (public endpoint).
+        // An empty field still clears the token (public endpoint)
         let form: Vec<(String, String)> = vec![
             ("name".into(), "renamed".into()),
             ("slug".into(), "p1".into()),
@@ -1351,14 +1343,14 @@ mod tests {
             "the floor must fire on the token field: {errors:?}"
         );
 
-        // The stored secret survives the refusal: nothing was written.
+        // The stored secret survives the refusal: nothing was written
         let after = profiles::get(&state.pool, &stored.id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(after.access_token.as_deref(), Some(stored_hash.as_str()));
 
-        // Exactly at the floor the token is accepted.
+        // Exactly at the floor the token is accepted
         let exact = "a".repeat(caps::TOKEN_MIN);
         let built =
             build_profile_from_form(&state, &lang, &with_token(&exact), &[], Some(&stored.id))
@@ -1393,7 +1385,7 @@ mod tests {
             ]
         };
 
-        // The placeholder itself still restores the stored token.
+        // The placeholder itself still restores the stored token
         let placeholder = token_placeholder(Some(&stored_hash));
         let built = build_profile_from_form(
             &state,
@@ -1409,7 +1401,7 @@ mod tests {
         // A typed value that merely contains a bullet is not the
         // placeholder, so it is validated like any other typed value:
         // '•' is outside the token charset and the save is refused rather
-        // than silently keeping the old token.
+        // than silently keeping the old token
         let errors = field_errors(
             build_profile_from_form(&state, &lang, &with_token("tok•en"), &[], Some(&stored.id))
                 .await
@@ -1420,7 +1412,7 @@ mod tests {
             "the format check must fire on a typed bullet: {errors:?}"
         );
 
-        // …and a different, well-formed token rotates the secret.
+        // …and a different, well-formed token rotates the secret
         let built = build_profile_from_form(
             &state,
             &lang,
@@ -1455,7 +1447,7 @@ mod tests {
             ]
         };
 
-        // Bad format: outside the shared slug charset/length rules.
+        // Bad format: outside the shared slug charset/length rules
         let errors = field_errors(
             build_profile_from_form(&state, &lang, &with_slug("no spaces"), &[], None)
                 .await
@@ -1466,7 +1458,7 @@ mod tests {
             "the format check must fire on the slug field: {errors:?}"
         );
 
-        // Taken: a new profile may not claim the stored row's slug.
+        // Taken: a new profile may not claim the stored row's slug
         let errors = field_errors(
             build_profile_from_form(&state, &lang, &with_slug("p1"), &[], None)
                 .await
@@ -1483,7 +1475,7 @@ mod tests {
             .expect("the row's own slug must stay valid on edit");
         assert_eq!(built.slug.as_deref(), Some("p1"));
 
-        // …and an empty field stores no slug at all.
+        // …and an empty field stores no slug at all
         let built = build_profile_from_form(&state, &lang, &with_slug(""), &[], None)
             .await
             .expect("an empty slug must save");
@@ -1496,9 +1488,6 @@ mod tests {
         new_id()
     }
 
-    /// A slug is part of the public link: replacing a non-empty one
-    /// breaks the links the subscribers hold, and the form has to say
-    /// so. A profile without a slug has no link to break.
     #[test]
     fn only_a_replaced_non_empty_slug_counts_as_a_change() {
         assert!(slug_changed(Some("p1"), Some("p2")));
@@ -1563,8 +1552,6 @@ mod tests {
         assert!(swap.contains(lang.t("common.on")), "{swap}");
     }
 
-    /// The disabled flip: the badge class and the button label follow the
-    /// stored state.
     #[test]
     fn toggle_swap_fragment_flips_with_the_disabled_state() {
         let lang = test_lang();
@@ -1709,7 +1696,7 @@ mod tests {
         .await
         .unwrap();
 
-        // The public listener shares the cache instance with the panel.
+        // The public listener shares the cache instance with the panel
         let public_state = crate::serve::AppState::new(
             pool.clone(),
             state.caches.clone(),
@@ -1724,18 +1711,18 @@ mod tests {
             ),
         );
         // The preview renders `/sub` through the real public router; the
-        // liveness route (and its dedicated pool) is listener wiring.
+        // liveness route (and its dedicated pool) is listener wiring
         let public = crate::serve::router(public_state);
 
         // The first request renders the subscription and caches it: the
-        // sources of the composition decide the order of the output.
+        // sources of the composition decide the order of the output
         let (status, body) = sub_body(&public, &profile.id).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let a = body.find("a.example.com").expect("the first source");
         let b = body.find("b.example.com").expect("the second source");
         assert!(a < b, "the composition order must reach the output: {body}");
 
-        // The panel saves the same profile with the sources swapped.
+        // The panel saves the same profile with the sources swapped
         let form: Vec<(String, String)> = vec![
             ("name".into(), "l128".into()),
             ("output_format".into(), "uri_list".into()),
@@ -1758,19 +1745,19 @@ mod tests {
         let b = body.find("b.example.com").expect("the second source");
         assert!(b < a, "the saved order must reach the output: {body}");
 
-        // A disabled profile stops answering.
+        // A disabled profile stops answering
         let response = profile_toggle(
             State(state.clone()),
             Path(profile.id.clone()),
             HeaderMap::new(),
         )
         .await;
-        // The plain-browser path answers with a redirect carrying the toast.
+        // The plain-browser path answers with a redirect carrying the toast
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let (status, _) = sub_body(&public, &profile.id).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // Switching it back on serves the saved composition again.
+        // Switching it back on serves the saved composition again
         profile_toggle(
             State(state.clone()),
             Path(profile.id.clone()),
@@ -1781,7 +1768,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("a.example.com") && body.contains("b.example.com"));
 
-        // A deleted profile is gone for good.
+        // A deleted profile is gone for good
         let response = profile_delete(
             State(state.clone()),
             Path(profile.id.clone()),

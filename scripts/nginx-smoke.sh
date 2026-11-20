@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# Smoke test for the nginx TLS-front image (docker/nginx/).
-#
-# What it proves, against a running container with a real (self-signed)
-# certificate pair mounted at /certs:
-#   1. the configuration is valid (`nginx -t`);
-#   2. /.well-known/acme-challenge/ is served on :80 WITHOUT the HTTPS
-#      redirect (ACME webroot mode) while every other HTTP request is
-#      redirected 301 to HTTPS;
+# Smoke test for the nginx TLS-front image (docker/nginx/), against a running
+# container with a real (self-signed) certificate pair mounted at /certs:
+#   1. the configuration is valid (`nginx -t`)
+#   2. /.well-known/acme-challenge/ is served on :80 without the HTTPS
+#      redirect (ACME webroot mode), every other HTTP request 301s to HTTPS
 #   3. a TLS handshake against :443 succeeds (the upstream is deliberately
-#      not running, so the answer is a 502 — the handshake is what counts);
+#      not running, so the answer is a 502, the handshake is what counts)
 #   4. the access log never carries the raw /export token: the log format
-#      masks the token segment (see nginx.conf, $fumox_safe_uri);
-#   5. a replaced certificate + SIGHUP reload serves the NEW certificate:
-#      the config reloads without restart, the way a certbot renewal does.
+#      masks the token segment (see nginx.conf, $fumox_safe_uri)
+#   5. a replaced certificate + SIGHUP reload serves the NEW certificate,
+#      the way a certbot renewal does
 #
-# The image is built with the default compose flavour (resolver +
-# variable proxy_pass); the podman flavour differs only in resolver.conf,
-# which the checks below do not exercise.
+# Built with the default compose flavour (resolver + variable proxy_pass);
+# the podman flavour differs only in resolver.conf, which is not exercised
 #
 # Usage:
 #   scripts/nginx-smoke.sh [image]
@@ -63,7 +59,7 @@ gen_cert() {
         -subj "/CN=fumox-smoke.invalid" >/dev/null 2>&1
 }
 
-# Served-certificate fingerprint as the reload test sees it.
+# Served-certificate fingerprint as the reload test sees it
 served_fingerprint() {
     echo | openssl s_client -connect "127.0.0.1:$1" -servername fumox-smoke.invalid 2>/dev/null \
         | openssl x509 -fingerprint -sha256 -noout
@@ -95,11 +91,9 @@ until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port80/" 2>/dev/null;
     sleep 1
 done
 
-# 1. the configuration is valid
 echo ">> nginx -t"
 "${CLI[@]}" exec "$NAME" nginx -t || fail "nginx -t rejected the configuration"
 
-# 2. ACME challenges are not redirected
 echo ">> /.well-known/acme-challenge/ on :80 (must NOT redirect)"
 code="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port80/.well-known/acme-challenge/smoke-token")"
 if [ "$code" != "404" ]; then
@@ -107,7 +101,6 @@ if [ "$code" != "404" ]; then
 fi
 echo ">> no redirect for the ACME location (404)"
 
-# 3. every other HTTP request redirects to HTTPS
 echo ">> /sub on :80 (must redirect 301 to HTTPS)"
 out="$(curl -s --max-time 10 -o /dev/null -w '%{http_code} %{redirect_url}' "http://127.0.0.1:$port80/sub?x=1")"
 case "$out" in
@@ -115,7 +108,6 @@ case "$out" in
     *) fail "expected '301 https://…', got: $out" ;;
 esac
 
-# 4. the TLS handshake succeeds
 echo ">> TLS handshake on :443"
 fp_before="$(served_fingerprint "$port443")"
 case "$fp_before" in
@@ -124,12 +116,11 @@ case "$fp_before" in
 esac
 echo ">> handshake ok ($fp_before)"
 
-# 5. the access log masks the /export tokens
 echo ">> requesting /export/alive and /export/ready with a known token"
 TOKEN="smoke-token-0123456789abcdef"
 # The upstream is deliberately absent (nothing listens on the front's own
-# loopback :8080), so the TLS request answers 502 — exactly the upstream
-# failure that used to put the raw request line into the error log.
+# loopback :8080), so the TLS request answers 502, the upstream failure that
+# used to put the raw request line into the error log
 curl -s --max-time 30 -o /dev/null "http://127.0.0.1:$port80/export/alive/$TOKEN"
 curl -sk --max-time 30 -o /dev/null "https://127.0.0.1:$port443/export/ready/$TOKEN"
 sleep 1
@@ -140,7 +131,6 @@ fi
     || fail "the masked URI is not in the access log"
 echo ">> the token is masked in the access log"
 
-# 6. a replaced certificate + SIGHUP reload serves the new one
 echo ">> replacing the certificate and reloading with SIGHUP"
 gen_cert
 "${CLI[@]}" kill -s HUP "$NAME" >/dev/null 2>&1 || fail "SIGHUP delivery failed"

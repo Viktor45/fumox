@@ -1,7 +1,6 @@
-//! Proxy browser: server-side filtered and paginated
-//! list (thousands of rows, never "show all"), detail card with lifecycle
-//! timeline, probe history and source links, and the manual "reset status"
-//! action.
+//! Proxy browser: server-side filtered and paginated list (thousands of
+//! rows, never "show all"), detail card with lifecycle timeline, probe
+//! history and source links, and the manual "reset status" action.
 
 use super::{
     QueryPairs, action_response, action_response_err, clamp_limit, flag_for, is_htmx, mask_secret,
@@ -27,8 +26,6 @@ use fumox_core::repo::proxies::{
     self, CheckCoverage, ProxyLinkRow, ProxyListCursor, ProxyListDirection, ProxyListFilter,
     ProxyListOrder, ProxyListPage, ProxyListRow,
 };
-
-// List
 
 /// The placeholder every cell without a value renders: a bare comma or an
 /// empty string in its place reads as a typo or as missing markup.
@@ -131,7 +128,7 @@ impl ProxiesListTemplate {
             (true, false) => "T1".to_string(),
             (false, true) => "T2".to_string(),
             // Same placeholder the timestamp cells use, a bare comma here
-            // read as a typo.
+            // read as a typo
             (false, false) => NO_VALUE.to_string(),
         }
     }
@@ -143,14 +140,10 @@ fn urlencoding(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-// Keyset cursor
-//
-// The browser pages with a cursor instead of a page number: the link to
-// the next page carries the sort key of the last row of the current
-// one, so the database seeks straight to it instead of walking over
-// every row the page skips. The cursor travels as one opaque token, so
-// a display name (which may hold any character) cannot break the query
-// string.
+// Keyset cursor: the browser pages with a cursor instead of a page
+// number, so the database seeks straight to the last row instead of
+// walking over every row the page skips. The cursor travels as one
+// opaque token, so a display name cannot break the query string.
 
 /// The token of one cursor: `side|tag|id|value`, base64url-encoded.
 ///
@@ -268,7 +261,7 @@ fn list_view_target(form: &[(String, String)]) -> String {
             continue;
         }
         // The field carries the query string already urlencoded; decode
-        // before the shared re-encoding, so a value round-trips once.
+        // before the shared re-encoding, so a value round-trips once
         let value = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
         parts.push(format!("{key}={}", urlencoding(&value)));
     }
@@ -289,7 +282,7 @@ fn list_page_link(
 ) -> String {
     let mut link = format!("/admin/proxies?per_page={per_page}");
     if let Some(cursor) = cursor {
-        // The base64url alphabet needs no escaping in a query string.
+        // The base64url alphabet needs no escaping in a query string
         link.push_str(&format!("&cur={}", encode_list_cursor(cursor, direction)));
     }
     link.push_str(suffix);
@@ -318,11 +311,11 @@ struct ListViewQuery {
 impl ListViewQuery {
     fn from_params(params: &QueryPairs) -> Self {
         // `status` may repeat (multi-select); the rest are single-valued. This
-        // needs QueryPairs, a HashMap would keep only the last value.
+        // needs QueryPairs, a HashMap would keep only the last value
         //
         // The whitelist is the status vocabulary of the core model: a value
         // outside it is not a filter, it is a typo or a probe at the URL, and
-        // it is logged instead of being silently dropped.
+        // it is logged instead of being silently dropped
         let requested_statuses = params.all("status").cloned().collect::<Vec<String>>();
         let mut rejected: Vec<&str> = Vec::new();
         let statuses: Vec<String> = requested_statuses
@@ -347,14 +340,14 @@ impl ListViewQuery {
         // `repo::proxies::ProxyListOrder::from_param` — any string it
         // does not map to falls back to `ProxyListOrder::Updated`, whose
         // parameter is exactly "updated"; the fallback here only seeds the
-        // same default.
+        // same default
         let sort = params
             .get("sort")
             .cloned()
             .unwrap_or_else(|| "updated".into());
         // Coverage bucket: a garbage value means "no filter", the same
         // tolerance the scheme/country selects show; the bucket whitelist and
-        // its SQL fragments live in the repo's `CheckCoverage`.
+        // its SQL fragments live in the repo's `CheckCoverage`
         let coverage = CheckCoverage::from_bucket(
             &params
                 .get("coverage")
@@ -473,7 +466,7 @@ pub async fn proxies_list(
 
     // The cursor of the requested page. A token of another sort is not a
     // position in this one, so the list falls back to its first page
-    // instead of paging from a key that means nothing here.
+    // instead of paging from a key that means nothing here
     let requested = params
         .get("cur")
         .and_then(|token| decode_list_cursor(token))
@@ -491,13 +484,13 @@ pub async fn proxies_list(
 
     // The side of the cursor the page takes: a page reached backwards
     // holds the rows right before the cursor, a page reached forwards
-    // the rows right after it.
+    // the rows right after it
     let backward = page
         .as_ref()
         .is_some_and(|page| page.direction == ProxyListDirection::Backward);
 
     // The page body and its neighbours, the shape shared with the fetch
-    // journal (`keyset_page`).
+    // journal (`keyset_page`)
     let (prev_cursor, next_cursor) =
         super::logs::keyset_page(&mut rows, page.is_some(), backward, query.per_page, |row| {
             row.cursor(order)
@@ -518,7 +511,7 @@ pub async fn proxies_list(
     // The country dropdown of the filter panel: a failed read answers
     // like every other query of this screen — the page says so instead of
     // rendering a silently empty dropdown the operator would read as "no
-    // countries in the table".
+    // countries in the table"
     let countries: Vec<String> = match proxies::distinct_countries(&state.pool).await {
         Ok(countries) => countries,
         Err(err) => return server_error(&state, &headers, "proxies.list", &err),
@@ -561,8 +554,6 @@ pub async fn proxies_list(
         StatusCode::OK,
     )
 }
-
-// Card
 
 #[derive(Template)]
 #[template(path = "proxies/detail.html")]
@@ -680,12 +671,12 @@ pub async fn proxy_detail(
     // Opening the card refreshes the geo facts from every available
     // GeoLite2 database (City/ASN included), no button to click. The
     // lookup runs in the background: the card renders the stored facts
-    // now and shows the fresh ones on the next open.
+    // now and shows the fresh ones on the next open
     refresh_geo(&state, proxy.id, &proxy.host);
 
     // Every value is server-generated (statuses, counters, timestamps,
     // numbers), the template renders them with askama's `| safe` so the
-    // timestamp entries can carry their `<time>` elements.
+    // timestamp entries can carry their `<time>` elements
     let lifecycle: Vec<(String, String)> = vec![
         (lang.t("common.status").into(), proxy.status.clone()),
         (lang.t("px.fail_count").into(), proxy.fail_count.to_string()),
@@ -750,7 +741,7 @@ pub async fn proxy_detail(
 
     // Unprobeable badge: the schemes the daemon cannot check
     // stay `unknown`; the tooltip text itself is the px.unprobeable_title
-    // catalog entry (admin-facing text must not reference design docs).
+    // catalog entry (admin-facing text must not reference design docs)
     let unprobeable = proxy
         .scheme
         .parse::<Scheme>()
@@ -779,8 +770,6 @@ pub async fn proxy_detail(
     )
 }
 
-// Probe history fragment (live refresh)
-
 /// Standalone fragment template for the probe history table; the same
 /// markup is `{% include %}`d into the full card, so the initial render and
 /// every live refresh stay byte-identical.
@@ -801,7 +790,7 @@ pub async fn proxy_probe_history(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     // A failed read is not an empty history: it is a broken database and
-    // must not render as "the proxy has no checks yet".
+    // must not render as "the proxy has no checks yet"
     match proxies::get_by_id(&state.pool, id).await {
         Ok(Some(_)) => {}
         Ok(None) => return not_found(lang, "err.proxy_not_found"),
@@ -819,8 +808,6 @@ pub async fn proxy_probe_history(
     )
 }
 
-// Purge removed
-
 /// Physically delete every `removed` proxy (and, via cascade, its links and
 /// probe history). Guarded by a confirmation dialog in the UI.
 pub async fn proxies_purge_removed(
@@ -835,7 +822,7 @@ pub async fn proxies_purge_removed(
         Err(err) => return server_error(&state, &headers, "proxies.purge_removed", &err),
     };
     // The peer names who ran the destructive action: the purge cannot be
-    // undone.
+    // undone
     tracing::info!(deleted, peer = %peer, "purged removed proxies");
     let fragment = format!(
         "<span class=\"badge on\">{}</span>",
@@ -851,12 +838,10 @@ pub async fn proxies_purge_removed(
     )
 }
 
-// Bulk cleanup
-//
-// Every action below transitions rows into the terminal `removed` status ,
-// they never delete. The physical cleanup stays the single «purge removed»
-// button, so each action is reversible via the per-proxy «reset status»
-// until purged.
+// Bulk cleanup: every action below transitions rows into the terminal
+// `removed` status, they never delete. The physical cleanup stays the
+// single «purge removed» button, so each action is reversible via the
+// per-proxy «reset status» until purged.
 
 /// Shared tail of the parameterless cleanup handlers: run the repo
 /// transition, log it and answer with the count badge + toast. The
@@ -1006,7 +991,7 @@ macro_rules! keyed_bulk_handler {
             let raw = keyed_form_raw(&form, stringify!($field));
             let Some(value) = ($normalize)(&raw) else {
                 // The (truncated) rejected value names what the operator
-                // actually sent, so the log line is actionable.
+                // actually sent, so the log line is actionable
                 tracing::info!(input = %raw.chars().take(32).collect::<String>(), $reject_log);
                 return action_response_err(
                     is_htmx(&headers),
@@ -1052,7 +1037,7 @@ macro_rules! keyed_bulk_handler {
             let raw = keyed_form_raw(&form, stringify!($field));
             let Some(value) = ($normalize)(&raw) else {
                 // The (truncated) rejected value names what the operator
-                // actually sent, so the log line is actionable.
+                // actually sent, so the log line is actionable
                 tracing::info!(input = %raw.chars().take(32).collect::<String>(), $reject_log);
                 return action_response_err(
                     is_htmx(&headers),
@@ -1114,12 +1099,11 @@ keyed_bulk_handler!(
     cleanup
 );
 
-// Bulk revival
-//
-// Every action below moves rows *back* to `unknown`, the inverse of the
-// cleanup panel. Revived ids are enqueued into `probe_requests` so the probe
-// daemon picks them up on its next cycle (the same handoff the ingest path
-// uses for `[ingest].removed_as_unknown`).
+// Bulk revival: every action below moves rows *back* to `unknown`, the
+// inverse of the cleanup panel. Revived ids are enqueued into
+// `probe_requests` so the probe daemon picks them up on its next cycle
+// (the same handoff the ingest path uses for
+// `[ingest].removed_as_unknown`).
 
 /// Hand-off budget for the bulk revivals: a fixed, generous cap so the
 /// operator's `[ingest].refresh_check_limit` cannot silently disable the
@@ -1133,10 +1117,10 @@ const REVIVE_ENQUEUE_LIMIT: u32 = fumox_core::config::bounds::REFRESH_CHECK_LIMI
 
 /// Enqueue revived ids for priority probing. Failures are logged and
 /// never fail the revival: the proxy sits in the random sample until
-/// `select_t1_candidates` happens to draw it. The reverse is not true
-///, `enqueue_checks` silently drops ids whose status drifted away
-/// from `unknown`, so a successful enqueue is a stronger guarantee
-/// than a missed one.
+/// `select_t1_candidates` happens to draw it. The reverse is not true:
+/// `enqueue_checks` silently drops ids whose status drifted away from
+/// `unknown`, so a successful enqueue is a stronger guarantee than a
+/// missed one.
 async fn enqueue_revived(state: &AdminState, ids: &[i64]) {
     if ids.is_empty() {
         return;
@@ -1145,7 +1129,7 @@ async fn enqueue_revived(state: &AdminState, ids: &[i64]) {
         probe_repo::enqueue_checks(&state.pool, ids, REVIVE_ENQUEUE_LIMIT, now_ts()).await
     {
         // The scale matters: a click that revived hundreds of rows and
-        // enqueued none of them reads very different from one lost row.
+        // enqueued none of them reads very different from one lost row
         tracing::warn!(error = %err, ids = ids.len(), "failed to enqueue revived proxies");
     }
 }
@@ -1235,8 +1219,6 @@ keyed_bulk_handler!(
     revive
 );
 
-// Actions
-
 /// The `#status-badge` swap fragment for a row an action left alone,
 /// same shape the detail template renders: the form's `hx-target` points
 /// at the wrapper, so a refusal has to answer with it or the button dies.
@@ -1268,7 +1250,7 @@ pub async fn proxy_reset(
     let lang = state.locales.lang_from_headers(&headers);
     match proxies::reset_status(&state.pool, id).await {
         Ok(true) => {}
-        // `false` is a gone row or one no probe lane can reach; only the first is a 404.
+        // `false` is a gone row or one no probe lane can reach; only the first is a 404
         Ok(false) => match proxies::get_by_id(&state.pool, id).await {
             Ok(Some(row)) => {
                 tracing::info!(
@@ -1293,10 +1275,10 @@ pub async fn proxy_reset(
         is_htmx(&headers),
         &format!("/admin/proxies/{id}"),
         // The wrapper id must survive the swap: the form's hx-target points
-        // at it, so losing it kills the button for every subsequent click.
-        // The aria attributes keep the initial template's announcements.
+        // at it, so losing it kills the button for every subsequent click
+        // The aria attributes keep the initial template's announcements
         // The badge is the shared one: a reset lands on `unknown`, so the
-        // success branch renders the same fragment the refusals do.
+        // success branch renders the same fragment the refusals do
         status_badge(&lang, "unknown"),
         lang.t("px.reset_toast"),
     )
@@ -1347,9 +1329,9 @@ mod tests {
     fn the_credential_is_masked() {
         assert_eq!(mask_credential("user:secret123"), "user:sec…••••");
         assert_eq!(mask_credential("a-very-long-uuid"), "a-v…••••");
-        // A short credential is hidden entirely.
+        // A short credential is hidden entirely
         assert_eq!(mask_credential("ab:cd"), "ab:••••");
-        // No credential, no mask.
+        // No credential, no mask
         assert_eq!(mask_credential(""), "");
     }
 
@@ -1362,7 +1344,7 @@ mod tests {
         assert!(!masked.contains("secret123"), "{masked}");
         assert!(!masked.contains("ABC"), "{masked}");
         // The parts that are not secrets survive: they are the
-        // diagnostics of the line.
+        // diagnostics of the line
         assert!(masked.contains("vless://user:"), "{masked}");
         assert!(masked.contains("@example.com:443"), "{masked}");
         assert!(masked.contains("type=ws"), "{masked}");
@@ -1396,7 +1378,7 @@ mod tests {
         assert!(!pretty.contains("secret"), "{pretty}");
         assert!(pretty.contains("example.com"), "{pretty}");
         // A corrupt column is shown verbatim: hiding the problem would
-        // leave the operator without a clue.
+        // leave the operator without a clue
         assert_eq!(
             pretty_params(&Some("not json".to_string())),
             "not json".to_string()
@@ -1417,13 +1399,13 @@ mod tests {
                 latency_ms: Some(120),
                 id: 7,
             },
-            // An unmeasured row has no latency to carry.
+            // An unmeasured row has no latency to carry
             ProxyListCursor::Latency {
                 latency_ms: None,
                 id: 7,
             },
             // A name may hold anything, including the separator of the
-            // token's own payload.
+            // token's own payload
             ProxyListCursor::Name {
                 name: "node | 7: ru".into(),
                 id: 7,
@@ -1449,25 +1431,22 @@ mod tests {
     /// list: the list falls back to its first page instead of failing.
     #[test]
     fn a_damaged_cursor_token_is_refused() {
-        // Valid base64, but not a cursor payload.
+        // Valid base64, but not a cursor payload
         for token in ["", "!!!", "Zm9v"] {
             assert!(
                 decode_list_cursor(token).is_none(),
                 "{token} must not decode into a cursor"
             );
         }
-        // The id is not a number.
+        // The id is not a number
         assert!(decode_list_cursor("f|u|x|1").is_none());
-        // The side and the tag are not known.
+        // The side and the tag are not known
         assert!(decode_list_cursor("x|u|1|1").is_none());
         assert!(decode_list_cursor("f|q|1|1").is_none());
-        // The value is missing.
+        // The value is missing
         assert!(decode_list_cursor("f|u|1").is_none());
     }
 
-    /// A cursor of another sort is not a position in this order: the
-    /// list falls back to its first page instead of paging from a key
-    /// that means nothing here.
     #[test]
     fn a_cursor_of_another_sort_is_not_a_position_here() {
         let updated = ProxyListCursor::Updated {
@@ -1602,14 +1581,14 @@ mod tests {
             "?status=alive&status=quarantine&q=node%20one&cur=abc"
         );
 
-        // Unknown keys, a path-ish pair and a bare word do not survive.
+        // Unknown keys, a path-ish pair and a bare word do not survive
         let crafted = vec![(
             "view".to_string(),
             "x=1&token=secret&/../evil=1&junk&country=DE".to_string(),
         )];
         assert_eq!(list_view_target(&crafted), "?country=DE");
 
-        // No view field at all: the bare list.
+        // No view field at all: the bare list
         assert_eq!(list_view_target(&[("_csrf".into(), "t".into())]), "");
     }
 
@@ -1652,7 +1631,7 @@ mod tests {
             "the link must carry the cursor it was built from"
         );
 
-        // The first page carries no cursor at all.
+        // The first page carries no cursor at all
         assert_eq!(
             list_page_link(&suffix, 25, None, ProxyListDirection::Forward),
             format!("/admin/proxies?per_page=25{suffix}")
@@ -1700,7 +1679,7 @@ mod tests {
             return;
         };
         // A literal address from the Cloudflare block: the City record
-        // decodes with an empty country there, the ASN record hits.
+        // decodes with an empty country there, the ASN record hits
         let host = "104.16.0.1";
         let Some(info) = state.geo_full.resolve(host).await else {
             eprintln!("skipping: {host} not covered by the local GeoLite2 files");
@@ -1724,11 +1703,11 @@ mod tests {
 
         let row = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
         // The refresh runs in the background: the test waits for the
-        // write it triggers.
+        // write it triggers
         refresh_geo(&state, id, &row.host).await.unwrap();
 
         // What the next card renders: the row the refresh wrote. A `-`
-        // here would hide a country the row still holds.
+        // here would hide a country the row still holds
         let card = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
         assert_eq!(
             card.geo_country.as_deref(),
@@ -1736,7 +1715,7 @@ mod tests {
             "the card must keep showing the stored country"
         );
         assert_eq!(card.geo_city.as_deref(), Some("New York"));
-        // And the row gained the resolved facts.
+        // And the row gained the resolved facts
         assert!(card.geo_asn.is_some(), "the resolved ASN is stored");
         assert_eq!(card.resolved_ip.as_deref(), Some(host));
     }
@@ -1764,7 +1743,7 @@ mod tests {
         );
 
         // One `removed` row linked to a source (the fixture mirrors the
-        // probe repo's queue tests: the link FK needs the source row).
+        // probe repo's queue tests: the link FK needs the source row)
         sqlx::query(
             "INSERT OR IGNORE INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
              VALUES ('srcA0000000', 's', 'https://example.com', 1, 3600, 1, 1)",
@@ -1790,7 +1769,7 @@ mod tests {
 
         // The exact pair of calls every revival handler makes: the repo
         // transition moves the row to `unknown` and returns its id, then
-        // the hand-off enqueues it for priority probing.
+        // the hand-off enqueues it for priority probing
         let outcome = proxies::revive_removed_by_country(&state.pool, "DE", now_ts())
             .await
             .unwrap();

@@ -1,24 +1,18 @@
 //! Application configuration.
 //!
-//! Layered configuration: built-in defaults → TOML file
-//! (`config/app.toml` by default) → environment variables with the
-//! `FUMOX_` prefix and `__` as the section separator
-//! (e.g. `FUMOX_ADMIN__TOKEN=secret`).
-//!
-//! Every key has a default so the service runs out of the box.
-//! Unknown keys are rejected to catch typos early.
+//! Layered: built-in defaults → TOML file (`config/app.toml` by default) →
+//! environment variables with the `FUMOX_` prefix and `__` as the section
+//! separator (e.g. `FUMOX_ADMIN__TOKEN=secret`), one direction only. Every
+//! key has a default so the service runs out of the box; unknown keys are
+//! rejected to catch typos early.
 //!
 //! Environment values arrive as strings and are fed to each key's
 //! deserializer unchanged, so a list-valued key needs a JSON array, not a
 //! comma-separated string: `FUMOX_SERVER__TRUST_PROXY_IPS='["10.0.0.0/8"]'`.
-//! The same rule covers every `Vec` key (`admin.trust_proxy_ips`,
-//! `server.allowed_hosts`, `admin.allowed_hosts`,
-//! `probe.recheck_delays_secs`). The one exception is `[meow].test_url`,
-//! whose deserializer also splits a comma-separated string into URLs.
-//!
-//! The TOML file itself is located by (strongest first): the `--config`
-//! CLI flag, the `FUMOX_CONFIG` environment variable, then the default
-//! `config/app.toml` resolved against the CWD.
+//! The one exception is `[meow].test_url`, whose deserializer also splits a
+//! comma-separated string into URLs. The TOML file is located by (strongest
+//! first): the `--config` CLI flag, the `FUMOX_CONFIG` environment variable,
+//! then the default `config/app.toml` resolved against the CWD.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -36,34 +30,30 @@ use crate::models::IpFamily;
 /// Default location of the TOML config file, resolved against the CWD.
 pub const DEFAULT_CONFIG_PATH: &str = "config/app.toml";
 
-/// Environment variable pointing at the TOML config file, the middle
-/// layer between the `--config` flag (strongest) and the default location.
+/// Environment variable pointing at the TOML config file.
 pub const CONFIG_PATH_ENV: &str = "FUMOX_CONFIG";
 
 /// Prefix of every environment variable the loader reads.
 pub const ENV_PREFIX: &str = "FUMOX_";
 
-/// `FUMOX_*` variables that are not configuration keys.
-///
-/// They belong to the deployment around the binary: the compose file
-/// reads them for the port mapping and the build cache, and the loader
-/// reads one of them itself. A variable in this list is ignored
-/// without a word; every other unknown name is refused, because the
-/// commonest cause is a typo in a section or a key name, and a
+/// `FUMOX_*` variables that are not configuration keys: deployment
+/// variables around the binary (the compose file reads them for the port
+/// mapping and the build cache, the loader reads one itself). A variable in
+/// this list is ignored without a word; every other unknown name is refused,
+/// because the commonest cause is a typo in a section or a key name, and a
 /// silently ignored variable is a setting that never takes effect.
 pub const NON_CONFIG_ENV_VARS: &[&str] = &[
     CONFIG_PATH_ENV,
-    // Compose: how the config directory is mounted into the container.
+    // Compose: how the config directory is mounted into the container
     "FUMOX_CONFIG_ACCESS",
-    // Compose: the host-side port mapping and the admin bind address.
+    // Compose: the host-side port mapping and the admin bind address
     "FUMOX_PUBLIC_PORT",
     "FUMOX_ADMIN_PORT",
     "FUMOX_ADMIN_BIND",
-    // Compose: the buildkit cache mode.
+    // Compose: the buildkit cache mode
     "FUMOX_BUILD_CACHE",
 ];
 
-/// Top-level application configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -91,25 +81,22 @@ pub struct AppConfig {
     pub log: LogConfig,
 }
 
-/// Where the TOML config file was looked for, as resolved by
-/// [`load`], lets the binaries log the truth (the loader
-/// itself cannot: the tracing subscriber is not installed until after the
-/// config, which carries the log level, is loaded).
+/// Where the TOML config file was looked for, as resolved by [`load`]. The
+/// binaries log it because the loader cannot: the tracing subscriber is not
+/// installed until after the config, which carries the log level, is loaded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedConfigPath {
     /// The file at this path was merged into the configuration.
     Loaded(PathBuf),
-    /// No file anywhere, the service runs on built-in defaults plus env
-    /// overrides. The default location may legitimately be absent
-    /// (out-of-the-box run), so this is not an error.
+    /// No file anywhere: the service runs on built-in defaults plus env
+    /// overrides, which is the out-of-the-box run, not an error.
     Missing,
 }
 
 impl ResolvedConfigPath {
-    /// The file path, or the default location when no file was loaded.
-    /// Readers that act on "the config file" (the admin settings editor
-    /// writes there, the overview names it) share this one choice instead
-    /// of repeating the `Missing` fallback.
+    /// The file path, or the default location when no file was loaded, so
+    /// readers that act on "the config file" (the admin settings editor
+    /// writes there, the overview names it) share this one choice.
     pub fn path_or_default(&self) -> PathBuf {
         match self {
             ResolvedConfigPath::Loaded(path) => path.clone(),
@@ -121,8 +108,8 @@ impl ResolvedConfigPath {
 /// Resolve the TOML file location by priority: the explicit `path` (the
 /// `--config` flag) → [`CONFIG_PATH_ENV`] → [`DEFAULT_CONFIG_PATH`] against
 /// the CWD. An explicitly requested file (flag or env) must exist, a typo
-/// must fail loudly, not silently fall back to defaults. An empty env
-/// value counts as unset.
+/// must fail loudly, not silently fall back to defaults. An empty env value
+/// counts as unset.
 pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigPath> {
     match path {
         Some(p) => {
@@ -136,8 +123,6 @@ pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigP
             }
         }
         None => {
-            // No CLI flag, the env pointer, if set, wins over the default
-            // location. An empty value counts as unset.
             let from_env = std::env::var(CONFIG_PATH_ENV)
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -153,8 +138,7 @@ pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigP
                         file.display()
                     )));
                 }
-                // The default location being absent is the out-of-the-box
-                // run, not an error.
+                // The default location being absent is the out-of-the-box run
                 return Ok(ResolvedConfigPath::Missing);
             }
             Ok(ResolvedConfigPath::Loaded(file.to_path_buf()))
@@ -168,13 +152,12 @@ impl AppConfig {
     /// `[probe].refresh_check_limit` became `[ingest].refresh_check_limit`
     /// when the priority queue became the scheduler's. A config file from
     /// the previous release still carries the old name, and a struct with
-    /// `deny_unknown_fields` refuses it — so an upgrade would turn into a
-    /// refusal to start. The old name is accepted for one release: its
-    /// value is carried over when the new key still holds its default,
-    /// and a warning names the key to rename.
-    ///
-    /// The new key wins when it was set explicitly, even to the default
-    /// value: an operator who set both meant the new one.
+    /// `deny_unknown_fields` refuses it, so an upgrade would turn into a
+    /// refusal to start. The old name is accepted for one release: its value
+    /// is carried over when the new key still holds its default, and a
+    /// warning names the key to rename. The new key wins when it was set
+    /// explicitly, even to the default value: an operator who set both meant
+    /// the new one.
     fn apply_moved_keys(&mut self) {
         let Some(old) = self.probe.refresh_check_limit.take() else {
             return;
@@ -193,11 +176,9 @@ impl AppConfig {
 
     /// The DNS timeout of the SSRF pipeline: the dedicated
     /// `[network].dns_timeout_secs` when it is set, `[geo].dns_timeout_secs`
-    /// otherwise, never below one second.
-    ///
-    /// The two consumers of the address policy (the probe's dial gate and
-    /// the server's fetcher) read the bound from here, so a change to it
-    /// reaches both.
+    /// otherwise, never below one second. Both consumers of the address
+    /// policy (the probe's dial gate and the server's fetcher) read the bound
+    /// from here, so a change to it reaches both.
     pub fn ssrf_dns_timeout(&self) -> std::time::Duration {
         let secs = if self.network.dns_timeout_secs > 0 {
             self.network.dns_timeout_secs
@@ -210,7 +191,7 @@ impl AppConfig {
     /// Cross-field checks serde cannot express on individual fields.
     fn validate(&self) -> crate::Result<()> {
         // The range table first: the checks below divide by a value it
-        // guarantees to be non-zero.
+        // guarantees to be non-zero
         self.validate_bounds()?;
         if self.meow.backoff_max_secs < self.meow.backoff_initial_secs {
             return Err(crate::Error::Config(format!(
@@ -220,9 +201,9 @@ impl AppConfig {
         }
         // An explicitly enabled panel that still carries the shipped
         // placeholder and listens on a non-loopback address is a
-        // misconfiguration with a security consequence, not a default.
-        // On loopback the placeholder merely disables the panel, which the
-        // operator can still reach through a tunnel.
+        // misconfiguration with a security consequence, not a default. On
+        // loopback the placeholder merely disables the panel, which the
+        // operator can still reach through a tunnel
         if self.admin.enabled
             && self.admin.uses_placeholder_token()
             && !self.admin.bind.ip().is_loopback()
@@ -243,23 +224,23 @@ impl AppConfig {
     /// The T2 test URL is fetched by meow-rs, on the proxy's side of the
     /// tunnel, so the probe's own address gate never sees it. A literal
     /// loopback, link-local or RFC1918 host in `[meow].test_url` turns the
-    /// tunnel check into a request to an internal service , which is the
-    /// SSRF the probe's gate exists to prevent. The flag that opens the
-    /// probe's dial targets opens these too.
+    /// tunnel check into a request to an internal service, which is the SSRF
+    /// the probe's gate exists to prevent. The flag that opens the probe's
+    /// dial targets opens these too.
     fn validate_meow_test_urls(&self) -> crate::Result<()> {
         if self.probe.allow_private_targets {
             return Ok(());
         }
         for entry in &self.meow.test_url {
             let Ok(parsed) = url::Url::parse(entry) else {
-                // Already refused by the deserializer.
+                // Already refused by the deserializer
                 continue;
             };
             let ip = match parsed.host() {
                 Some(url::Host::Ipv4(addr)) => std::net::IpAddr::V4(addr),
                 Some(url::Host::Ipv6(addr)) => std::net::IpAddr::V6(addr),
                 // A name is resolved by meow-rs where the probe cannot vet
-                // it, so only literals are checked here.
+                // it, so only literals are checked here
                 Some(url::Host::Domain(_)) | None => continue,
             };
             if let Err(reason) = crate::ssrf::vet_addr(ip, false) {
@@ -272,10 +253,10 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Every numeric setting is checked against the range the admin
-    /// editor advertises, so a value the panel would refuse is refused
-    /// at startup too. The message names the key and the bound: an
-    /// operator who typed the value has to be able to find it.
+    /// Every numeric setting is checked against the range the admin editor
+    /// advertises, so a value the panel would refuse is refused at startup
+    /// too. The message names the key and the bound: an operator who typed
+    /// the value has to be able to find it.
     fn validate_bounds(&self) -> crate::Result<()> {
         for (path, value) in self.numeric_settings() {
             let Some(range) = bounds::range_of(path) else {
@@ -292,10 +273,10 @@ impl AppConfig {
         Ok(())
     }
 
-    /// The numeric settings of this config, each under the dotted path
-    /// the range table uses. A rate limit is composite: the table bounds
-    /// the count under a `.limit` suffix, and the window is fixed to one
-    /// of four units by the parser.
+    /// The numeric settings of this config, each under the dotted path the
+    /// range table uses. A rate limit is composite: the table bounds the
+    /// count under a `.limit` suffix, and the window is fixed to one of four
+    /// units by the parser.
     fn numeric_settings(&self) -> Vec<(&'static str, u64)> {
         let mut settings = Vec::new();
         settings.extend(self.server_database_fetch_numeric_settings());
@@ -305,8 +286,6 @@ impl AppConfig {
         settings
     }
 
-    /// The numeric settings of the `server`, `database` and `fetch`
-    /// sections.
     fn server_database_fetch_numeric_settings(&self) -> Vec<(&'static str, u64)> {
         vec![
             (
@@ -344,8 +323,6 @@ impl AppConfig {
         ]
     }
 
-    /// The numeric settings of the `ingest`, `geo`, `network` and
-    /// `admin` sections.
     fn geo_network_admin_numeric_settings(&self) -> Vec<(&'static str, u64)> {
         vec![
             (
@@ -375,7 +352,6 @@ impl AppConfig {
         ]
     }
 
-    /// The numeric settings of the `probe` section.
     fn probe_numeric_settings(&self) -> Vec<(&'static str, u64)> {
         vec![
             ("probe.cycle_interval_secs", self.probe.cycle_interval_secs),
@@ -411,7 +387,6 @@ impl AppConfig {
         ]
     }
 
-    /// The numeric settings of the `meow` and `retention` sections.
     fn meow_retention_numeric_settings(&self) -> Vec<(&'static str, u64)> {
         vec![
             ("meow.timeout_secs", self.meow.timeout_secs),
@@ -432,11 +407,11 @@ impl AppConfig {
         ]
     }
 
-    /// The trusted-proxy lists are the operator's statement about which
-    /// peers may speak for a client (`X-Forwarded-For`). A `/0` entry
-    /// trusts every peer on the internet, which turns the per-IP rate
-    /// limit into a no-op: any caller can name its own address. Such an
-    /// entry is a config error, not a warning.
+    /// The trusted-proxy lists are the operator's statement about which peers
+    /// may speak for a client (`X-Forwarded-For`). A `/0` entry trusts every
+    /// peer on the internet, which turns the per-IP rate limit into a no-op:
+    /// any caller can name its own address. Such an entry is a config error,
+    /// not a warning.
     fn validate_trust_proxy_ips(&self) -> crate::Result<()> {
         for (path, list) in [
             ("server.trust_proxy_ips", &self.server.trust_proxy_ips),
@@ -459,17 +434,17 @@ impl AppConfig {
         Ok(())
     }
 
-    /// The priority queue holds the freshly ingested proxies, and the
-    /// probe drains it at the rate it checks proxies: `sample_size` per
-    /// `cycle_interval_secs`. A queue that grows faster than it is
-    /// drained never empties, and the proxies an operator waits for sit
-    /// at the back of it for ever.
+    /// The priority queue holds the freshly ingested proxies, and the probe
+    /// drains it at the rate it checks proxies: `sample_size` per
+    /// `cycle_interval_secs`. A queue that grows faster than it is drained
+    /// never empties, and the proxies an operator waits for sit at the back
+    /// of it for ever.
     fn validate_probe_queue(&self) -> crate::Result<()> {
         // The divisor is at least 1: the range table bounds the cycle
         // interval to a second or more, and `validate_bounds` ran. The
         // multiplication comes first: a cycle longer than an hour drains
         // a *fraction* of the sample per hour, and dividing `3600 / cycle`
-        // first would floor that fraction to zero and refuse every limit.
+        // first would floor that fraction to zero and refuse every limit
         let per_hour =
             u64::from(self.probe.sample_size) * 3600 / self.probe.cycle_interval_secs.max(1);
         if u64::from(self.ingest.refresh_check_limit) > per_hour {
@@ -486,9 +461,8 @@ impl AppConfig {
     }
 }
 
-/// Parse one entry of a trusted-proxy list: a CIDR (`10.0.0.0/8`) or a
-/// bare address, which counts as a host prefix. `None` when the entry
-/// is neither.
+/// Parse one entry of a trusted-proxy list: a CIDR (`10.0.0.0/8`) or a bare
+/// address, which counts as a host prefix. `None` when the entry is neither.
 pub fn parse_trusted_cidr(entry: &str) -> Option<ipnet::IpNet> {
     let trimmed = entry.trim();
     if trimmed.is_empty() {
@@ -498,7 +472,7 @@ pub fn parse_trusted_cidr(entry: &str) -> Option<ipnet::IpNet> {
         return Some(net);
     }
     // A bare address is a host prefix: the admin editor writes them
-    // back verbatim, and the startup parser reads them the same way.
+    // back verbatim, and the startup parser reads them the same way
     let addr = trimmed.parse::<std::net::IpAddr>().ok()?;
     Some(match addr {
         std::net::IpAddr::V4(_) => ipnet::IpNet::new(addr, 32).ok()?,
@@ -506,10 +480,9 @@ pub fn parse_trusted_cidr(entry: &str) -> Option<ipnet::IpNet> {
     })
 }
 
-/// Result of [`load`]: the merged configuration together with the file
-/// that was actually read. The path is what the admin panel uses as the
-/// round-trip target for the *Edit settings* page, see
-/// [`crate::config_writer`].
+/// Result of [`load`]: the merged configuration together with the file that
+/// was actually read, the round-trip target of the admin panel's *Edit
+/// settings* page, see [`crate::config_writer`].
 #[derive(Debug)]
 pub struct LoadedConfig {
     pub config: AppConfig,
@@ -517,18 +490,12 @@ pub struct LoadedConfig {
 }
 
 /// Loads configuration from defaults, an optional TOML file and the
-/// environment.
+/// environment; the file location is resolved by [`resolve_config_path`].
 ///
-/// The file location is resolved by [`resolve_config_path`]: the
-/// explicit `path` (the `--config` flag) → the [`CONFIG_PATH_ENV`]
-/// environment variable → [`DEFAULT_CONFIG_PATH`] against the CWD.
-/// Every key has a default, so a missing default file runs the
-/// service out of the box.
-///
-/// The precedence is one direction and one direction only: the
-/// environment wins over the file, the file wins over the built-in
-/// defaults. `--print-config` on both binaries prints the result, so
-/// the operator can see which value is in force.
+/// The precedence is one direction and one direction only: the environment
+/// wins over the file, the file wins over the built-in defaults.
+/// `--print-config` on both binaries prints the result, so the operator can
+/// see which value is in force.
 pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
     let mut figment = Figment::from(Serialized::defaults(AppConfig::default()));
     let resolved = resolve_config_path(path)?;
@@ -539,9 +506,9 @@ pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
 
     // Environment overrides: FUMOX_SECTION__KEY (double underscore splits
     // the section path). The layer is restricted to the paths the
-    // configuration actually has, so a variable that names no key
-    // cannot shadow something else; `check_env_vars` turns such a name
-    // into an error instead of letting it pass unnoticed.
+    // configuration actually has, so a variable that names no key cannot
+    // shadow something else; `check_env_vars` turns such a name into an
+    // error instead
     let mut paths = config_paths()?;
     paths.extend(DEPRECATED_PATHS.iter().map(|p| (*p).to_string()));
     let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -558,17 +525,15 @@ pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
     })
 }
 
-/// Config paths that exist only for backward compatibility: the key
-/// moved to another section, and the old name is still read so a config
-/// file from the previous release keeps loading.
+/// Config paths that exist only for backward compatibility: the key moved to
+/// another section, and the old name is still read so a config file from the
+/// previous release keeps loading.
 const DEPRECATED_PATHS: &[&str] = &["probe.refresh_check_limit"];
 
 /// The dotted paths the configuration has (`server.bind`, `admin.token`),
-/// lower-cased.
-///
-/// The env layer's whitelist: `FUMOX_SERVER__BIND` maps to
-/// `server.bind`, and a variable naming no path here names no
-/// configuration key.
+/// lower-cased: the env layer's whitelist (`FUMOX_SERVER__BIND` maps to
+/// `server.bind`, and a variable naming no path here names no configuration
+/// key).
 pub fn config_paths() -> crate::Result<Vec<String>> {
     let value = serde_json::to_value(AppConfig::default())
         .map_err(|e| crate::Error::Config(format!("cannot serialize the default config: {e}")))?;
@@ -578,24 +543,20 @@ pub fn config_paths() -> crate::Result<Vec<String>> {
     Ok(paths)
 }
 
-/// The configuration paths the environment currently overrides.
+/// The configuration paths the environment currently overrides, as the
+/// dotted config keys (`admin.token`) [`config_paths`] returns.
 ///
 /// The env layer wins over the file, so a setting named here cannot be
-/// changed through the config file: the environment keeps the value no
-/// matter what the file says. The admin panel uses the list to render
-/// those fields read-only and to leave them out of the write.
-///
-/// The paths are the dotted config keys (`admin.token`), the same
-/// shape [`config_paths`] returns. A `FUMOX_*` variable that names no
-/// config key is not reported: [`check_env_vars`] refuses the start
-/// instead.
+/// changed through the config file: the admin panel renders those fields
+/// read-only and leaves them out of the write. A `FUMOX_*` variable that
+/// names no config key is not reported: [`check_env_vars`] refuses the
+/// start instead.
 pub fn env_overridden_paths() -> Vec<String> {
     // The whitelist comes from serializing the built-in default config,
-    // whose Serialize impl is derived over fixed types and carries no
-    // operator input. Should that ever fail, `load` reports the same
-    // error and no process reaches this render path; the fallback keeps
-    // the answer truthful ("nothing can be matched against the config's
-    // own keys") instead of panicking inside a request handler.
+    // whose Serialize impl is derived over fixed types. Should that ever
+    // fail, `load` reports the same error and no process reaches this render
+    // path; the fallback keeps the answer truthful instead of panicking
+    // inside a request handler
     let known = match config_paths() {
         Ok(paths) => paths,
         Err(err) => {
@@ -623,8 +584,8 @@ pub fn env_overridden_paths() -> Vec<String> {
     overridden
 }
 
-/// Flatten a JSON value into dotted leaf paths (`admin.rate_limit`).
-/// Arrays count as one leaf so `meow.test_url` stays a single key.
+/// Flatten a JSON value into dotted leaf paths (`admin.rate_limit`), arrays
+/// counting as one leaf so `meow.test_url` stays a single key.
 fn collect_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
@@ -652,15 +613,13 @@ fn env_var_path(name: &str) -> Option<String> {
     Some(rest.replace("__", ".").to_ascii_lowercase())
 }
 
-/// Refuse a `FUMOX_*` variable that names no configuration key.
-///
-/// The deployment variables of [`NON_CONFIG_ENV_VARS`] are expected and
-/// ignored. Every other unknown name is a mistake — a typo in the
-/// section, a key that moved, a variable of another project — and the
-/// mistake is invisible otherwise: the variable is simply not applied
-/// and the setting keeps the value the file gave it. The error names
-/// the variable and the closest key, because the operator has to be
-/// able to fix it without reading the source.
+/// Refuse a `FUMOX_*` variable that names no configuration key. The
+/// deployment variables of [`NON_CONFIG_ENV_VARS`] are expected and ignored;
+/// every other unknown name is a mistake (a typo in the section, a key that
+/// moved, a variable of another project) and the mistake is invisible
+/// otherwise: the variable is simply not applied and the setting keeps the
+/// value the file gave it. The error names the variable and the closest key,
+/// because the operator has to be able to fix it without reading the source.
 fn check_env_vars(paths: &[String]) -> crate::Result<()> {
     let mut unknown: Vec<String> = Vec::new();
     for (name, _) in std::env::vars_os() {
@@ -729,13 +688,10 @@ pub fn load_config(path: Option<&Path>) -> crate::Result<AppConfig> {
 /// and the meow API token, the two secrets the config carries.
 pub const REDACTED_ADMIN_TOKEN: &str = "<redacted>";
 
-/// The resolved configuration as TOML, with every credential redacted.
-///
-/// This is what `--print-config` prints: the effective value of every
-/// key after the file and the environment were merged, so the operator
-/// can see which value is in force and which one the file would give
-/// without the environment. The admin token and the meow API token are
-/// credentials, and the dump lands in terminals, CI logs and bug
+/// The resolved configuration as TOML, with every credential redacted: this
+/// is what `--print-config` prints, the effective value of every key after
+/// file and environment were merged. The admin token and the meow API token
+/// are credentials, and the dump lands in terminals, CI logs and bug
 /// reports, so they are replaced by a placeholder.
 pub fn dump(config: &AppConfig) -> crate::Result<String> {
     let mut redacted = config.clone();
@@ -749,17 +705,14 @@ pub fn dump(config: &AppConfig) -> crate::Result<String> {
         .map_err(|err| crate::Error::Config(format!("cannot render the configuration: {err}")))
 }
 
-/// Parse a config document body over the built-in defaults and run the
-/// same cross-field validation the loader runs, without the environment
-/// layer.
+/// Parse a config document body over the built-in defaults and run the same
+/// cross-field validation the loader runs, without the environment layer.
 ///
-/// The admin panel writes the file verbatim, so the document it
-/// assembles is checked with the rules the binaries enforce at startup:
-/// a file the loader refuses aborts both of them, so a success toast
-/// for such a file would be a lie.
-///
-/// The environment layer is deliberately left out. `FUMOX_*` may shadow
-/// a broken value in the file for as long as the variable is set, but
+/// The admin panel writes the file verbatim, so the document it assembles is
+/// checked with the rules the binaries enforce at startup: a file the loader
+/// refuses aborts both of them, so a success toast for such a file would be
+/// a lie. The environment layer is deliberately left out: `FUMOX_*` may
+/// shadow a broken value in the file for as long as the variable is set, but
 /// the file is what the next start without those variables reads.
 pub fn parse_document(text: &str) -> crate::Result<AppConfig> {
     let mut config: AppConfig = Figment::from(Serialized::defaults(AppConfig::default()))
@@ -771,13 +724,13 @@ pub fn parse_document(text: &str) -> crate::Result<AppConfig> {
 }
 /// Which forwarding header the trusted reverse proxy writes.
 ///
-/// The declaration is the contract: a header the operator has not named
-/// is never honored, whoever sent it. Without the declaration a client
-/// picks its own rate-limit key: it sends `X-Forwarded-For: 9.9.9.9` and
-/// `Forwarded: for=9.9.9.9` beside a proxy that writes one header and
-/// passes the other through, and the pair agrees, so the forged address
-/// looks confirmed. `None` (the default) resolves every forwarded header
-/// to the peer address.
+/// The declaration is the contract: a header the operator has not named is
+/// never honored, whoever sent it. Without the declaration a client picks
+/// its own rate-limit key: it sends `X-Forwarded-For: 9.9.9.9` and
+/// `Forwarded: for=9.9.9.9` beside a proxy that writes one header and passes
+/// the other through, and the pair agrees, so the forged address looks
+/// confirmed. `None` (the default) resolves every forwarded header to the
+/// peer address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustedHeader {
@@ -841,11 +794,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub trust_proxy_header: TrustedHeader,
     /// Hostnames / IPs allowed to reach the public listener. Empty = accept
-    /// any host (today's behavior); setting this locks the
-    /// alive-export endpoint to the operator's own hostname. An entry is a
-    /// DNS name, an IPv4 literal or an IPv6 literal in brackets; a port an
-    /// entry spells is ignored — entries are matched by host only, on any
-    /// port, and the server logs a warning for entries that name one.
+    /// any host (today's behavior); setting this locks the alive-export
+    /// endpoint to the operator's own hostname. An entry is a DNS name, an
+    /// IPv4 literal or an IPv6 literal in brackets; a port an entry spells is
+    /// ignored, entries are matched by host only, on any port, and the
+    /// server logs a warning for entries that name one.
     #[serde(default = "defaults::allowed_hosts")]
     pub allowed_hosts: Vec<String>,
     /// Hard ceiling on the rows one `/export/alive` / `/export/ready` body
@@ -853,9 +806,8 @@ pub struct ServerConfig {
     /// and `/src`, which a profile's `limit.count` and a source pipeline
     /// already bound, the two export links have no upstream cap, so without
     /// one a large pool would turn one public request into an unbounded
-    /// read, render and body. An operator whose tier exceeds the ceiling
-    /// raises it here; the admin badge stays uncapped, so a truncated
-    /// export is always visible as smaller than the tier.
+    /// read, render and body. The admin badge stays uncapped, so a
+    /// truncated export is always visible as smaller than the tier.
     #[serde(default = "defaults::export_max_rows")]
     pub export_max_rows: u32,
 }
@@ -885,21 +837,19 @@ pub struct IngestConfig {
     /// drains the queue at the start of its next cycle, newest first.
     #[serde(default = "defaults::refresh_check_limit")]
     pub refresh_check_limit: u32,
-    /// Whether pipeline `drop` rules switch off the alive-linger link
-    /// policy for their source. `true` (the default): an alive proxy of
-    /// a source with drop rules leaves on the next refresh after the rule
-    /// catches it. `false`: the probe alone retires proxies, every source
-    /// lingers, even ones with drop rules, so a rule added later only
-    /// stops new matches, never stored ones.
+    /// Whether pipeline `drop` rules switch off the alive-linger link policy
+    /// for their source. `true` (the default): an alive proxy of a source
+    /// with drop rules leaves on the next refresh after the rule catches it.
+    /// `false`: the probe alone retires proxies, every source lingers, so a
+    /// rule added later only stops new matches, never stored ones.
     #[serde(default = "defaults::drop_gate")]
     pub drop_gate: bool,
-    /// Revive a `removed` proxy the feed still carries: on the next
-    /// refresh of a source containing it, the row resets to the pristine
-    /// `unknown` state (fail_count and quarantine schedules cleared, same
-    /// as the admin "reset status" action) and re-enters the probe cycle.
-    /// `false` (the default) keeps `removed` terminal, the only ways back
-    /// are the admin "reset status" action or «purge removed» followed by
-    /// a re-insert from a fetch.
+    /// Revive a `removed` proxy the feed still carries: on the next refresh
+    /// of a source containing it, the row resets to the pristine `unknown`
+    /// state (fail_count and quarantine schedules cleared, same as the admin
+    /// "reset status" action) and re-enters the probe cycle. `false` (the
+    /// default) keeps `removed` terminal, the only ways back are the admin
+    /// "reset status" action or «purge removed» followed by a re-insert.
     #[serde(default = "defaults::removed_as_unknown")]
     pub removed_as_unknown: bool,
 }
@@ -932,28 +882,25 @@ pub enum SynchronousMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
-    /// Path to the SQLite database file.
     #[serde(default = "defaults::database_path")]
     pub path: PathBuf,
     /// `busy_timeout` in milliseconds applied to every connection.
     #[serde(default = "defaults::busy_timeout_ms")]
     pub busy_timeout_ms: u32,
-    /// Maximum number of connections in the pool.
     #[serde(default = "defaults::max_connections")]
     pub max_connections: u32,
-    /// Durability level handed to SQLite. The default (`normal`) is the
+    /// Durability level handed to SQLite; the default (`normal`) is the
     /// recommended mode for WAL.
     #[serde(default = "defaults::synchronous")]
     pub synchronous: SynchronousMode,
-    /// Whether a migration whose stored checksum no longer matches the
-    /// file on disk may be re-stamped in place at startup.
-    ///
-    /// Off by default. sqlx hashes the whole migration file, so a
-    /// comment edit and a DDL edit are indistinguishable from here, and a
-    /// silent re-stamp hides a schema that fell behind the files. With
-    /// the flag off the boot stops and names the version; the operator
-    /// then runs the `repair_migration_checksums` utility, or turns the
-    /// flag on for that run.
+    /// Whether a migration whose stored checksum no longer matches the file
+    /// on disk may be re-stamped in place at startup. Off by default: sqlx
+    /// hashes the whole migration file, so a comment edit and a DDL edit are
+    /// indistinguishable from here, and a silent re-stamp hides a schema
+    /// that fell behind the files. With the flag off the boot stops and
+    /// names the version; the operator then runs the
+    /// `repair_migration_checksums` utility, or turns the flag on for that
+    /// run.
     #[serde(default = "defaults::allow_checksum_repair")]
     pub allow_checksum_repair: bool,
 }
@@ -1028,13 +975,12 @@ pub struct GeoConfig {
     /// Master switch for geo enrichment.
     #[serde(default = "defaults::geo_enabled")]
     pub enabled: bool,
-    /// Legacy selector from the one-database era. No longer affects
-    /// resolution (every database in `db_dir` is merged) and is not read
-    /// by any code; the key is still accepted so existing config files
-    /// keep parsing, and it no longer round-trips into saved config.
-    /// `doc(hidden)`: the field is public only so struct literals with
-    /// `..Default::default()` compile outside this crate: there is
-    /// nothing to do with a value of type `()`.
+    /// Legacy selector from the one-database era, no longer read by any code
+    /// (every database in `db_dir` is merged); the key is still accepted so
+    /// existing config files keep parsing, and it no longer round-trips into
+    /// saved config. `doc(hidden)`: the field is public only so struct
+    /// literals with `..Default::default()` compile outside this crate,
+    /// there is nothing to do with a value of type `()`.
     #[doc(hidden)]
     #[serde(default, skip_serializing, deserialize_with = "de_ignore_legacy")]
     pub db: (),
@@ -1045,9 +991,9 @@ pub struct GeoConfig {
     #[serde(default = "defaults::geo_cache_max_entries")]
     pub cache_max_entries: u64,
     /// How long a host→geo verdict (a positive one and a no-record one
-    /// alike) stays cached, in seconds. Six hours by default, matching
-    /// the periodic geo backfill's cadence; entries expire, so a host
-    /// that comes back is resolved again without a restart.
+    /// alike) stays cached, in seconds. Six hours by default, matching the
+    /// periodic geo backfill's cadence; entries expire, so a host that
+    /// comes back is resolved again without a restart.
     #[serde(default = "defaults::geo_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
     /// Timeout for the async DNS resolution step.
@@ -1058,8 +1004,8 @@ pub struct GeoConfig {
     /// backfill of the geo columns that runs after it: both are startup
     /// work the public surface should not wait on. Past the budget the
     /// download keeps running in the background (the file is installed by
-    /// an atomic rename) and this run simply runs without geo enrichment
-    /// until the next start.
+    /// an atomic rename) and this run runs without geo enrichment until
+    /// the next start.
     #[serde(default = "defaults::geo_startup_download_budget_secs")]
     pub startup_download_budget_secs: u64,
     /// Whether the databases are downloaded at all. Off means the operator
@@ -1067,10 +1013,9 @@ pub struct GeoConfig {
     /// copy, a read-only volume) and fumox never writes into `db_dir`.
     #[serde(default = "defaults::geo_auto_download")]
     pub auto_download: bool,
-    /// Mirror URLs per database file name (`GeoLite2-City.mmdb` → URL).
-    /// The built-in values point at the public release assets; an operator
-    /// points them at another mirror by name, which is an operational
-    /// decision rather than a release.
+    /// Mirror URLs per database file name (`GeoLite2-City.mmdb` → URL). The
+    /// built-in values point at the public release assets; an operator
+    /// points them at another mirror by name.
     #[serde(default = "defaults::geo_download_urls")]
     pub download_urls: BTreeMap<String, String>,
     /// Expected SHA-256 per database file name. A file whose checksum is
@@ -1080,14 +1025,13 @@ pub struct GeoConfig {
     pub sha256: BTreeMap<String, String>,
 }
 
-/// Serde landing place for config keys the code no longer reads (the
-/// legacy `[geo].db`): any value is accepted and discarded, so old
-/// config files keep parsing and a saved file never carries the key.
-///
-/// An empty value is the historical "unset" spelling and passes without a
-/// word. A non-empty one is a setting the operator wrote, and a silently
-/// ignored setting is one that never takes effect: it gets a warning
-/// naming where the geo data really comes from now.
+/// Serde landing place for config keys the code no longer reads (the legacy
+/// `[geo].db`): any value is accepted and discarded, so old config files
+/// keep parsing and a saved file never carries the key. An empty value is
+/// the historical "unset" spelling and passes without a word; a non-empty
+/// one is a setting the operator wrote, and a silently ignored setting is
+/// one that never takes effect, so it gets a warning naming where the geo
+/// data really comes from now.
 fn de_ignore_legacy<'de, D>(deserializer: D) -> Result<(), D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1134,12 +1078,11 @@ impl GeoConfig {
     }
 
     /// How long startup may block on the GeoLite2 download before the
-    /// listeners bind without geo enrichment.
-    ///
-    /// Capped at [`MAX_STARTUP_DOWNLOAD_BUDGET_SECS`]: the budget is the
-    /// time the public surface is unavailable, and no mirror is worth five
-    /// minutes of that. A hand-edited config file above the cap is clamped
-    /// rather than rejected, so an existing installation still starts.
+    /// listeners bind without geo enrichment. Capped at
+    /// [`MAX_STARTUP_DOWNLOAD_BUDGET_SECS`]: the budget is the time the
+    /// public surface is unavailable, and no mirror is worth five minutes
+    /// of that. A hand-edited config file above the cap is clamped rather
+    /// than rejected, so an existing installation still starts.
     pub fn startup_download_budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.startup_download_budget_secs
@@ -1148,29 +1091,24 @@ impl GeoConfig {
     }
 }
 
-/// The upper bound of `[geo].startup_download_budget_secs`.
-///
-/// The budget is the time the public surface waits for the GeoLite2
-/// download. Five minutes is already far more than a mirror needs, and
-/// every second of it is a second in which the instance answers no
-/// request.
+/// The upper bound of `[geo].startup_download_budget_secs`: the budget is
+/// the time the public surface waits for the GeoLite2 download, and every
+/// second of it is a second in which the instance answers no request.
 pub const MAX_STARTUP_DOWNLOAD_BUDGET_SECS: u64 = 300;
 
 /// Settings of the address policy, the gate every untrusted host passes
-/// before it may be dialed.
-///
-/// The section exists because the SSRF pipeline resolves a feed-supplied
-/// host before the probe or the fetcher may connect to it, and that
-/// resolution belongs to the address policy, not to the geo enrichment
-/// (which resolves the same names for a different reason: to label them).
+/// before it may be dialed. The section exists because the SSRF pipeline
+/// resolves a feed-supplied host before the probe or the fetcher may
+/// connect to it, and that resolution belongs to the address policy, not to
+/// the geo enrichment (which resolves the same names for a different
+/// reason: to label them).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Upper bound for the DNS resolution step of the SSRF pipeline.
-    ///
-    /// `0` = follow `[geo].dns_timeout_secs`. The effective bound is never
-    /// below one second: a zero timeout would fail every resolution
-    /// instantly, which is a misconfiguration, not a policy.
+    /// Upper bound for the DNS resolution step of the SSRF pipeline. `0` =
+    /// follow `[geo].dns_timeout_secs`. The effective bound is never below
+    /// one second: a zero timeout would fail every resolution instantly,
+    /// which is a misconfiguration, not a policy.
     #[serde(default = "defaults::network_dns_timeout_secs")]
     pub dns_timeout_secs: u64,
 }
@@ -1204,10 +1142,9 @@ impl GeoDbKind {
     }
 }
 
-/// Admin panel settings. An empty `token` disables the
-/// admin listener entirely (it answers 404).
-/// Built-in default of `[admin].token` is the empty string: the panel
-/// stays off until an operator sets a token explicitly.
+/// Built-in default of `[admin].token`, the empty string: the panel stays
+/// off until an operator sets a token explicitly (an empty `token` disables
+/// the admin listener entirely, it answers 404).
 pub const DEFAULT_ADMIN_TOKEN: &str = "change-me";
 
 /// Placeholder value that shipped in older releases. It is treated as
@@ -1261,10 +1198,10 @@ pub struct AdminConfig {
     #[serde(default)]
     pub trust_proxy_header: TrustedHeader,
     /// Hostnames / IPs allowed to reach the admin listener. Empty = accept
-    /// any host (today's behavior). An entry is a DNS name, an IPv4
-    /// literal or an IPv6 literal in brackets; a port an entry spells is
-    /// ignored — entries are matched by host only, on any port, and the
-    /// server logs a warning for entries that name one.
+    /// any host (today's behavior). An entry is a DNS name, an IPv4 literal
+    /// or an IPv6 literal in brackets; a port an entry spells is ignored,
+    /// entries are matched by host only, on any port, and the server logs a
+    /// warning for entries that name one.
     #[serde(default = "defaults::allowed_hosts")]
     pub allowed_hosts: Vec<String>,
 }
@@ -1291,9 +1228,9 @@ impl Default for AdminConfig {
 impl fmt::Debug for AdminConfig {
     /// A hand-written `Debug` impl, because the token is a credential and
     /// the derived one would print it: `{:?}` of the whole [`AppConfig`]
-    /// and of [`LoadedConfig`] delegate to the fields' `Debug`, so the
-    /// secret never reaches a debug log or a panic message any more than
-    /// it reaches `--print-config` (see [`dump`]).
+    /// delegates to the fields' `Debug`, so the secret never reaches a debug
+    /// log or a panic message any more than it reaches `--print-config` (see
+    /// [`dump`]).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AdminConfig")
             .field("enabled", &self.enabled)
@@ -1313,11 +1250,9 @@ impl fmt::Debug for AdminConfig {
 }
 
 impl AdminConfig {
-    /// The panel is active only when enabled and a real token is set.
-    ///
-    /// Both an empty token and the historical `"change-me"` placeholder
-    /// count as "no token": the listener is not started and the panel
-    /// answers 404.
+    /// The panel is active only when enabled and a real token is set: both
+    /// an empty token and the historical `"change-me"` placeholder count as
+    /// "no token", the listener is not started and the panel answers 404.
     pub fn is_active(&self) -> bool {
         self.enabled && !self.token.is_empty() && self.token != PLACEHOLDER_ADMIN_TOKEN
     }
@@ -1330,14 +1265,12 @@ impl AdminConfig {
     }
 
     /// True when the panel is live, reachable from outside the host, and
-    /// sends its session cookie without the `Secure` attribute.
-    ///
-    /// A cookie without `Secure` travels in clear text on every request,
-    /// so anyone on the path can read the session token. The check is a
-    /// warning and not an error: a plain-HTTP deployment is legitimate
-    /// when the panel sits behind a TLS-terminating proxy that the
-    /// browser reaches over HTTPS, and forcing `Secure` there would
-    /// make the browser drop the cookie and lock the operator out.
+    /// sends its session cookie without the `Secure` attribute, which
+    /// travels in clear text on every request. The check is a warning and
+    /// not an error: a plain-HTTP deployment is legitimate when the panel
+    /// sits behind a TLS-terminating proxy that the browser reaches over
+    /// HTTPS, and forcing `Secure` there would make the browser drop the
+    /// cookie and lock the operator out.
     pub fn insecure_cookies_on_a_public_bind(&self) -> bool {
         self.is_active() && !self.secure_cookies && !self.bind.ip().is_loopback()
     }
@@ -1358,10 +1291,9 @@ pub struct ProbeConfig {
     pub fail_limit: u32,
     /// When `false` (the default), the daemon refuses to dial proxy hosts
     /// that resolve to loopback / RFC1918 / link-local (cloud metadata) /
-    /// CGNAT / unique-local addresses:
-    /// proxy hosts come from remote feeds, and without this gate a hostile
-    /// feed turns the probe into an internal port scanner. A refusal is
-    /// journaled as a *failed check*, so a
+    /// CGNAT / unique-local addresses: proxy hosts come from remote feeds,
+    /// and without this gate a hostile feed turns the probe into an internal
+    /// port scanner. A refusal is journaled as a *failed check*, so a
     /// blocked target walks the ordinary fail ladder instead of clogging
     /// the queues. Mirrors `[admin].allow_private_urls` of the fetcher.
     #[serde(default)]
@@ -1410,12 +1342,10 @@ pub struct ProbeConfig {
     #[serde(default = "defaults::backlog_target_drain_minutes")]
     pub backlog_target_drain_minutes: u64,
     /// The key moved to `[ingest].refresh_check_limit`: the queue is the
-    /// scheduler's, the probe only drains it. The old name is accepted
-    /// for one release so an upgrade from a config that still carries it
-    /// does not turn into a refusal to start: the value is carried over
-    /// to the new key when the new key still holds its default, and a
-    /// warning names the key to rename. `skip_serializing` keeps the
-    /// dead knob out of a written config.
+    /// scheduler's, the probe only drains it. The old name is accepted for
+    /// one release so an upgrade does not turn into a refusal to start, see
+    /// [`AppConfig::apply_moved_keys`]. `skip_serializing` keeps the dead
+    /// knob out of a written config.
     #[doc(hidden)]
     #[serde(default, skip_serializing)]
     pub refresh_check_limit: Option<u32>,
@@ -1451,16 +1381,14 @@ pub struct MeowConfig {
     /// meow-rs REST API address (`host:port`).
     #[serde(default = "defaults::meow_api_addr")]
     pub api_addr: String,
-    /// Bearer token for the meow-rs external-controller.
-    ///
-    /// The controller can reconfigure the proxy kernel and read its
-    /// state, so it is only safe on a network nobody else reaches. A
-    /// non-empty value makes it answer `401` to a request without the
-    /// matching `Authorization: Bearer <token>` header, which is the
-    /// difference between "reachable" and "usable" for anyone who gets
-    /// past the network boundary. Empty (the default) keeps the
-    /// controller unauthenticated, which is only acceptable when the
-    /// port is not published at all.
+    /// Bearer token for the meow-rs external-controller, which can
+    /// reconfigure the proxy kernel and read its state, so it is only safe
+    /// on a network nobody else reaches. A non-empty value makes it answer
+    /// `401` to a request without the matching `Authorization: Bearer
+    /// <token>` header, the difference between "reachable" and "usable" for
+    /// anyone past the network boundary. Empty (the default) keeps the
+    /// controller unauthenticated, only acceptable when the port is not
+    /// published at all.
     #[serde(default = "defaults::meow_api_token")]
     pub api_token: String,
     /// Clash YAML config path generated by the probe and reloaded via
@@ -1484,11 +1412,10 @@ pub struct MeowConfig {
     /// Upper bound of the meow-rs retry backoff.
     #[serde(default = "defaults::meow_backoff_max_secs")]
     pub backoff_max_secs: u64,
-    /// Resolve the T2 test URL over IPv4 only (meow-rs' own default).
-    ///
-    /// Only the *test URL* host is resolved through meow (proxy servers
-    /// are pinned to an IP literal), so this matters solely on IPv6-only
-    /// egress or an AAAA-only test URL.
+    /// Resolve the T2 test URL over IPv4 only (meow-rs' own default). Only
+    /// the *test URL* host is resolved through meow (proxy servers are
+    /// pinned to an IP literal), so this matters solely on IPv6-only egress
+    /// or an AAAA-only test URL.
     #[serde(default = "defaults::meow_ipv6")]
     pub ipv6: bool,
 }
@@ -1511,9 +1438,9 @@ impl Default for MeowConfig {
 impl fmt::Debug for MeowConfig {
     /// A hand-written `Debug` impl, because the token is a credential and
     /// the derived one would print it: `{:?}` of the whole [`AppConfig`]
-    /// and of [`LoadedConfig`] delegate to the fields' `Debug`, so the
-    /// secret never reaches a debug log or a panic message any more than
-    /// it reaches `--print-config` (see [`dump`]).
+    /// delegates to the fields' `Debug`, so the secret never reaches a debug
+    /// log or a panic message any more than it reaches `--print-config` (see
+    /// [`dump`]).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MeowConfig")
             .field("api_addr", &self.api_addr)
@@ -1541,10 +1468,10 @@ pub struct RetentionConfig {
     pub fetch_log_days: u32,
     /// Physically delete proxies that have sat in the `removed` status for
     /// this many days (the server-side retention sweep; the probe daemon's
-    /// authorizer forbids proxy deletion, so the purge is server-only).
-    /// `0` disables it: `removed` stays reversible until the admin presses
-    /// «purge removed», the behavior every deployment had before this
-    /// window existed.
+    /// authorizer forbids proxy deletion, so the purge is server-only). `0`
+    /// disables it: `removed` stays reversible until the admin presses
+    /// «purge removed», the behavior every deployment had before this window
+    /// existed.
     #[serde(default = "defaults::removed_proxies_days")]
     pub removed_proxies_days: u32,
 }
@@ -1583,10 +1510,10 @@ impl LogLevel {
         }
     }
 
-    /// Every level as its wire string. This is the closed set the serde
-    /// deserializer accepts, so it is also what the admin settings editor
-    /// validates its dropdowns against — the strings here and the
-    /// deserializer's vocabulary must not drift.
+    /// Every level as its wire string: the closed set the serde deserializer
+    /// accepts, so it is also what the admin settings editor validates its
+    /// dropdowns against, and the strings here and the deserializer's
+    /// vocabulary must not drift.
     pub const ALL_AS_STR: &'static [&'static str] = &["error", "warn", "info", "debug", "trace"];
 }
 
@@ -1605,7 +1532,7 @@ pub struct LogConfig {
 }
 
 /// `[meow].test_url`: a single URL, a comma-separated string, or a sequence
-/// of URLs. Blank entries are dropped, and the list must not end up empty ,
+/// of URLs. Blank entries are dropped, and the list must not end up empty,
 /// the T2 check has nothing to fetch otherwise. Every entry has to be an
 /// absolute `http(s)` URL with a host: meow-rs fetches it on the proxy's
 /// side, so a `file://` entry or a hostless path would turn the tunnel
@@ -1640,7 +1567,7 @@ where
     }
 
     // Comma-splitting applies to array items too, so `FUMOX_MEOW__TEST_URL`
-    // overrides stay possible with several endpoints (env values are strings).
+    // overrides stay possible with several endpoints (env values are strings)
     fn split_urls(value: &str) -> impl Iterator<Item = String> + '_ {
         value
             .split(',')
@@ -1738,7 +1665,7 @@ impl FromStr for RateLimit {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         // A bare integer means "requests per minute", the same reading the
-        // deserializer gives a TOML integer.
+        // deserializer gives a TOML integer
         if let Ok(limit) = s.parse::<u32>() {
             return Ok(Self::new(limit, Duration::from_secs(60)));
         }
@@ -1757,7 +1684,7 @@ impl FromStr for RateLimit {
             "d" | "day" => 86400,
             // The seconds form `N/<n>sec` is what `Display` prints for a
             // window that is none of the four canonical ones, so it has to
-            // parse back to the same window.
+            // parse back to the same window
             other => other
                 .strip_suffix("sec")
                 .and_then(|n| n.trim().parse::<u64>().ok())
@@ -1810,7 +1737,7 @@ impl<'de> Deserialize<'de> for RateLimit {
             }
 
             // figment's TOML pipeline delivers integers as `i64`, not `u64`
-            // like serde_json: without this a bare `rate_limit = 300` broke boot.
+            // like serde_json: without this a bare `rate_limit = 300` broke boot
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RateLimit, E> {
                 let v = u64::try_from(v).map_err(serde::de::Error::custom)?;
                 self.visit_u64(v)
@@ -1824,29 +1751,20 @@ impl<'de> Deserialize<'de> for RateLimit {
 /// The value range one numeric setting accepts.
 ///
 /// These bounds are what the *editor* enforces, what the settings form
-/// advertises and what the loader refuses at startup, not a promise
-/// about what the running code can survive. They live here, next to the
-/// config they describe, because they used to live in three places at
-/// once: as literal arguments in the save handler, as `min`/`max`
-/// attributes in the template, and as prose in `config/app.toml`. One
-/// table, three consumers.
+/// advertises and what the loader refuses at startup, not a promise about
+/// what the running code can survive. One table, three consumers, next to
+/// the config they describe (they used to live in three places at once).
 ///
-/// **Composite fields.** A setting the config stores as one string but
-/// the form edits as two inputs (a rate limit: `N/unit`) appears under
-/// the path of the *edited* input with a `.limit` suffix:
-/// `server.rate_limit.limit`. The stored key is `server.rate_limit`;
-/// the suffix names the half of the pair the bound applies to. The
-/// editor and the loader both read the table through this convention,
+/// **Composite fields.** A setting the config stores as one string but the
+/// form edits as two inputs (a rate limit: `N/unit`) appears under the path
+/// of the *edited* input with a `.limit` suffix: `server.rate_limit.limit`.
+/// The editor and the loader both read the table through this convention,
 /// so a bound and the field it guards cannot drift apart.
 pub mod bounds {
-    /// Ceiling on `[fetch].max_response_bytes`: 256 MiB.
-    ///
-    /// The fetcher buffers the body of a subscription page in memory, so
-    /// an unbounded value is an unbounded allocation, and the editor
-    /// writes integers into a TOML document, so the value has to
-    /// survive an `i64` with room to spare. 256 MiB is far above any
-    /// real subscription page and far below the memory a single fetch
-    /// may take.
+    /// Ceiling on `[fetch].max_response_bytes`: 256 MiB. The fetcher buffers
+    /// a subscription page in memory, so an unbounded value is an unbounded
+    /// allocation, and the editor writes integers into a TOML document, so
+    /// the value has to survive an `i64` with room to spare.
     pub const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
     /// Steps of the quarantine recheck ladder. Past this the ladder is
@@ -1906,14 +1824,14 @@ pub mod bounds {
         ),
         ("geo.cache_max_entries", Range::new(0, 10_000_000)),
         // One second .. 30 days; a zero TTL would expire every entry
-        // immediately and turn the cache off without saying so.
+        // immediately and turn the cache off without saying so
         ("geo.cache_ttl_secs", Range::new(1, 30 * 24 * 3600)),
         ("geo.dns_timeout_secs", Range::new(1, 60)),
         (
             "geo.startup_download_budget_secs",
             Range::new(0, super::MAX_STARTUP_DOWNLOAD_BUDGET_SECS),
         ),
-        // 0 = follow [geo].dns_timeout_secs.
+        // 0 = follow [geo].dns_timeout_secs
         ("network.dns_timeout_secs", Range::new(0, 60)),
         ("admin.session_ttl_hours", Range::new(1, 24 * 365)),
         ("admin.rate_limit.limit", Range::new(1, 1_000_000)),
@@ -1934,7 +1852,7 @@ pub mod bounds {
         // window, so the concurrent tasks multiply the file descriptors
         // the process needs. Past a few hundred the default ulimit -n
         // (1024) is the real ceiling, and a config the daemon cannot
-        // honor is worse than one it refuses.
+        // honor is worse than one it refuses
         ("probe.concurrency", Range::new(1, 128)),
         ("probe.heartbeat_interval_secs", Range::new(1, 24 * 3600)),
         ("probe.backlog_target_drain_minutes", Range::new(5, 24 * 60)),
@@ -1945,7 +1863,7 @@ pub mod bounds {
         ("retention.fetch_log_days", Range::new(1, 3650)),
         // 0 = off: the automatic purge of `removed` proxies is opt-in,
         // unlike the two journal windows above, where 0 would wipe the
-        // whole table and is clamped to one day instead.
+        // whole table and is clamped to one day instead
         ("retention.removed_proxies_days", Range::new(0, 3650)),
         ("server.export_max_rows", Range::new(1, 10_000_000)),
         ("server.rate_limit.limit", Range::new(1, 1_000_000)),
@@ -1987,17 +1905,14 @@ pub mod bounds {
     }
 }
 
-/// Built-in default values. Every config key has one.
-///
-/// Most defaults live in the functions below and are named in each
-/// field's `serde(default = ...)` attribute. The exceptions are the
-/// fields with an implicit default, and each of them is deliberate:
-/// `admin.allow_private_urls`, `admin.secure_cookies` and
-/// `probe.allow_private_targets` default to `false` — the safe side of
-/// each security toggle, turning a protection on is never the fallback —
-/// `fetch.ip_family` defaults to `IpFamily::default()` (`any`), and the
-/// `[log]` levels default to `LogLevel::default()` (`info`), all via
-/// `#[serde(default)]` on the field or the `Default` impl of the section.
+/// Built-in default values. Every config key has one. Most live in the
+/// functions below and are named in each field's `serde(default = ...)`
+/// attribute. The implicit defaults are deliberate: `admin.allow_private_urls`,
+/// `admin.secure_cookies` and `probe.allow_private_targets` default to
+/// `false`, the safe side of each security toggle (turning a protection on
+/// is never the fallback); `fetch.ip_family` defaults to `any` and the
+/// `[log]` levels to `info`, via `#[serde(default)]` on the field or the
+/// `Default` impl of the section.
 mod defaults {
     use super::*;
 
@@ -2182,7 +2097,7 @@ mod defaults {
         86400
     }
     pub fn recheck_delays_secs() -> Vec<i64> {
-        // defaults: +15m, +30m, +1h after the failed second chance.
+        // defaults: +15m, +30m, +1h after the failed second chance
         vec![15 * 60, 30 * 60, 60 * 60]
     }
     pub const fn queue_stale_days() -> u64 {
@@ -2214,19 +2129,18 @@ mod defaults {
         PathBuf::from("config/meow.yaml")
     }
     pub fn meow_test_url() -> Vec<String> {
-        // One endpoint, not a list. The probe draws the URL once per
-        // (sub-)batch (see `fumox-probe`'s `batch_test_url`), so a list
-        // only ever widened the ways a whole batch could fail; seven
-        // addresses of one
-        // vendor made that worse, because a region where that vendor is
-        // blocked failed every proxy at once. This endpoint answers 204
-        // and is not tied to one account; operators whose egress cannot
-        // reach it set `[meow].test_url` to a URL of their own.
+        // One endpoint, not a list: the probe draws the URL once per
+        // (sub-)batch (see `fumox-probe`'s `batch_test_url`), so a list only
+        // widened the ways a whole batch could fail, and seven addresses of
+        // one vendor made that worse, because a region where that vendor is
+        // blocked failed every proxy at once. This endpoint answers 204 and
+        // is not tied to one account; operators whose egress cannot reach it
+        // set `[meow].test_url` to a URL of their own
         //
-        // HTTPS, not HTTP: the request is made by the proxy under test,
-        // so a hostile proxy could answer a plaintext request itself and
-        // the check would read that forgery as a working tunnel. Over TLS
-        // the answer has to come from the real endpoint.
+        // HTTPS, not HTTP: the request is made by the proxy under test, so a
+        // hostile proxy could answer a plaintext request itself and the
+        // check would read that forgery as a working tunnel. Over TLS the
+        // answer has to come from the real endpoint
         vec!["https://www.gstatic.com/generate_204".to_string()]
     }
     pub const fn meow_timeout_secs() -> u64 {
@@ -2250,10 +2164,9 @@ mod defaults {
 mod tests {
     use super::*;
 
-    /// The admin writer checks the document it assembles with this
-    /// parser, and the operator has to learn which key is wrong: an
-    /// error that only says "invalid config" sends them looking
-    /// through the whole file.
+    /// The admin writer checks the document it assembles with this parser,
+    /// and the error has to name the offending key, not just "invalid
+    /// config".
     #[test]
     fn parse_document_names_the_offending_key() {
         let err = parse_document("[server]\nbynd = \"0.0.0.0:8080\"\n")
@@ -2265,9 +2178,9 @@ mod tests {
         );
     }
 
-    /// A document the loader accepts must survive the parser too: the
-    /// writer refuses everything this parser refuses, so a drift here
-    /// would refuse every save.
+    /// A document the loader accepts must survive the parser too: the writer
+    /// refuses everything this parser refuses, so a drift here would refuse
+    /// every save.
     #[test]
     fn parse_document_accepts_what_the_loader_accepts() {
         let cfg = parse_document("[server]\nbind = \"127.0.0.1:9999\"\n")
@@ -2278,11 +2191,11 @@ mod tests {
     #[test]
     fn defaults_load_without_file() {
         // The env-pointer must not leak from other tests into this one:
-        // `defaults_load_without_file` asserts the built-in defaults.
+        // `defaults_load_without_file` asserts the built-in defaults
         let _guard = env_mutex().lock();
         // SAFETY: every touch of FUMOX_CONFIG across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe { std::env::remove_var(CONFIG_PATH_ENV) };
 
         let cfg = load_config(None).expect("defaults must load");
@@ -2293,13 +2206,13 @@ mod tests {
         assert_eq!(cfg.log.server, LogLevel::Info);
         assert_eq!(cfg.log.probe, LogLevel::Info);
         // The built-in defaults carry no admin token: the panel is off
-        // until an operator sets one explicitly.
+        // until an operator sets one explicitly
         assert_eq!(cfg.admin.token, "");
         assert!(!cfg.admin.is_active());
         assert!(cfg.admin.enabled);
         // Ingest defaults: the drop gate is on (a source with drop rules
         // detaches what its rules would have discarded) and the
-        // priority-probe queue is enabled.
+        // priority-probe queue is enabled
         assert!(cfg.ingest.drop_gate);
         assert_eq!(cfg.ingest.refresh_check_limit, 50);
     }
@@ -2318,11 +2231,10 @@ mod tests {
         assert!(cfg.ingest.drop_gate);
         assert_eq!(cfg.ingest.refresh_check_limit, 10);
 
-        // The keys moved house. `drop_gate` has no old spelling left, so
-        // the old section still refuses it. `refresh_check_limit` keeps
-        // its old name for one release: the value is carried over
-        // instead of the file being refused, so an upgrade does not turn
-        // into a server that will not start.
+        // The keys moved house: `drop_gate` has no old spelling left, so the
+        // old section still refuses it. `refresh_check_limit` keeps its old
+        // name for one release, the value is carried over instead of the
+        // file being refused
         std::fs::write(&file, "[server]\ndrop_gate = true\n").unwrap();
         assert!(load_config_isolated(Some(&file)).is_err());
         std::fs::write(&file, "[probe]\nrefresh_check_limit = 10\n").unwrap();
@@ -2370,17 +2282,11 @@ mod tests {
         MUTEX.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    /// [`load_config`] with the process environment held still.
-    ///
-    /// The loader reads `FUMOX_*` from the environment, and the
-    /// environment belongs to the whole process: a test that sets one of
-    /// those variables leaks it into every test that runs next, whether
-    /// that test asked for it or not. A leaked `FUMOX_SERVER__BIND`
-    /// changes what the next test believes it loaded.
-    ///
-    /// The lock is not reentrant, so a test that manipulates the
-    /// environment itself takes the guard and calls [`load_config`]
-    /// directly.
+    /// [`load_config`] with the process environment held still: a test that
+    /// sets a `FUMOX_*` variable leaks it into every test that runs next,
+    /// and a leaked `FUMOX_SERVER__BIND` changes what the next test believes
+    /// it loaded. The lock is not reentrant, so a test that manipulates the
+    /// environment itself takes the guard and calls [`load_config`] directly.
     fn load_config_isolated(path: Option<&Path>) -> crate::Result<AppConfig> {
         let _guard = env_mutex().lock();
         load_config(path)
@@ -2399,7 +2305,7 @@ mod tests {
 
         // SAFETY: every touch of FUMOX_CONFIG across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe { std::env::set_var(CONFIG_PATH_ENV, &file) };
         let cfg = load_config(None).expect("env-pointed file must load");
         assert_eq!(cfg.retention.probe_results_days, 7);
@@ -2408,14 +2314,14 @@ mod tests {
             "untouched keys keep defaults"
         );
 
-        // The explicit flag outranks the variable.
+        // The explicit flag outranks the variable
         let flag_file = dir.join("flag.toml");
         std::fs::write(&flag_file, "[retention]\nprobe_results_days = 5\n").unwrap();
         let cfg = load_config(Some(&flag_file)).expect("the flag must outrank the env pointer");
         assert_eq!(cfg.retention.probe_results_days, 5);
 
-        // A variable naming a missing file is an operator typo, loud.
-        // SAFETY: see above.
+        // A variable naming a missing file is an operator typo, loud
+        // SAFETY: see above
         let missing = dir.join("missing.toml");
         unsafe { std::env::set_var(CONFIG_PATH_ENV, &missing) };
         let err = load_config(None).unwrap_err();
@@ -2425,13 +2331,13 @@ mod tests {
         );
 
         // Empty (or whitespace) value counts as unset, the default
-        // location applies again, exactly like without the variable.
-        // SAFETY: see above.
+        // location applies again, exactly like without the variable
+        // SAFETY: see above
         unsafe { std::env::set_var(CONFIG_PATH_ENV, "   ") };
         let cfg = load_config(None).expect("empty pointer behaves as unset");
         assert_eq!(cfg.retention.probe_results_days, 14);
 
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe {
             std::env::remove_var(CONFIG_PATH_ENV);
             std::fs::remove_dir_all(&dir).ok();
@@ -2453,7 +2359,7 @@ mod tests {
             RateLimit::new(10, Duration::from_secs(3600))
         );
         // A bare integer means "per minute", the same reading the
-        // deserializer gives a TOML integer.
+        // deserializer gives a TOML integer
         assert_eq!(
             "120".parse::<RateLimit>().unwrap(),
             RateLimit::new(120, Duration::from_secs(60))
@@ -2473,7 +2379,7 @@ mod tests {
             RateLimit::new(30, Duration::from_secs(3600)),
             RateLimit::new(7, Duration::from_secs(86400)),
             // A window that is none of the four canonical ones is printed
-            // in the seconds form and has to parse back.
+            // in the seconds form and has to parse back
             RateLimit::new(5, Duration::from_secs(30)),
         ] {
             let text = limit.to_string();
@@ -2525,7 +2431,7 @@ mod tests {
         assert_eq!(single.test_url, ["http://www.gstatic.com/generate_204"]);
 
         // A plain string may carry several URLs comma-separated, this is how
-        // the FUMOX_MEOW__TEST_URL env override can configure rotation.
+        // the FUMOX_MEOW__TEST_URL env override can configure rotation
         let csv: MeowConfig =
             serde_json::from_str(r#"{"test_url": "http://a/204, http://b/204 ,http://c/204"}"#)
                 .unwrap();
@@ -2538,7 +2444,7 @@ mod tests {
             serde_json::from_str(r#"{"test_url": ["http://a/204", "http://b/204"]}"#).unwrap();
         assert_eq!(array.test_url, ["http://a/204", "http://b/204"]);
 
-        // Items of an array may also be comma-separated.
+        // Items of an array may also be comma-separated
         let mixed: MeowConfig =
             serde_json::from_str(r#"{"test_url": ["http://a/204", "http://b/204, http://c/204"]}"#)
                 .unwrap();
@@ -2723,16 +2629,13 @@ probe_results_days = 7
 
     /// Keys the reference file deliberately does not declare. Empty since
     /// the inert one-database-era `[geo].db` selector was dropped from the
-    /// struct (old files still parse: the key is accepted and ignored,
-    /// but it is no longer a config key, so the shipped file that promises
-    /// "every available key" must not declare it either).
+    /// struct: old files still parse (accepted and ignored), but the shipped
+    /// file that promises "every available key" must not declare it either.
     const REFERENCE_FILE_OMISSIONS: &[&str] = &[];
 
-    /// The bounds table is a lookup, so a duplicate key is not a
-    /// compile error: `range_of` would silently return the first one and
-    /// the second would read as a live row that no field ever uses. The
-    /// server-side test proves every row is rendered; this proves there
-    /// is only one row per key, and that no range is inverted.
+    /// The bounds table is a lookup, so a duplicate key is not a compile
+    /// error: `range_of` would silently return the first one. This proves
+    /// there is only one row per key, and that no range is inverted.
     #[test]
     fn bounds_rows_are_unique_and_ordered() {
         let mut seen = std::collections::BTreeSet::new();
@@ -2747,12 +2650,11 @@ probe_results_days = 7
         }
     }
 
-    /// Every bounds key has to be a real config path. The table is keyed
-    /// by the *form field* name, which for the four rate-limit inputs is
-    /// `<path>.limit` (the number half of a number-plus-unit pair)
-    /// while the config itself stores one `RateLimit` under `<path>`.
-    /// That suffix is the only place the two naming schemes differ, so
-    /// it is stripped here rather than pretended away.
+    /// Every bounds key has to be a real config path. The table is keyed by
+    /// the *form field* name, which for the four rate-limit inputs is
+    /// `<path>.limit` (the number half of a number-plus-unit pair) while the
+    /// config stores one `RateLimit` under `<path>`, so the suffix is
+    /// stripped here.
     #[test]
     fn bounds_keys_are_real_config_paths() {
         for (key, _) in bounds::RANGES {
@@ -2767,11 +2669,10 @@ probe_results_days = 7
         }
     }
 
-    /// The bounds table and the list of settings the loader checks are
-    /// two tables. A setting in one and missing from the other is a
-    /// setting nobody bounds: the editor refuses it, the loader accepts
-    /// it, and the operator gets two different answers about the same
-    /// key depending on where the value came from.
+    /// The bounds table and the list of settings the loader checks are two
+    /// tables; a setting in one and missing from the other gets two
+    /// different answers about the same key depending on where the value
+    /// came from.
     #[test]
     fn every_bounded_setting_is_checked_by_the_loader() {
         let checked: std::collections::BTreeSet<&str> = AppConfig::default()
@@ -2798,9 +2699,8 @@ probe_results_days = 7
         );
     }
 
-    /// A value outside its range fails at startup, and the message names
-    /// the key and the bound: an operator who typed the value has to be
-    /// able to find it without reading the source.
+    /// A value outside its range fails at startup, and the message names the
+    /// key and the bound, so the operator who typed the value can find it.
     #[test]
     fn an_out_of_range_value_fails_at_startup() {
         let dir = std::env::temp_dir().join(format!("fumox-cfg-range-{}", std::process::id()));
@@ -2819,7 +2719,7 @@ probe_results_days = 7
             "the error must name the bound: {message}"
         );
 
-        // The zero values the range table forbids.
+        // The zero values the range table forbids
         for (section, body) in [
             ("probe", "sample_size = 0\n"),
             ("admin", "session_ttl_hours = 0\n"),
@@ -2835,7 +2735,7 @@ probe_results_days = 7
         }
 
         // The response-size ceiling: an unbounded body limit is an
-        // unbounded allocation.
+        // unbounded allocation
         std::fs::write(&file, "[fetch]\nmax_response_bytes = 1073741824\n").unwrap();
         let err = load_config_isolated(Some(&file)).unwrap_err();
         assert!(
@@ -2847,8 +2747,8 @@ probe_results_days = 7
     }
 
     /// A trusted-proxy entry that covers the whole internet is a config
-    /// error: the per-IP rate limit would key on a value the caller
-    /// chooses, which is the same as having no per-IP limit at all.
+    /// error: the per-IP rate limit would key on a value the caller chooses,
+    /// which is the same as having no per-IP limit at all.
     #[test]
     fn a_trust_proxy_entry_that_covers_everything_is_refused() {
         let dir = std::env::temp_dir().join(format!("fumox-cfg-cidr-{}", std::process::id()));
@@ -2868,11 +2768,11 @@ probe_results_days = 7
             );
         }
 
-        // An entry that is not an address at all.
+        // An entry that is not an address at all
         std::fs::write(&file, "[server]\ntrust_proxy_ips = [\"not-an-address\"]\n").unwrap();
         assert!(load_config_isolated(Some(&file)).is_err());
 
-        // A plain host prefix and a real CIDR are both fine.
+        // A plain host prefix and a real CIDR are both fine
         for entry in ["10.0.0.1", "10.0.0.0/8", "::1"] {
             std::fs::write(
                 &file,
@@ -2888,9 +2788,8 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The priority queue drains at the rate the probe checks proxies.
-    /// A queue that grows faster than it drains never empties, and the
-    /// proxies an operator waits for sit at the back of it for ever.
+    /// The priority queue drains at the rate the probe checks proxies; a
+    /// queue that grows faster than it drains never empties.
     #[test]
     fn a_refresh_limit_the_probe_cannot_drain_is_refused() {
         let dir = std::env::temp_dir().join(format!("fumox-cfg-queue-{}", std::process::id()));
@@ -2898,7 +2797,7 @@ probe_results_days = 7
         let file = dir.join("app.toml");
 
         // 60 per minute = 3600 per hour, so a limit of 3600 fits and
-        // 3601 does not.
+        // 3601 does not
         std::fs::write(
             &file,
             "[probe]\ncycle_interval_secs = 60\nsample_size = 60\n\
@@ -2923,9 +2822,8 @@ probe_results_days = 7
     }
 
     /// A cycle longer than an hour drains a *fraction* of the sample per
-    /// hour, not zero: 10000 every 7200 s is 5000 rows an hour, so a
-    /// limit of 100 fits. The check must rate the real drain rate, not
-    /// the zero an integer `3600 / cycle` division produces.
+    /// hour, not zero: the check must rate the real drain rate, not the zero
+    /// an integer `3600 / cycle` division produces.
     #[test]
     fn a_refresh_limit_a_slow_cycle_can_drain_is_accepted() {
         let dir = std::env::temp_dir().join(format!("fumox-cfg-queue-slow-{}", std::process::id()));
@@ -2943,7 +2841,7 @@ probe_results_days = 7
         }
 
         // The boundary holds for the slow cycle too: 5000 fits, 5001
-        // does not.
+        // does not
         std::fs::write(
             &file,
             "[probe]\ncycle_interval_secs = 7200\nsample_size = 10000\n\
@@ -2968,16 +2866,15 @@ probe_results_days = 7
     }
 
     /// The shipped `config/app.toml` is the full reference of every available
-    /// key at its default value (owner request 2026-08-30). Guard it against
-    /// rot: whenever a config struct gains a field, the file must gain the
-    /// key too, or this test fails. Values are intentionally not compared ,
-    /// the file doubles as a working deployment config and may override them.
+    /// key at its default value (owner request 2026-08-30). Whenever a config
+    /// struct gains a field, the file must gain the key too, or this test
+    /// fails. Values are intentionally not compared, the file doubles as a
+    /// working deployment config and may override them.
     ///
     /// The key set is read from the file **as TOML text**, not through
     /// `extract::<AppConfig>()`: every field carries a serde default, so a
-    /// deserialized struct is the default set by construction and a key
-    /// deleted from the file reappears filled from that default, the diff
-    /// was empty whatever the file said.
+    /// deserialized struct is the default set by construction and the diff
+    /// would be empty whatever the file said.
     #[test]
     fn shipped_app_toml_covers_every_key() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/app.toml");
@@ -3018,10 +2915,8 @@ probe_results_days = 7
             "config/app.toml declares keys AppConfig does not know (typo, or a renamed key): {unknown:?}"
         );
 
-        // The file is also the deployment config the image ships, so it
-        // has to survive the loader's own checks: a value outside its
-        // range, an unknown key or an unparsable trust list would stop
-        // the server at the first start.
+        // The file is also the deployment config the image ships, so it has
+        // to survive the loader's own checks
         load_config_isolated(Some(&path)).expect("the shipped config must load");
     }
 
@@ -3059,10 +2954,8 @@ probe_results_days = 7
         assert_eq!(cfg.dns_timeout(), std::time::Duration::from_secs(7));
     }
 
-    /// The SSRF pipeline has its own DNS bound: the dedicated
-    /// `[network].dns_timeout_secs` when it is set, the geo key otherwise,
-    /// and never below one second (a zero timeout would fail every
-    /// resolution instantly).
+    /// Pins the SSRF DNS bound: `[network].dns_timeout_secs` when set, the
+    /// geo key otherwise, never below one second.
     #[test]
     fn the_ssrf_dns_timeout_follows_the_geo_key_until_it_is_set() {
         let mut cfg = AppConfig::default();
@@ -3072,28 +2965,27 @@ probe_results_days = 7
         cfg.network.dns_timeout_secs = 9;
         assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(9));
 
-        // The geo key stays the geo enrichment's own bound.
+        // The geo key stays the geo enrichment's own bound
         cfg.geo.dns_timeout_secs = 3;
         assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(9));
         assert_eq!(cfg.geo.dns_timeout(), std::time::Duration::from_secs(3));
 
-        // A zero bound is clamped to one second, never to "no wait".
+        // A zero bound is clamped to one second, never to "no wait"
         cfg.network.dns_timeout_secs = 0;
         cfg.geo.dns_timeout_secs = 0;
         assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(1));
     }
 
-    /// A `FUMOX_*` variable that names no configuration key is a
-    /// mistake, and a silent one: the variable is simply not applied
-    /// and the setting keeps the value the file gave it. The loader
-    /// refuses it and names the key it probably meant.
+    /// A `FUMOX_*` variable that names no configuration key is a silent
+    /// mistake otherwise: the loader refuses it and names the key it
+    /// probably meant.
     #[test]
     fn a_typo_in_an_env_var_is_refused() {
         let _guard = env_mutex().lock();
 
         // SAFETY: every touch of FUMOX_* across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe { std::env::set_var("FUMOX_ADMNI__TOKEN", "secret") };
         let err = load_config(None).unwrap_err();
         let message = err.to_string();
@@ -3105,7 +2997,7 @@ probe_results_days = 7
             message.contains("admin.token"),
             "the error must suggest the key it meant: {message}"
         );
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe { std::env::remove_var("FUMOX_ADMNI__TOKEN") };
 
         assert!(
@@ -3121,14 +3013,14 @@ probe_results_days = 7
         let _guard = env_mutex().lock();
 
         // `FUMOX_CONFIG` is the file pointer, not a setting: it is
-        // covered by `env_pointed_config_file_is_loaded_and_validated`.
+        // covered by `env_pointed_config_file_is_loaded_and_validated`
         for name in NON_CONFIG_ENV_VARS
             .iter()
             .filter(|n| **n != CONFIG_PATH_ENV)
         {
             // SAFETY: every touch of FUMOX_* across the test suite is
             // serialized by `env_mutex`; other threads read the variable
-            // only through the same lock.
+            // only through the same lock
             unsafe { std::env::set_var(name, "1") };
         }
         let loaded = load_config(None);
@@ -3136,7 +3028,7 @@ probe_results_days = 7
             .iter()
             .filter(|n| **n != CONFIG_PATH_ENV)
         {
-            // SAFETY: see above.
+            // SAFETY: see above
             unsafe { std::env::remove_var(name) };
         }
         loaded.expect("the compose variables must not stop the load");
@@ -3178,18 +3070,16 @@ probe_results_days = 7
         );
 
         // An empty token stays empty: the placeholder would suggest a
-        // token is set when none is.
+        // token is set when none is
         let config = AppConfig::default();
         let text = dump(&config).expect("the config must render");
         assert!(!text.contains(REDACTED_ADMIN_TOKEN), "{text}");
     }
 
     /// The legacy `[geo].db` selector no longer exists as a config field:
-    /// old files that still carry the key must keep loading (any value,
-    /// even one the old enum would have refused), and a serialized
-    /// config must not re-emit the dead knob. A non-empty value is a
-    /// setting the operator wrote, so it draws a warning instead of a
-    /// silent ignore; the empty historical "unset" spelling stays silent.
+    /// old files that still carry the key must keep loading (any value), a
+    /// serialized config must not re-emit the dead knob, and a non-empty
+    /// value draws a warning instead of a silent ignore.
     #[test]
     fn legacy_geo_db_key_is_accepted_and_ignored() {
         let dir = std::env::temp_dir().join(format!("fumox-cfg-geodb-{}", std::process::id()));
@@ -3198,15 +3088,15 @@ probe_results_days = 7
         // A value the old `GeoDbKind` would still have accepted…
         std::fs::write(&file, "[geo]\ndb = \"city\"\n").unwrap();
         assert!(load_config_isolated(Some(&file)).is_ok());
-        // …and one it would not: the key is ignored wholesale now.
+        // …and one it would not: the key is ignored wholesale now
         std::fs::write(&file, "[geo]\ndb = 42\n").unwrap();
         assert!(load_config_isolated(Some(&file)).is_ok());
-        // The empty spelling counts as unset and stays warning-free.
+        // The empty spelling counts as unset and stays warning-free
         std::fs::write(&file, "[geo]\ndb = \"\"\n").unwrap();
         assert!(load_config_isolated(Some(&file)).is_ok());
         std::fs::remove_dir_all(&dir).ok();
 
-        // The key must not round-trip back into written config.
+        // The key must not round-trip back into written config
         let json = serde_json::to_value(GeoConfig::default()).unwrap();
         assert!(
             json.get("db").is_none(),
@@ -3215,11 +3105,10 @@ probe_results_days = 7
     }
 
     /// `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`
-    /// when the priority queue became the scheduler's. A config file from
-    /// the release that still carries the old key must keep loading: an
-    /// upgrade that refuses to start is the worst possible outcome of a
-    /// rename. The value comes along, so the queue depth the operator
-    /// chose survives the upgrade too.
+    /// when the priority queue became the scheduler's. An upgrade that
+    /// refuses to start is the worst possible outcome of a rename, so a
+    /// config file from the release that still carries the old key keeps
+    /// loading, and the value comes along.
     #[test]
     fn the_moved_refresh_check_limit_key_is_accepted_and_carried_over() {
         let dir = std::env::temp_dir().join(format!("fumox-cfg-moved-{}", std::process::id()));
@@ -3231,7 +3120,7 @@ probe_results_days = 7
         assert_eq!(loaded.ingest.refresh_check_limit, 7);
 
         // The new key wins when the operator set both: the old name is
-        // the leftover, the new one is the intent.
+        // the leftover, the new one is the intent
         std::fs::write(
             &file,
             "[probe]\nrefresh_check_limit = 7\n[ingest]\nrefresh_check_limit = 3\n",
@@ -3268,20 +3157,20 @@ probe_results_days = 7
 
         // SAFETY: every touch of FUMOX_* across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe { std::env::set_var("FUMOX_PROBE__REFRESH_CHECK_LIMIT", "9") };
         let loaded = load_config(Some(&file)).expect("the old variable must still be accepted");
         assert_eq!(loaded.ingest.refresh_check_limit, 9);
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe { std::env::remove_var("FUMOX_PROBE__REFRESH_CHECK_LIMIT") };
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The startup budget is operator-tunable, not a constant baked into
-    /// the server binary: a mirror that needs longer than the default (or an
-    /// operator willing to boot without geo) must be able to say so in
-    /// `app.toml` or via `FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`.
+    /// The startup budget is operator-tunable, not a constant baked into the
+    /// server binary: a mirror that needs longer than the default must be
+    /// able to say so in `app.toml` or via
+    /// `FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`.
     #[test]
     fn geo_startup_download_budget_is_configurable() {
         let _guard = env_mutex().lock();
@@ -3311,10 +3200,9 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The startup budget is capped: the public surface waits for it, and
-    /// no mirror is worth minutes of an unavailable instance. A value
-    /// above the cap (a hand-edited file) is clamped, not rejected: an
-    /// existing installation still starts.
+    /// The startup budget is capped: the public surface waits for it, and no
+    /// mirror is worth minutes of an unavailable instance. A value above the
+    /// cap (a hand-edited file) is clamped, not rejected.
     #[test]
     fn the_geo_startup_budget_is_capped() {
         let cfg = GeoConfig {
@@ -3333,12 +3221,12 @@ probe_results_days = 7
         );
     }
 
-    /// The alive/ready export row ceiling is a setting, like the geo
-    /// startup budget above: an operator with a tier larger than the
-    /// shipped 50 000 rows raises it in `config/app.toml` or via
-    /// `FUMOX_SERVER__EXPORT_MAX_ROWS`, and the env override still
-    /// outranks the file. A config missing the key keeps the shipped
-    /// number, so no existing deployment changes behavior.
+    /// The alive/ready export row ceiling is a setting, like the geo startup
+    /// budget: an operator with a tier larger than the shipped 50 000 rows
+    /// raises it in `config/app.toml` or via `FUMOX_SERVER__EXPORT_MAX_ROWS`,
+    /// and the env override still outranks the file. A config missing the
+    /// key keeps the shipped number, so no existing deployment changes
+    /// behavior.
     #[test]
     fn server_export_max_rows_is_configurable() {
         let _guard = env_mutex().lock();
@@ -3353,23 +3241,23 @@ probe_results_days = 7
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("app.toml");
 
-        // A config that does not mention the key keeps the default.
+        // A config that does not mention the key keeps the default
         std::fs::write(&file, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
         assert_eq!(
             load_config(Some(&file)).unwrap().server.export_max_rows,
             50_000
         );
 
-        // The file raises it.
+        // The file raises it
         std::fs::write(&file, "[server]\nexport_max_rows = 200000\n").unwrap();
         assert_eq!(
             load_config(Some(&file)).unwrap().server.export_max_rows,
             200_000
         );
 
-        // The env outranks the file, as for every other key.
+        // The env outranks the file, as for every other key
         // SAFETY: every touch of FUMOX_SERVER__EXPORT_MAX_ROWS across the
-        // test suite is serialized by `env_mutex`.
+        // test suite is serialized by `env_mutex`
         unsafe { std::env::set_var("FUMOX_SERVER__EXPORT_MAX_ROWS", "7") };
         assert_eq!(
             load_config(Some(&file)).unwrap().server.export_max_rows,
@@ -3377,7 +3265,7 @@ probe_results_days = 7
             "FUMOX_SERVER__EXPORT_MAX_ROWS must outrank the file value"
         );
 
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe {
             std::env::remove_var("FUMOX_SERVER__EXPORT_MAX_ROWS");
             std::fs::remove_dir_all(&dir).ok();
@@ -3385,9 +3273,9 @@ probe_results_days = 7
     }
 
     /// `FUMOX_ADMIN__TOKEN` must outrank the value written to
-    /// `config/app.toml`, env overrides are how operators rotate the
-    /// admin token without editing the file (regression for the
-    /// figment-merge case that silently left the file value in place).
+    /// `config/app.toml`: env overrides are how operators rotate the admin
+    /// token without editing the file (regression for the figment-merge case
+    /// that silently left the file value in place).
     #[test]
     fn env_admin_token_overrides_file() {
         let _guard = env_mutex().lock();
@@ -3399,7 +3287,7 @@ probe_results_days = 7
 
         // SAFETY: every touch of FUMOX_ADMIN__TOKEN across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe { std::env::set_var("FUMOX_ADMIN__TOKEN", "from-env") };
         let cfg = load_config(Some(&file)).expect("env override must load");
         assert_eq!(
@@ -3407,19 +3295,16 @@ probe_results_days = 7
             "FUMOX_ADMIN__TOKEN must outrank [admin].token from the file"
         );
 
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe {
             std::env::remove_var("FUMOX_ADMIN__TOKEN");
             std::fs::remove_dir_all(&dir).ok();
         }
     }
 
-    /// Env must override the file for every type the loader handles ,
-    /// not just `String`. `Env::split` in figment 0.10 does a string
-    /// replace, so the merge path is the same for every leaf, but
-    /// guarding each type catches regressions in a single place.
-    /// `Vec<String>` overrides need a JSON array (figment's default
-    /// sequence deserializer), not a comma-separated string, that
+    /// Env must override the file for every type the loader handles, not
+    /// just `String`. `Vec<String>` overrides need a JSON array (figment's
+    /// default sequence deserializer), not a comma-separated string; that
     /// comma-split support lives in `de_test_urls` and is opt-in.
     #[test]
     fn env_overrides_file_for_every_type() {
@@ -3439,7 +3324,7 @@ probe_results_days = 7
 
         // SAFETY: every touch of FUMOX_* across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe {
             std::env::set_var("FUMOX_ADMIN__TOKEN", "env-token");
             std::env::set_var("FUMOX_INGEST__DROP_GATE", "true");
@@ -3452,7 +3337,7 @@ probe_results_days = 7
         assert_eq!(cfg.probe.cycle_interval_secs, 7);
         assert_eq!(cfg.server.trust_proxy_ips, ["10.8.0.0/16"]);
 
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe {
             std::env::remove_var("FUMOX_ADMIN__TOKEN");
             std::env::remove_var("FUMOX_INGEST__DROP_GATE");
@@ -3471,11 +3356,11 @@ probe_results_days = 7
 
         // SAFETY: every touch of FUMOX_* across the test suite is
         // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock.
+        // through the same lock
         unsafe {
             std::env::set_var("FUMOX_INGEST__DROP_GATE", "true");
             std::env::set_var("FUMOX_ADMIN__TOKEN", "env-token");
-            // A deployment variable, not a setting.
+            // A deployment variable, not a setting
             std::env::set_var("FUMOX_CONFIG_ACCESS", "rw");
         }
         let overridden = env_overridden_paths();
@@ -3492,13 +3377,13 @@ probe_results_days = 7
             "a deployment variable is not a setting: {overridden:?}"
         );
         // Sorted and free of duplicates: the panel renders the list as
-        // it stands, and a repeated entry would read as a mistake.
+        // it stands, and a repeated entry would read as a mistake
         let mut sorted = overridden.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted, overridden, "the list must be sorted and unique");
 
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe {
             std::env::remove_var("FUMOX_INGEST__DROP_GATE");
             std::env::remove_var("FUMOX_ADMIN__TOKEN");
@@ -3516,10 +3401,9 @@ probe_results_days = 7
     }
 
     /// [`load`] reports which config file it actually read: an existing
-    /// explicit path comes back as [`ResolvedConfigPath::Loaded`], a
-    /// missing one is an operator typo and fails loudly, and no file
-    /// anywhere is the out-of-the-box [`ResolvedConfigPath::Missing`]
-    /// (the crate directory the tests run in has no `config/app.toml`).
+    /// explicit path comes back as [`ResolvedConfigPath::Loaded`], a missing
+    /// one is an operator typo and fails loudly, and no file anywhere is the
+    /// out-of-the-box [`ResolvedConfigPath::Missing`].
     #[test]
     fn load_reports_which_config_file_it_read() {
         let _guard = env_mutex().lock();
@@ -3528,21 +3412,21 @@ probe_results_days = 7
         let file = dir.join("app.toml");
         std::fs::write(&file, "[retention]\nprobe_results_days = 7\n").unwrap();
 
-        // An existing explicit path is loaded and named.
+        // An existing explicit path is loaded and named
         let loaded = load(Some(&file)).expect("the explicit file must load");
         assert_eq!(loaded.path, ResolvedConfigPath::Loaded(file.clone()));
         assert_eq!(loaded.config.retention.probe_results_days, 7);
 
-        // A missing explicit path is an error, not a fallback.
+        // A missing explicit path is an error, not a fallback
         let missing = dir.join("missing.toml");
         let err = load(Some(&missing)).unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)), "{err}");
         assert!(err.to_string().contains("missing.toml"), "{err}");
 
         // Without any pointer and without a config/app.toml next to the
-        // crate, the loader runs on built-in defaults.
+        // crate, the loader runs on built-in defaults
         // SAFETY: every touch of FUMOX_CONFIG across the test suite is
-        // serialized by `env_mutex`.
+        // serialized by `env_mutex`
         unsafe { std::env::set_var(CONFIG_PATH_ENV, "   ") };
         let defaults = load(None).expect("defaults must load");
         assert_eq!(
@@ -3551,7 +3435,7 @@ probe_results_days = 7
             "no config/app.toml next to the crate"
         );
 
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe {
             std::env::remove_var(CONFIG_PATH_ENV);
             std::fs::remove_dir_all(&dir).ok();
@@ -3587,9 +3471,9 @@ probe_results_days = 7
         );
 
         // The environment override: `FUMOX_FETCH__IP_FAMILY` wins over
-        // the file, exactly like for every other key.
+        // the file, exactly like for every other key
         // SAFETY: every touch of FUMOX_* across the test suite is
-        // serialized by `env_mutex`.
+        // serialized by `env_mutex`
         let _guard = env_mutex().lock();
         unsafe { std::env::set_var("FUMOX_FETCH__IP_FAMILY", "ipv6") };
         let cfg = load(Some(&file)).expect("the env override must load");
@@ -3598,7 +3482,7 @@ probe_results_days = 7
             IpFamily::Ipv6,
             "FUMOX_FETCH__IP_FAMILY must apply"
         );
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe { std::env::remove_var("FUMOX_FETCH__IP_FAMILY") };
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3623,7 +3507,7 @@ probe_results_days = 7
         assert_eq!(loaded.config.geo.cache_ttl_secs, 600);
 
         // SAFETY: every touch of FUMOX_* across the test suite is
-        // serialized by `env_mutex`.
+        // serialized by `env_mutex`
         let _guard = env_mutex().lock();
         unsafe { std::env::set_var("FUMOX_GEO__CACHE_TTL_SECS", "120") };
         let loaded = load(Some(&file)).expect("the env override must load");
@@ -3631,12 +3515,12 @@ probe_results_days = 7
             loaded.config.geo.cache_ttl_secs, 120,
             "FUMOX_GEO__CACHE_TTL_SECS must outrank the file"
         );
-        // SAFETY: see above.
+        // SAFETY: see above
         unsafe { std::env::remove_var("FUMOX_GEO__CACHE_TTL_SECS") };
 
-        // A zero TTL would expire every entry immediately: refused.
+        // A zero TTL would expire every entry immediately: refused
         // `load_config` directly: the guard is already held and the
-        // helper's lock is not reentrant.
+        // helper's lock is not reentrant
         std::fs::write(&file, "[geo]\ncache_ttl_secs = 0\n").unwrap();
         assert!(load_config(Some(&file)).is_err());
 
@@ -3682,10 +3566,10 @@ probe_results_days = 7
         );
     }
 
-    /// The meow API token is a credential like the admin token: it
-    /// unlocks the meow-rs external controller, and the dump and the
-    /// `Debug` output land in the same terminals, CI logs and bug
-    /// reports — so the placeholder takes its place there too.
+    /// The meow API token is a credential like the admin token: it unlocks
+    /// the meow-rs external controller, and the dump and the `Debug` output
+    /// land in the same terminals, CI logs and bug reports, so the
+    /// placeholder takes its place there too.
     #[test]
     fn the_meow_api_token_is_redacted_like_the_admin_token() {
         let config = AppConfig {
@@ -3706,7 +3590,7 @@ probe_results_days = 7
         );
 
         // The whole-config `Debug` delegates to the section's `Debug`,
-        // so the placeholder shows up there instead of the token.
+        // so the placeholder shows up there instead of the token
         let text = format!("{config:?}");
         assert!(
             !text.contains("a-real-secret"),
@@ -3724,7 +3608,7 @@ probe_results_days = 7
         );
 
         // An empty token stays empty: the placeholder would suggest a
-        // token is set when none is.
+        // token is set when none is
         let config = AppConfig::default();
         let text = dump(&config).expect("the config must render");
         assert!(!text.contains(REDACTED_ADMIN_TOKEN), "{text}");
@@ -3747,8 +3631,8 @@ probe_results_days = 7
     }
 
     /// The concurrency ceiling is the file-descriptor budget, not an
-    /// arbitrary number: a config above it is refused at startup, and the
-    /// range the admin editor advertises is the same table.
+    /// arbitrary number; the range the admin editor advertises is the same
+    /// table.
     #[test]
     fn the_probe_concurrency_ceiling_is_enforced() {
         assert_eq!(

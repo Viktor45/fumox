@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Tear the smoke stand down (the counterpart of scripts/smoke-up.sh).
-# The stand is disposable, so its volumes (the SQLite DB and the meow config
-# exchange) can be deleted -- but only when the operator asks for it with
-# --purge-volumes. The project name comes from the environment, and a
-# mistyped one must not take a volume with it.
-# Images are never removed: their tags are shared with the main stack.
+# Tear the smoke stand down (the counterpart of scripts/smoke-up.sh). Its
+# volumes (the SQLite DB and the meow config exchange) are disposable but
+# deleted only with --purge-volumes, and the project name comes from the
+# environment: a mistyped one must not take a volume with it. Images are
+# never removed, their tags are shared with the main stack.
 #
 # Usage:
 #   scripts/smoke-down.sh [--purge-volumes]
@@ -35,7 +34,7 @@ case "${1:-}" in
 esac
 
 # `timeout` is not on macOS (there it is `gtimeout`, and coreutils may not
-# be installed at all), so the deadline is enforced with a background job.
+# be installed at all), so the deadline is enforced with a background job
 run_with_timeout() { # <seconds> <command...>
     local secs="$1" pid waited
     shift
@@ -54,11 +53,10 @@ run_with_timeout() { # <seconds> <command...>
     wait "$pid"
 }
 
-# container engine
-# `compose version` only proves the plugin is installed; the daemon behind
-# it may be down. `info` is the check that actually matters, and it is what
-# decides which engine this run talks to. The candidates are tried in turn,
-# so a stopped docker does not hide a working podman.
+# `compose version` only proves the plugin is installed, the daemon behind it
+# may be down: `info` is the check that matters and decides which engine this
+# run talks to. Candidates are tried in turn, so a stopped docker does not
+# hide a working podman
 COMPOSE=()
 ENGINES=()
 if command -v docker >/dev/null 2>&1; then ENGINES+=(docker); fi
@@ -97,10 +95,9 @@ for engine in "${ENGINES[@]}"; do
             ;;
     esac
 
-    # podman-compose (the standalone front-end) learned --remove-orphans
-    # late, and a version without it rejects the whole down call. The flag
-    # is probed rather than parsed out of a version string: `down --help`
-    # lists it when the front-end knows it and errors out when it does not.
+    # podman-compose learned --remove-orphans late, and a version without it
+    # rejects the whole down call. The flag is probed via `down --help`
+    # rather than parsed out of a version string
     DOWN_FLAGS=(--remove-orphans)
     if [ "${COMPOSE[0]}" = "podman-compose" ] \
         && ! podman-compose down --help 2>&1 | grep -q -- --remove-orphans; then
@@ -108,14 +105,10 @@ for engine in "${ENGINES[@]}"; do
         echo ">> podman-compose: no --remove-orphans support, tearing down without it" >&2
     fi
 
-    # The down call is bounded like the info call above: a hung daemon must
-    # not wedge the teardown, and a timeout (124) counts as a failed
-    # teardown so the next engine still gets its turn. An empty "${arr[@]}"
-    # is fatal under `set -u` on the stock macOS bash 3.2, which is what the
-    # default (no volume deletion) puts VOLUME_FLAGS in, and DOWN_FLAGS is
-    # in that same state when --remove-orphans is not supported; the + guard
-    # expands to nothing there. COMPOSE is never empty here, but is guarded
-    # the same way.
+    # The down call is bounded like `info` above, and a timeout (124) counts
+    # as a failed teardown so the next engine still gets its turn. An empty
+    # "${arr[@]}" is fatal under `set -u` on the stock macOS bash 3.2, so
+    # every array is expanded through a ${arr[@]+...} guard
     set +e
     run_with_timeout 120 ${COMPOSE[@]+"${COMPOSE[@]}"} -p "$SMOKE_PROJECT" down \
         ${DOWN_FLAGS[@]+"${DOWN_FLAGS[@]}"} \

@@ -1,7 +1,4 @@
-//! Core error type shared across the workspace.
-
-/// Core error enum. Variants are added as functionality lands; keep the
-/// log-and-skip principle in mind, parse/fetch failures must never panic.
+/// Parse/fetch failures are log-and-skip, never panic.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("configuration error: {0}")]
@@ -11,20 +8,18 @@ pub enum Error {
     Parse(String),
 
     /// A database failure that is not the driver's: the file could not be
-    /// created or secured, or a repository precondition failed. There is
-    /// no driver error behind it to keep, only this text.
+    /// created or secured, or a repository precondition failed.
     #[error("database error: {0}")]
     Database(String),
 
-    /// A failure the driver reported. The original error is kept, so a
-    /// caller can classify it by the driver's variant — a locked database
-    /// is transient, a missing table is not — instead of by the text of
-    /// the message.
+    /// A failure the driver reported, kept as the original error so a caller
+    /// can classify it by the driver's variant (a locked database is
+    /// transient, a missing table is not) instead of by the message text.
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
-    /// The row does not exist. Kept apart from [`Error::Database`] so a
-    /// caller can answer "not found" instead of "the database failed".
+    /// Kept apart from [`Error::Database`] so a caller can answer "not found"
+    /// instead of "the database failed".
     #[error("not found: {0}")]
     NotFound(String),
 
@@ -33,14 +28,11 @@ pub enum Error {
 }
 
 impl Error {
-    /// The failure is transient contention over the database file: another
-    /// process holds the write lock, or the pool had no connection to
-    /// hand out.
+    /// Transient contention over the database file: another process holds
+    /// the write lock, or the pool had no connection to hand out.
     ///
-    /// The classification reads the driver's variant and SQLite's result
-    /// code, never the message text: SQLite localizes that text, and it
-    /// has changed between releases ("database is locked" is not a
-    /// contract).
+    /// Classifies by the driver's variant and SQLite's result code, never the
+    /// message text: SQLite localizes it and it has changed between releases.
     pub fn is_busy(&self) -> bool {
         match self {
             Error::Sqlx(err) => sqlx_error_is_busy(err),
@@ -55,8 +47,6 @@ const SQLITE_BUSY: i64 = 5;
 /// SQLITE_LOCKED: another connection holds a lock on the table.
 const SQLITE_LOCKED: i64 = 6;
 
-/// Whether a SQLite result code means "contention, try again later".
-///
 /// The driver reports the *extended* result code, whose low byte carries
 /// the primary one: SQLITE_BUSY_SNAPSHOT (517) and SQLITE_BUSY_RECOVERY
 /// (261) are both SQLITE_BUSY (5).
@@ -66,14 +56,13 @@ fn sqlite_code_is_busy(code: &str) -> bool {
         .is_ok_and(|code| matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED))
 }
 
-/// Whether a driver error is contention rather than a real failure.
 fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
             db_err.code().is_some_and(|code| sqlite_code_is_busy(&code))
         }
         // The pool had no free connection: the database is busy even
-        // though the driver never got to say so.
+        // though the driver never got to say so
         sqlx::Error::PoolTimedOut => true,
         _ => false,
     }
@@ -97,13 +86,10 @@ impl From<figment::Error> for Error {
     }
 }
 
-/// Reduce a figment error to the path of the offending key and a kind that
-/// names no value.
-///
-/// The full figment text is not safe to keep: a TOML syntax error quotes
-/// the offending source line and a type error prints the value, so a
-/// mistyped `admin.token` or a `db.url` carrying a password would put the
-/// secret into the startup error and from there into the operator's logs.
+/// Reduce a figment error to the offending key path and a value-free kind: the
+/// full text quotes source lines and prints values, so a mistyped
+/// `admin.token` or a `db.url` carrying a password would leak the secret into
+/// the logs.
 fn config_error_summary(err: &figment::Error) -> String {
     let path = err.path.join(".");
     let kind = config_error_kind(&err.kind);
@@ -114,12 +100,11 @@ fn config_error_summary(err: &figment::Error) -> String {
     }
 }
 
-/// The value-free description of a figment error kind.
 fn config_error_kind(kind: &figment::error::Kind) -> String {
     match kind {
-        // A parse error quotes the offending source line, and with it any
-        // secret on that line, so only its first line survives: for TOML
-        // that is the location, not the content.
+        // A parse error quotes the offending source line, secrets included, so
+        // only its first line survives: for TOML that is the location, not the
+        // content
         figment::error::Kind::Message(message) => message
             .lines()
             .next()
@@ -128,13 +113,13 @@ fn config_error_kind(kind: &figment::error::Kind) -> String {
             .chars()
             .take(200)
             .collect(),
-        // These kinds name the offending value; the label alone says what
-        // was wrong without repeating it.
+        // These kinds name the offending value; the label alone says what was
+        // wrong
         figment::error::Kind::InvalidType(..) => "invalid type".into(),
         figment::error::Kind::InvalidValue(..) => "invalid value".into(),
         figment::error::Kind::InvalidLength(..) => "invalid length".into(),
         figment::error::Kind::UnknownVariant(..) => "unknown variant".into(),
-        // A field name is a key, not a value.
+        // A field name is a key, not a value
         figment::error::Kind::UnknownField(name, _) => format!("unknown field `{name}`"),
         figment::error::Kind::MissingField(name) => format!("missing field `{name}`"),
         figment::error::Kind::DuplicateField(name) => format!("duplicate field `{name}`"),
@@ -151,9 +136,6 @@ mod tests {
     use super::*;
     use figment::providers::Format;
 
-    /// A config error must name the key and the section, never the value:
-    /// the body of the config carries the admin token and the database
-    /// password, and a parse error quotes the line it choked on.
     #[test]
     fn a_parse_error_carries_no_value() {
         let secret = "s3cr3t-value";
@@ -168,8 +150,6 @@ mod tests {
         );
     }
 
-    /// A type error prints the value it found; the reduction keeps the key
-    /// and drops the value.
     #[test]
     fn a_type_error_names_the_key_only() {
         #[derive(Debug, serde::Deserialize)]
@@ -198,9 +178,6 @@ mod tests {
         );
     }
 
-    /// The classification itself is pinned: a figment error lands in the
-    /// [`Error::Config`] variant, and its Display keeps the prefix callers
-    /// can match on.
     #[test]
     fn a_figment_error_maps_to_the_config_variant() {
         #[derive(Debug, serde::Deserialize)]
@@ -223,8 +200,6 @@ mod tests {
         assert!(error.to_string().starts_with("configuration error: "));
     }
 
-    /// A driver error is kept as [`Error::Sqlx`] with the same
-    /// "database error:" prefix the non-driver [`Error::Database`] spells.
     #[test]
     fn a_driver_error_maps_to_the_sqlx_variant() {
         let error = Error::from(sqlx::Error::RowNotFound);
@@ -232,8 +207,6 @@ mod tests {
         assert!(error.to_string().starts_with("database error: "));
     }
 
-    /// Every variant's Display carries the prefix that classifies it in
-    /// logs and user-facing messages.
     #[test]
     fn every_variant_display_keeps_its_prefix() {
         assert!(

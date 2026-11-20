@@ -1,9 +1,9 @@
 //! `probe_results` journal: one row per health-check attempt (T1/T2).
 //!
-//! Also the probe priority queue (`probe_requests`): the server
-//! enqueues freshly ingested `unknown` proxies at source-refresh time and
-//! the probe drains the queue at the start of every cycle, newest first,
-//! before falling back to the random sample.
+//! Also the probe priority queue (`probe_requests`): the server enqueues
+//! freshly ingested `unknown` proxies at source-refresh time, the probe
+//! drains the queue at the start of every cycle before falling back to
+//! the random sample.
 
 use crate::db::DbPool;
 use crate::repo::proxies::{T1_EXCLUDED_SCHEMES, T1Candidate, t1_lane_predicate};
@@ -15,25 +15,19 @@ pub const T2_KIND: &str = "t2";
 
 /// `probe_results.probe_kind` of a tunnel attempt that produced *no*
 /// verdict because the tunnel engine was down (a ping, config-reload or
-/// mid-batch failure).
-///
-/// The separate label is what tells a log consumer and the admin panel
-/// "the engine failed" apart from "the proxy failed": an unverified
-/// attempt says nothing about the proxy and never charges its fail
-/// budget.
+/// mid-batch failure): the separate label is what tells a log consumer
+/// and the admin panel "the engine failed" apart from "the proxy
+/// failed"; an unverified attempt never charges the fail budget.
 pub const T2_UNVERIFIED_KIND: &str = "t2_unverified";
 
 /// The T2 kinds as a SQL literal list. Every query that asks "did this
 /// proxy get a tunnel attempt?" uses it, so an unverified attempt still
-/// counts as an attempt: the recency queue has to advance past a row
-/// whose check never ran.
+/// counts as an attempt and the recency queue advances past the row.
 pub const T2_KINDS_SQL: &str = "'t2', 't2_unverified'";
 
-/// Whether a `probe_kind` belongs to the T2 tier.
-///
-/// The fail ladder follows it: a T1 success must not wipe the counter a
-/// T2 failure accumulated, and an unverified T2 attempt is still a T2
-/// attempt, so it keeps the counter too.
+/// Whether a `probe_kind` belongs to the T2 tier. The fail ladder
+/// follows it: a T1 success must not wipe the counter a T2 failure
+/// accumulated, and an unverified attempt keeps it too.
 pub fn is_t2_kind(kind: &str) -> bool {
     matches!(kind, T2_KIND | T2_UNVERIFIED_KIND)
 }
@@ -42,12 +36,8 @@ pub fn is_t2_kind(kind: &str) -> bool {
 
 /// Wire contracts of the `meta` stamps the probe daemon and the admin
 /// panel exchange: every key name and JSON payload shape is defined once
-/// here and used by both the writer (probe daemon, server scheduler) and
-/// the reader (admin handlers), so a rename is a compile error on both
+/// here and used by both sides, so a rename is a compile error on both
 /// sides instead of a panel card silently collapsing to `unknown`.
-///
-/// The on-wire JSON is exactly what the hand-built payloads always were:
-/// these types state the existing shapes, they do not change them.
 pub mod meta {
     use serde::{Deserialize, Serialize};
 
@@ -64,8 +54,7 @@ pub mod meta {
     /// ([`ServerRetentionStamp`], JSON). A separate key on purpose: the
     /// server's sweep covers the two tables the *server* writes, and a
     /// server-side pass overwriting [`LAST_ROTATION_KEY`] used to zero the
-    /// daemon's `probe_results` counter and read as "the daemon rotated"
-    /// in a deployment that has none.
+    /// daemon's `probe_results` counter.
     pub const SERVER_RETENTION_KEY: &str = "server_retention";
     /// `meta` key of the server scheduler sweep stamp (unix seconds as
     /// plain text; deliberately not JSON, the reader only needs the age).
@@ -80,12 +69,11 @@ pub mod meta {
     pub const MEOW_BACKOFF_SECS_KEY: &str = "meow_backoff_secs";
 
     /// `probe_heartbeat`: the daemon's liveness stamp, upserted on every
-    /// beat. `interval_secs` and `cycle_interval_secs` are the beat and
-    /// cycle periods the daemon actually runs; server and probe may read
-    /// different config files, so the panel thresholds staleness against
-    /// these rather than its own config copy. Both optional: stamps
-    /// written before the fields existed must still parse, the reader
-    /// then falls back to its own config.
+    /// beat. `interval_secs` and `cycle_interval_secs` are the periods
+    /// the daemon actually runs; server and probe may read different
+    /// config files, so the panel thresholds staleness against these.
+    /// Both optional: stamps written before the fields existed must still
+    /// parse.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct Heartbeat {
         pub ts: i64,
@@ -115,10 +103,9 @@ pub mod meta {
 
     /// `last_rotation`: one run of the probe daemon's retention loop,
     /// including runs that deleted nothing, so the age of `ts` is the
-    /// "retention is alive" signal. A failed run carries `ok: false` with
-    /// the error text and keeps the `ts` of the last *successful* run: a
-    /// stale stamp then reads as "retention has not succeeded lately", not
-    /// as "retention ran and died silently".
+    /// "retention is alive" signal. A failed run keeps the `ts` of the
+    /// last *successful* run and carries `ok: false` with the error text,
+    /// so a stale stamp reads as "retention has not succeeded lately".
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct LastRotation {
         pub ts: i64,
@@ -144,12 +131,9 @@ pub mod meta {
     }
 
     /// `server_retention`: one server-side retention pass over the two
-    /// journals the server itself writes (`fetch_log`, `probe_requests`).
-    /// Same reporting contract as [`LastRotation`] minus the daemon-only
-    /// `probe_results` counter: a failed pass keeps the `ts` of the last
-    /// *successful* one and carries `ok: false` with the error text, so a
-    /// stale stamp reads as "the sweep has not succeeded lately", not as
-    /// "it ran and died silently".
+    /// journals the server itself writes (`fetch_log`,
+    /// `probe_requests`). Same reporting contract as [`LastRotation`]
+    /// minus the daemon-only `probe_results` counter.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct ServerRetentionStamp {
         pub ts: i64,
@@ -157,10 +141,9 @@ pub mod meta {
         pub fetch_log: u64,
         #[serde(default)]
         pub probe_requests: u64,
-        /// The proxies the pass deleted from the `removed` status past
-        /// the TTL window (`[retention].removed_proxies_days`). Stamps
-        /// from before the field existed and deployments with the window
-        /// off carry 0.
+        /// The proxies the pass deleted past the TTL window
+        /// (`[retention].removed_proxies_days`); 0 for stamps from before
+        /// the field existed or with the window off.
         #[serde(default)]
         pub proxies: u64,
         /// Whether the pass ran to completion; a stamp written before the
@@ -176,8 +159,6 @@ pub mod meta {
     mod tests {
         use super::*;
 
-        /// Round-trip: the writer's payload survives serialize +
-        /// deserialize unchanged.
         #[test]
         fn heartbeat_round_trips() {
             let payload = Heartbeat {
@@ -192,8 +173,7 @@ pub mod meta {
         }
 
         /// Stamps written by older daemons (no beat/cycle periods) and
-        /// hand-written fixtures (no pid/version) must still parse, with
-        /// the same fallbacks the previous hand-parsing applied.
+        /// hand-written fixtures (no pid/version) must still parse.
         #[test]
         fn heartbeat_parses_legacy_stamps() {
             let hb: Heartbeat =
@@ -209,10 +189,9 @@ pub mod meta {
             assert_eq!(minimal.version, "?");
         }
 
-        /// A stamp without the queue counter parses (the field was added
-        /// later than the other two), and the full payload round-trips.
-        /// A stamp without the outcome pair reads as a successful run:
-        /// those were written unconditionally.
+        /// A stamp without the queue counter parses, and a stamp without
+        /// the outcome pair reads as a successful run (written
+        /// unconditionally before the field existed).
         #[test]
         fn last_rotation_parses_partial_and_round_trips() {
             let rot: LastRotation =
@@ -236,9 +215,8 @@ pub mod meta {
             assert_eq!(serde_json::from_str::<LastRotation>(&raw).unwrap(), full);
         }
 
-        /// The server-side retention stamp round-trips, and a hand-written
-        /// fixture without the outcome pair (a stamp from before the field
-        /// existed) reads as a successful pass.
+        /// The server-side retention stamp round-trips; a hand-written
+        /// fixture without the outcome pair reads as a successful pass.
         #[test]
         fn server_retention_stamp_round_trips() {
             let minimal: ServerRetentionStamp = serde_json::from_str(r#"{"ts":5}"#).unwrap();
@@ -298,13 +276,10 @@ pub struct ProbeResultEntry<'a> {
 }
 
 /// Refresh the denormalised T2 recency stamp of the proxies whose
-/// journal rows were just written.
-///
-/// The stamp is the moment of the last T2 *attempt*, the verified one and
-/// the unverified one alike: the recency queue has to move past a row
-/// whose tunnel check never ran. It never moves backwards, so a replayed
-/// or out-of-order batch cannot make a proxy look older than it is, and
-/// it stays NULL for a proxy that never had a T2 attempt.
+/// journal rows were just written: the stamp is the moment of the last
+/// T2 *attempt*, verified or not, and never moves backwards, so a
+/// replayed or out-of-order batch cannot make a proxy look older than
+/// it is. It stays NULL for a proxy that never had a T2 attempt.
 async fn stamp_last_t2_checked<'e, E>(
     executor: E,
     entries: &[ProbeResultEntry<'_>],
@@ -312,7 +287,7 @@ async fn stamp_last_t2_checked<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    // One stamp per proxy: the newest attempt of the batch wins.
+    // One stamp per proxy: the newest attempt of the batch wins
     let mut newest: Vec<(i64, i64)> = Vec::new();
     for entry in entries {
         if !is_t2_kind(entry.probe_kind) {
@@ -339,7 +314,7 @@ where
            FROM stamps
           WHERE proxies.id = stamps.id"
     );
-    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for (id, at) in &newest {
         query = query.bind(id).bind(at);
@@ -351,8 +326,7 @@ where
 pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Result<()> {
     // The journal row and the recency stamp land in one transaction: an
     // insert that fails must not leave the stamp behind, and the stamp
-    // must not move the recency queue past an attempt that was never
-    // journaled.
+    // must not move the queue past an attempt that was never journaled
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO probe_results
@@ -377,12 +351,9 @@ pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Resul
 /// the project supports.
 const JOURNAL_CHUNK: usize = 100;
 
-/// Insert a batch of journal rows in one statement per chunk.
-///
-/// A batch of failures used to write its rows one by one, and every row
-/// was its own round trip to the database. The batch is one statement
-/// now: the rows land together or not at all, and the recency stamp goes
-/// into the same transaction as the inserts.
+/// Insert a batch of journal rows in one statement per chunk: the rows
+/// land together or not at all, and the recency stamp goes into the same
+/// transaction as the inserts.
 pub async fn insert_many(pool: &DbPool, entries: &[ProbeResultEntry<'_>]) -> crate::Result<u64> {
     let mut written = 0u64;
     let mut tx = pool.begin().await?;
@@ -410,18 +381,14 @@ pub async fn insert_many(pool: &DbPool, entries: &[ProbeResultEntry<'_>]) -> cra
     Ok(written)
 }
 
-/// How many journal rows one purge batch deletes.
 const PURGE_BATCH_SIZE: i64 = 1_000;
 
-/// Delete probe history older than the cutoff (retention).
-///
-/// The delete runs in bounded batches, one statement each: a single
-/// `DELETE` over the whole expired population holds the write lock until
-/// the last row is gone and grows the WAL with one giant commit. The
-/// journal is the largest table in the database (one row per check
-/// attempt, every tier, every cycle), so this is exactly the sweep that
-/// must not monopolise the lock. Each statement is its own transaction,
-/// so the lock is released between the batches.
+/// Delete probe history older than the cutoff (retention), in bounded
+/// batches, one statement each: a single `DELETE` over the whole expired
+/// population holds the write lock until the last row is gone and grows
+/// the WAL with one giant commit, and the journal is the largest table
+/// in the database (one row per check attempt), so this is the sweep
+/// that must not monopolise the lock.
 pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     super::purge_batched(
         pool,
@@ -461,17 +428,15 @@ where
     Ok(row)
 }
 
-/// The `probe_kind` of the most recent failed attempt for a proxy, or `None`
-/// when it has no failed attempts. Newest first via the
-/// `idx_probe_proxy_time` index. Feeds the strict T2-priority rule:
-/// a T1 success must not wipe the fail counter accumulated by
-/// T2 failures, so the caller needs to know what the last failure was.
+/// The `probe_kind` of the most recent failed attempt for a proxy, or
+/// `None` when it has none. Feeds the strict T2-priority rule: a T1
+/// success must not wipe the fail counter accumulated by T2 failures,
+/// so the caller needs to know what the last failure was.
 ///
 /// `checked_at` has one-second resolution and the T1 sample and the T2
 /// batch of one cycle both journal into it, so two failures can share a
 /// timestamp; `id DESC` breaks the tie by insertion order (the column is
-/// an `AUTOINCREMENT` primary key), so the newest journaled failure wins
-/// deterministically.
+/// an `AUTOINCREMENT` primary key).
 pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT probe_kind FROM probe_results
@@ -485,13 +450,11 @@ pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Opt
 }
 
 /// Aggregate the most common probe failure reasons (`probe_results.error`)
-/// over a rolling time window, ordered by hit count descending. Used by the
-/// admin dashboard's Top Failure Reasons widget.
-///
-/// `since_ts` is the lower bound on `checked_at` (Unix seconds, inclusive);
-/// `limit` caps the returned rows. Errors with `NULL` reason text are
-/// excluded, they are uninformative aggregates of successful probes that
-/// stored no diagnostic.
+/// over a rolling time window, ordered by hit count descending (the
+/// admin dashboard's Top Failure Reasons widget). `since_ts` is the
+/// lower bound on `checked_at` (Unix seconds, inclusive); errors with
+/// `NULL` reason text are excluded, they are uninformative aggregates of
+/// successful probes that stored no diagnostic.
 pub async fn top_failure_reasons<'e, E>(
     executor: E,
     since_ts: i64,
@@ -524,8 +487,8 @@ pub struct ProbeHistoryRow {
     pub probe_kind: String,
 }
 
-/// The last `limit` probe attempts of one proxy, newest first (proxy card
-/// history table). Same rows the daemon journals; the table rotates with
+/// The last `limit` probe attempts of one proxy, newest first (proxy
+/// card history table). The table rotates with
 /// `[retention].probe_results_days`, so old attempts disappear from the
 /// card exactly as they do from the coverage counters.
 pub async fn recent_for_proxy(
@@ -545,20 +508,15 @@ pub async fn recent_for_proxy(
     Ok(rows)
 }
 
-// Priority queue (`probe_requests`)
-
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the
-/// queue forever); the row itself must still be `unknown` and still be
-/// linked to a source — the same base predicate the drain applies (see
-/// [`t1_lane_predicate`]), minus the drain's T2-suppression guard: a row
-/// without a link is skipped by every T1 lane, so queueing it would only
-/// leave a request nothing will ever consume. `now` is Unix time in
-/// seconds. Re-enqueueing an id that is already queued is not a
-/// duplicate row: the upsert refreshes its `requested_at`, so a caller
-/// that hands an id over twice raises the row's priority in the
-/// newest-first drain. Returns the number of ids enqueued, re-queued
-/// ones included.
+/// queue forever); the row must still be `unknown` and still linked to a
+/// source (see [`t1_lane_predicate`]): a row without a link is skipped
+/// by every T1 lane, so queueing it would only leave a request nothing
+/// will ever consume. `now` is Unix time in seconds. Re-enqueueing an
+/// already-queued id is not a duplicate row: the upsert refreshes its
+/// `requested_at`, raising the row's priority in the newest-first drain.
+/// Returns the number of ids enqueued, re-queued ones included.
 pub async fn enqueue_checks(
     pool: &DbPool,
     candidate_ids: &[i64],
@@ -568,16 +526,12 @@ pub async fn enqueue_checks(
     let mut queued = 0u64;
     let mut remaining = i64::from(limit);
     // IN-lists are chunked so a huge ingest cannot blow the bound-variable
-    // limit; the newest ids (highest rowid) win within the limit. The two
-    // only agree if the chunks themselves are walked newest-first: the
+    // limit; the newest ids (highest rowid) win within the limit. The
     // per-chunk `ORDER BY p.id DESC LIMIT ?` can only see inside its own
-    // chunk, so a caller-supplied list longer than 500 (a bulk revival of
-    // a whole country/ASN) would otherwise spend the whole limit on the
-    // oldest ids and never even look at the newest. Sort a copy descending
-    // and chunk that, so the first chunk holds the highest ids; `dedup`
-    // then also keeps a repeated id from being enqueued twice across the
-    // chunk boundary (the `rows_affected` accounting counts it twice
-    // otherwise).
+    // chunk, so the chunks are walked newest-first (a caller-supplied
+    // list longer than 500, a bulk revival of a whole country/ASN, would
+    // otherwise spend the whole limit on the oldest ids). `dedup` keeps a
+    // repeated id from being enqueued twice across a chunk boundary
     let mut newest_first = candidate_ids.to_vec();
     newest_first.sort_unstable_by(|a, b| b.cmp(a));
     newest_first.dedup();
@@ -596,7 +550,7 @@ pub async fn enqueue_checks(
             t1_lane_predicate("p.status = 'unknown'")
         );
         // sqlx 0.9 SqlSafeStr: the format! only expands `?` placeholder
-        // lists, all data flows through .bind().
+        // lists, all data flows through .bind()
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(now);
         for id in chunk {
             query = query.bind(id);
@@ -612,13 +566,11 @@ pub async fn enqueue_checks(
     Ok(queued)
 }
 
-/// Drain the queue, newest first (fresh proxies check first).
-/// Returns candidates that are still `unknown`, still linked to a source,
+/// Drain the queue, newest first (fresh proxies check first). Returns
+/// candidates that are still `unknown`, still linked to a source,
 /// T1-probeable and not under a T2 block (`last_t2_failed_at IS NULL`,
-/// the same guard as the random sample, migration 0007: a T2 failure
-/// suppresses T1 until the next successful T2, and the T2 recency
-/// selector is the only way back); everything else in the queue is
-/// skipped here and removed by [`purge_settled_checks`].
+/// migration 0007); everything else is skipped here and removed by
+/// [`purge_settled_checks`].
 pub async fn select_queued_checks(pool: &DbPool, limit: u32) -> crate::Result<Vec<T1Candidate>> {
     let sql = format!(
         "SELECT q.proxy_id AS id, p.scheme, p.host, p.port, p.params
@@ -655,11 +607,9 @@ pub async fn claim_checks(pool: &DbPool, proxy_ids: &[i64]) -> crate::Result<u64
     Ok(claimed)
 }
 
-/// How many entries are still waiting for their first check.
-///
-/// The cycle log compares this before and after a cycle: a queue that
-/// does not drain is invisible in the check counters (the cycle checked
-/// its quota, the queue grew anyway).
+/// How many entries are still waiting for their first check: the cycle
+/// log compares this before and after a cycle, a queue that does not
+/// drain is invisible in the check counters.
 pub async fn queue_depth(pool: &DbPool) -> crate::Result<i64> {
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
         .fetch_one(pool)
@@ -721,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_purge_history() {
         let (_dir, pool) = temp_pool().await;
-        // probe_results has an FK to proxies; create the row first.
+        // probe_results has an FK to proxies; create the row first
         let id = insert_proxy(&pool, "fp1", "vless", "unknown", true).await;
 
         insert(
@@ -789,7 +739,7 @@ mod tests {
                 probe_kind: "tcp",
             });
         }
-        // One fresh row survives the sweep.
+        // One fresh row survives the sweep
         entries.push(ProbeResultEntry {
             proxy_id: id,
             checked_at: 2000,
@@ -813,7 +763,6 @@ mod tests {
         let (_dir, pool) = temp_pool().await;
         let id = insert_proxy(&pool, "fp-kind", "vless", "alive", true).await;
 
-        // No failed attempts yet.
         assert_eq!(last_failed_kind(&pool, id).await.unwrap(), None);
 
         insert(
@@ -829,7 +778,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // A success in between does not hide the failure.
+        // A success in between does not hide the failure
         insert(
             &pool,
             &ProbeResultEntry {
@@ -848,7 +797,6 @@ mod tests {
             Some("tcp")
         );
 
-        // The newest failure wins, whatever kinds are mixed.
         insert(
             &pool,
             &ProbeResultEntry {
@@ -885,8 +833,6 @@ mod tests {
         );
     }
 
-    /// The proxy card history: the newest attempts first, capped, with the
-    /// columns the history table renders.
     #[tokio::test]
     async fn recent_for_proxy_returns_the_newest_attempts_capped() {
         let (_dir, pool) = temp_pool().await;
@@ -920,14 +866,12 @@ mod tests {
         assert_eq!(rows[1].checked_at, 1100);
         assert_eq!(rows[1].latency_ms, Some(30));
 
-        // Uncapped: everything, oldest last.
         let rows = recent_for_proxy(&pool, id, 20).await.unwrap();
         assert_eq!(
             rows.iter().map(|r| r.checked_at).collect::<Vec<_>>(),
             vec![1200, 1100, 1000]
         );
 
-        // Another proxy's history stays separate.
         let other = insert_proxy(&pool, "fp-history-2", "vless", "alive", true).await;
         assert!(recent_for_proxy(&pool, other, 20).await.unwrap().is_empty());
     }
@@ -939,7 +883,6 @@ mod tests {
     async fn last_failed_kind_breaks_same_second_ties_by_insertion_order() {
         let (_dir, pool) = temp_pool().await;
 
-        // t2 journaled after tcp: the tie resolves to t2.
         let first = insert_proxy(&pool, "fp-tie1", "vless", "alive", true).await;
         for (kind, error) in [("tcp", "timeout"), ("t2", "invalid credential")] {
             insert(
@@ -962,7 +905,7 @@ mod tests {
         );
 
         // The mirror order resolves to tcp: the tie-break is insertion
-        // order (id DESC), not the probe_kind's own sort order.
+        // order (id DESC), not the probe_kind's own sort order
         let second = insert_proxy(&pool, "fp-tie2", "vless", "alive", true).await;
         for (kind, error) in [("t2", "invalid credential"), ("tcp", "timeout")] {
             insert(
@@ -991,7 +934,7 @@ mod tests {
         let id = insert_proxy(&pool, "fp-fail", "vless", "alive", false).await;
 
         // Five distinct failure reasons with hit counts 3, 5, 1 plus one
-        // NULL (which must be excluded) and one row outside the window.
+        // NULL (which must be excluded) and one row outside the window
         let cases: &[(i64, Option<&str>)] = &[
             (100, Some("timeout")),
             (110, Some("timeout")),
@@ -1023,8 +966,8 @@ mod tests {
             .unwrap();
         }
 
-        // Window starts at 100; expect 3 distinct reasons, ordered by hits desc
-        // then by reason text asc (deterministic tie-break).
+        // Ordered by hits desc, then by reason text asc (deterministic
+        // tie-break)
         let top = top_failure_reasons(&pool, 100, 10).await.unwrap();
         assert_eq!(
             top,
@@ -1035,17 +978,16 @@ mod tests {
             ]
         );
 
-        // The limit truncates the result regardless of hit counts.
+        // The limit truncates the result regardless of hit counts
         let top2 = top_failure_reasons(&pool, 100, 2).await.unwrap();
         assert_eq!(top2.len(), 2);
         assert_eq!(top2[0].0, "tls handshake failed");
         assert_eq!(top2[1].0, "timeout");
 
-        // An empty window returns nothing.
         let empty = top_failure_reasons(&pool, 9_999_999, 10).await.unwrap();
         assert!(empty.is_empty());
 
-        // Successful probes do not contribute (their `error` column is NULL).
+        // Successful probes do not contribute (their `error` column is NULL)
         insert(
             &pool,
             &ProbeResultEntry {
@@ -1060,7 +1002,7 @@ mod tests {
         .await
         .unwrap();
         let after_success = top_failure_reasons(&pool, 100, 10).await.unwrap();
-        assert_eq!(after_success.len(), 3); // unchanged
+        assert_eq!(after_success.len(), 3);
     }
 
     /// Minimal proxies fixture: rows are linked to a source unless
@@ -1108,7 +1050,7 @@ mod tests {
         let alive = insert_proxy(&pool, "fp-t4", "trojan", "alive", true).await;
         let unlinked = insert_proxy(&pool, "fp-t5", "trojan", "unknown", false).await;
 
-        // Older request first, then a fresher one; unprobeable/alive limits.
+        // Older request first, then a fresher one; unprobeable/alive limits
         enqueue_checks(&pool, &[vless_old, tuic, alive, unlinked], 10, 1000)
             .await
             .unwrap();
@@ -1116,7 +1058,7 @@ mod tests {
 
         // Re-enqueueing an already queued id does not duplicate the row;
         // the upsert refreshes its `requested_at` (and counts as one
-        // enqueued id).
+        // enqueued id)
         assert_eq!(enqueue_checks(&pool, &[trojan], 10, 3000).await.unwrap(), 1);
         let (requested_at,): (i64,) =
             sqlx::query_as("SELECT requested_at FROM probe_requests WHERE proxy_id = ?")
@@ -1127,9 +1069,7 @@ mod tests {
         assert_eq!(requested_at, 3000, "the re-enqueue refreshed the stamp");
 
         // A row without a source link is not queued at all: no T1 lane
-        // would ever drain it, so the request would be dead weight in
-        // the table (and the revival paths would report a row the probe
-        // cannot reach).
+        // would ever drain it, so the request would be dead weight
         let (queued_for_unlinked,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM probe_requests WHERE proxy_id = ?")
                 .bind(unlinked)
@@ -1138,17 +1078,14 @@ mod tests {
                 .unwrap();
         assert_eq!(queued_for_unlinked, 0);
 
-        // Drain: newest first, only unknown+probeable+linked rows.
         let drained = select_queued_checks(&pool, 10).await.unwrap();
         let drained_ids: Vec<i64> = drained.iter().map(|c| c.id).collect();
         assert_eq!(drained_ids, vec![trojan, vless_old]);
 
-        // The limit caps the drain.
         let one = select_queued_checks(&pool, 1).await.unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].id, trojan);
 
-        // Claiming removes exactly the drained entries.
         assert_eq!(claim_checks(&pool, &drained_ids).await.unwrap(), 2);
         let left = select_queued_checks(&pool, 10).await.unwrap();
         assert!(left.is_empty());
@@ -1156,8 +1093,7 @@ mod tests {
 
     /// Re-enqueueing an already queued id raises its priority: the
     /// upsert refreshes `requested_at`, and the drain (newest first)
-    /// moves the row back to the head. `INSERT OR IGNORE` used to keep
-    /// the old stamp, so a caller had no way to bump a waiting row.
+    /// moves the row back to the head.
     #[tokio::test]
     async fn re_enqueueing_bumps_the_queue_priority() {
         let (_dir, pool) = temp_pool().await;
@@ -1177,8 +1113,6 @@ mod tests {
         };
         assert_eq!(drain().await, vec![fresh, old]);
 
-        // One row, not a duplicate: the re-enqueue refreshes the stamp
-        // and the order flips.
         assert_eq!(enqueue_checks(&pool, &[old], 10, 3_000).await.unwrap(), 1);
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
             .fetch_one(&pool)
@@ -1188,12 +1122,11 @@ mod tests {
         assert_eq!(drain().await, vec![old, fresh]);
     }
 
-    /// The priority lane carries the T2 suppression flag too:
-    /// migration 0007 puts a proxy under a T2 block "until the next
-    /// successful T2", and the T2 recency selector is the only way back.
-    /// Without the guard a queued row would leave the block on the next
-    /// plain TCP success, re-entering the T1 rotation the flag exists
-    /// to keep it out of.
+    /// The priority lane carries the T2 suppression flag too: migration
+    /// 0007 puts a proxy under a T2 block "until the next successful T2",
+    /// and the T2 recency selector is the only way back. Without the
+    /// guard a queued row would leave the block on the next plain TCP
+    /// success.
     #[tokio::test]
     async fn queue_drain_skips_rows_under_a_t2_block() {
         let (_dir, pool) = temp_pool().await;
@@ -1219,10 +1152,8 @@ mod tests {
 
     /// The queue's own contract is "the newest ids win within the limit"
     /// (the daemon drains it newest-first), so that must hold across the
-    /// 500-id chunk boundary too, not only inside the first chunk. The
-    /// bulk revival handlers hand their whole id list over with a small
-    /// limit: a list longer than one chunk (1200 rows is an ordinary
-    /// revival population) must still enqueue the highest ids.
+    /// 500-id chunk boundary too: a bulk revival population (1200 rows)
+    /// handed over with a small limit must still enqueue the highest ids.
     #[tokio::test]
     async fn enqueue_prefers_the_newest_ids_across_chunk_boundaries() {
         let (_dir, pool) = temp_pool().await;
@@ -1234,7 +1165,7 @@ mod tests {
         .await
         .unwrap();
         // 1200 linked, `unknown`, T1-probeable candidates in one statement
-        // (a per-row helper would dominate the runtime of the test).
+        // (a per-row helper would dominate the runtime of the test)
         sqlx::query(
             "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1200)
              INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
@@ -1270,10 +1201,10 @@ mod tests {
         );
     }
 
-    /// The caller's limit holds across the chunking, not only inside one
-    /// chunk: enqueueing 600 of 1200 candidates fills the first 500-id
-    /// chunk and spends the remaining 100 on the second one, so the queue
-    /// ends up holding exactly the 600 highest ids.
+    /// The caller's limit holds across the chunking: enqueueing 600 of
+    /// 1200 candidates fills the first 500-id chunk and spends the
+    /// remaining 100 on the second one, so the queue holds exactly the
+    /// 600 highest ids.
     #[tokio::test]
     async fn enqueue_spends_the_limit_across_both_chunks() {
         let (_dir, pool) = temp_pool().await;
@@ -1285,7 +1216,7 @@ mod tests {
         .await
         .unwrap();
         // 1200 linked, `unknown`, T1-probeable candidates in one statement
-        // (a per-row helper would dominate the runtime of the test).
+        // (a per-row helper would dominate the runtime of the test)
         sqlx::query(
             "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1200)
              INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
@@ -1321,7 +1252,7 @@ mod tests {
             "the 600 highest ids are queued: 500 from the first chunk, 100 from the second"
         );
         // The second chunk's share is exactly the band just below the
-        // first chunk's lowest id: the limit was spent there, not restarted.
+        // first chunk's lowest id: the limit was spent there, not restarted
         assert_eq!(
             queued.iter().take(100).copied().collect::<Vec<_>>(),
             ids[600..700].to_vec()
@@ -1342,7 +1273,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The proxy that left `unknown` drops out; the fresh unknown stays.
         assert_eq!(purge_settled_checks(&pool).await.unwrap(), 1);
         let left = select_queued_checks(&pool, 10).await.unwrap();
         assert_eq!(
@@ -1350,7 +1280,6 @@ mod tests {
             vec![fresh_unknown]
         );
 
-        // Retention removes entries older than the cutoff.
         assert_eq!(purge_requests_before(&pool, 2000).await.unwrap(), 1);
         assert!(select_queued_checks(&pool, 10).await.unwrap().is_empty());
     }

@@ -1,24 +1,16 @@
 //! Protocol parsers and serializers for every supported subscription format.
 //!
-//! Public surface:
+//! [`parse_line`] follows a log-and-skip contract: it never panics and
+//! reports unrecognized lines instead of failing. Every parser has a
+//! serializer; URI schemes round-trip byte-for-byte whenever the original
+//! used percent-encoded fragments and standard formatting, while vmess and
+//! ss normalize encoding and guarantee semantic round-trip instead
+//! (`parse ∘ serialize ∘ parse` equals the first parse). Unknown parameters
+//! always pass through untouched.
 //!
-//! * [`parse_line`], parse a single URI line (log-and-skip contract: it
-//!   never panics, unrecognized lines are reported, not fatal);
-//! * [`serialize`], turn a [`ProxyEntry`] back into its canonical line;
-//! * [`parse_subscription`], decode + auto-detect a whole payload
-//!   (URI list / Clash YAML / sing-box JSON / base64-wrapped) and parse
-//!   every line.
-//!
-//! Round-trip guarantees: every parser has a serializer. URI schemes
-//! round-trip byte-for-byte whenever the original used percent-encoded
-//! fragments and standard formatting; vmess and ss normalize encoding and
-//! guarantee semantic round-trip instead (`parse ∘ serialize ∘ parse`
-//! equals the first parse). Unknown parameters always pass through untouched.
-//!
-//! Entries that never had a source line (Clash YAML, sing-box JSON) are the
-//! exception: their parameters may carry mihomo field names, which the URI
-//! serializers translate onto the canonical vocabulary first (see
-//! `canonical_uri_entry`). The translation is output-only, stored
+//! Entries that never had a source line (Clash YAML, sing-box JSON) may
+//! carry mihomo field names; their parameters are translated onto the URI
+//! vocabulary at output time only (`canonical_uri_entry`), stored
 //! parameters are not rewritten.
 
 pub mod clash;
@@ -42,11 +34,9 @@ pub enum LineOutcome {
     Unrecognized,
 }
 
-/// Machine-readable category of a single-line parse failure.
-///
-/// The message text of a parse error is for humans reading the log; the
-/// kind is what the skip counters and tests branch on without string
-/// matching.
+/// Machine-readable category of a single-line parse failure: what the skip
+/// counters and tests branch on without string matching; the message text is
+/// for humans reading the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseErrorKind {
     /// The transport payload (base64 blob, JSON) did not decode.
@@ -93,7 +83,7 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// An error returned as a plain `String` (the parsers not converted to
+/// An error returned as a plain `String` (parsers not converted to
 /// [`ParseError`] yet) folds into [`ParseErrorKind::InvalidField`], the
 /// dominant single-line failure class; the message stays the authoritative
 /// description.
@@ -108,21 +98,19 @@ impl From<String> for ParseError {
 
 /// Upper bound on the entries one payload may produce.
 ///
-/// Every entry costs a row, a fingerprint and a parameter set, and a payload
-/// is attacker-controlled feed content bounded only by the fetch cap: a feed
-/// with a million lines would otherwise load the database with a million
-/// rows in one refresh. The cap stops the parse; the remainder is counted
-/// (unrecognized for a URI list, skipped for the structured formats) so the
-/// truncation stays visible.
+/// A payload is attacker-controlled feed content bounded only by the fetch
+/// cap, and every entry costs a row, a fingerprint and a parameter set: a
+/// million-line feed would otherwise load a million rows in one refresh.
+/// The cap stops the parse; the remainder is counted (unrecognized for a URI
+/// list, skipped for the structured formats) so the truncation stays visible.
 pub const MAX_ENTRIES: usize = 4096;
 
 /// Parse one subscription line. Comments and blank lines must be filtered
 /// out by the caller ([`parse_subscription`] does this).
 pub fn parse_line(line: &str) -> LineOutcome {
-    // Line-size cap: `raw_line` is
-    // persisted verbatim onto every stored row, so an oversized line is a
-    // storage bomb, the caller's log-and-skip path drops it like any other
-    // malformed line.
+    // Line-size cap: `raw_line` is persisted verbatim onto every stored row,
+    // so an oversized line is a storage bomb; the caller's log-and-skip path
+    // drops it like any other malformed line
     if line.len() > uri::MAX_LINE_BYTES {
         tracing::warn!(
             bytes = line.len(),
@@ -139,11 +127,11 @@ pub fn parse_line(line: &str) -> LineOutcome {
     match scheme.as_str() {
         "ss" => parsed("ss", line, ss::parse(rest, line).map_err(ParseError::from)),
         "vmess" => parsed("vmess", line, vmess::parse(rest, line)),
-        // happ:// is recognized and deliberately discarded (MVP decision).
+        // happ:// is recognized and deliberately discarded
         "happ" => LineOutcome::Discarded,
-        // `naive+<transport>`: the transport suffix is scheme identity, so
-        // it gets its own arm ahead of the registry lookup; the parser
-        // preserves it as the synthetic `naive_transport` parameter.
+        // `naive+<transport>`: the transport suffix is scheme identity, so it
+        // gets its own arm ahead of the registry lookup and is preserved as
+        // the synthetic `naive_transport` parameter
         other if let Some(transport) = other.strip_prefix("naive+") => {
             parse_naive(transport, rest, line)
         }
@@ -153,15 +141,15 @@ pub fn parse_line(line: &str) -> LineOutcome {
                 line,
                 uri::parse_with_spec(spec, rest, line).map_err(ParseError::from),
             ),
-            // The unknown-scheme log is per payload, see `parse_uri_list`.
+            // The unknown-scheme log is per payload, see `parse_uri_list`
             None => LineOutcome::Unrecognized,
         },
     }
 }
 
 /// Wrap a parse result into a [`LineOutcome`], logging the skip with the
-/// context a malformed line needs to be findable in a feed: the scheme, the
-/// failure kind, the best-effort host and the first bytes of the line.
+/// context a malformed line needs to be findable in a feed: scheme, failure
+/// kind, best-effort host, first bytes of the line.
 fn parsed(scheme: &str, line: &str, result: Result<ProxyEntry, ParseError>) -> LineOutcome {
     match result {
         Ok(entry) => LineOutcome::Parsed(entry),
@@ -190,9 +178,8 @@ pub(crate) fn truncate_utf8(value: &str, max: usize) -> &str {
 }
 
 /// Best-effort `host:port` of a line that failed to parse, for the skip
-/// diagnostics. The real parse has already failed, so this only mirrors
-/// `split_uri`'s precedence and strips the scheme, the fragment/query, the
-/// userinfo and the path.
+/// diagnostics: mirrors `split_uri`'s precedence, minus scheme, fragment/
+/// query, userinfo and path.
 fn skip_host(line: &str) -> &str {
     let Some((_, rest)) = line.split_once("://") else {
         return "";
@@ -203,31 +190,27 @@ fn skip_host(line: &str) -> &str {
     truncate_utf8(rest, 128)
 }
 
-/// Normalize a host to the shape the URI parser produces: the bare address.
-///
-/// The URI parser stores the literal without its brackets (`[2001:db8::1]`
-/// becomes `2001:db8::1`), a structured source may spell it the URI way or
-/// with a `%zone` scope id. The stored host must have one shape, the
-/// fingerprint, the SSRF vetting and the serializer all read it as an
-/// address.
+/// Normalize a host to the shape the URI parser produces: the literal
+/// without its brackets (`[2001:db8::1]` becomes `2001:db8::1`), `%zone`
+/// scope ids stripped. The fingerprint, the SSRF vetting and the serializer
+/// all read the stored host as an address, so it must have one shape.
 pub(crate) fn normalize_host(host: &str) -> String {
     crate::ssrf::strip_host_decorations(host).to_string()
 }
 
-/// Reject a field value that would break the one-proxy-per-line contract.
-///
-/// The URI serializers emit `host` and `credential` verbatim and parameter
+/// Reject a field value that would break the one-proxy-per-line contract:
+/// the URI serializers emit `host` and `credential` verbatim, parameter
 /// values with only the query delimiters escaped (`uri::encode_query_delimiters`),
-/// `name` goes through [`uri::encode_fragment`], so a line break inside any
-/// of them splits one stored proxy into several output lines. A crafted Clash
+/// and `name` through [`uri::encode_fragment`], so a line break inside any of
+/// them splits one stored proxy into several output lines; a crafted Clash
 /// YAML or legacy-`ss` feed could smuggle a proxy of an entirely different
-/// scheme past a source's protocol allowlist that way, or forge `url_list`
-/// metadata comments.
+/// scheme past a source's protocol allowlist, or forge `url_list` metadata
+/// comments.
 ///
 /// URI-list input cannot reach this: `parse_uri_list` iterates over
 /// `str::lines`. The vectors are the formats whose fields are not
-/// line-delimited, Clash YAML scalars, vmess JSON `\n` escapes and the
-/// base64 blob of a legacy `ss` line.
+/// line-delimited: Clash YAML scalars, vmess JSON `\n` escapes, the base64
+/// blob of a legacy `ss` line.
 pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
         return Err(format!("{field} contains a line break"));
@@ -237,12 +220,11 @@ pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String>
 
 /// Reject a persisted field that is over the byte cap.
 ///
-/// The host, the credential and the name are stored verbatim on every row
-/// (`proxies.host`, `proxies.credential`, `proxies.name`), so an oversized one
-/// is a storage bomb exactly like an oversized parameter. URI-list input is
-/// bounded as a whole by [`uri::MAX_LINE_BYTES`]; the vector formats (Clash
-/// YAML, vmess JSON, the base64 blob of a legacy `ss` line) are not, so their
-/// fields are capped one by one.
+/// The host, the credential and the name are stored verbatim on every row,
+/// so an oversized one is a storage bomb exactly like an oversized parameter.
+/// URI-list input is bounded as a whole by [`uri::MAX_LINE_BYTES`]; the
+/// vector formats (Clash YAML, vmess JSON, the base64 blob of a legacy `ss`
+/// line) are not, so their fields are capped one by one.
 pub(crate) fn check_field_size(field: &str, value: &str) -> Result<(), String> {
     if value.len() > uri::MAX_PARAM_BYTES {
         return Err(format!(
@@ -256,13 +238,10 @@ pub(crate) fn check_field_size(field: &str, value: &str) -> Result<(), String> {
 
 /// Enforce the parameter caps on a structured-format entry: at most
 /// [`uri::MAX_QUERY_PARAMS`] parameters and [`uri::MAX_PARAM_BYTES`] per
-/// key and value, with the one message wording shared by every vector
-/// parser.
-///
-/// The vector formats (Clash YAML, vmess JSON, sing-box JSON) feed decoded
-/// text straight into the parameter list, bypassing [`uri::parse_query`],
-/// so the caps `parse_query` enforces for URI lines are checked here, per
-/// entry.
+/// key and value, with one message wording shared by every vector parser.
+/// The vector formats feed decoded text straight into the parameter list,
+/// bypassing [`uri::parse_query`], so the caps `parse_query` enforces for
+/// URI lines are checked here, per entry.
 pub(crate) fn validate_params(prefix: &str, params: &[Param]) -> Result<(), String> {
     if params.len() > uri::MAX_QUERY_PARAMS {
         return Err(format!(
@@ -286,13 +265,10 @@ pub(crate) fn validate_params(prefix: &str, params: &[Param]) -> Result<(), Stri
 /// (`serde_json` for vmess/sing-box, `serde_norway` for Clash YAML), behind
 /// one port-reading face so the port rule lives in [`port_from_number`].
 pub(crate) trait PortNumber {
-    /// The integer value, when the number carries one.
     fn port_u64(&self) -> Option<u64>;
 
-    /// The float value, when the number carries one.
     fn port_f64(&self) -> Option<f64>;
 
-    /// The literal as it came in, for the error message.
     fn port_text(&self) -> String;
 }
 
@@ -330,8 +306,6 @@ impl PortNumber for serde_norway::Number {
 ///
 /// Port 0 is not a dialable endpoint (the schema CHECK, migration 0018,
 /// refuses it too), so the record is as invalid as an out-of-range one.
-/// `dialect` prefixes the message, the way each vector parser names
-/// itself.
 pub(crate) fn port_from_number(n: &impl PortNumber, dialect: &str) -> Result<u16, String> {
     let port = match n.port_u64() {
         Some(v) => u16::try_from(v).ok(),
@@ -344,11 +318,9 @@ pub(crate) fn port_from_number(n: &impl PortNumber, dialect: &str) -> Result<u16
         .ok_or_else(|| format!("{dialect}: port out of range: {}", n.port_text()))
 }
 
-/// The port a vector-format record carries as a decimal string.
-///
-/// The same zero rejection as [`port_from_number`]; the echoed value is
-/// bounded, a junk "port" can be arbitrarily long and the diagnostic
-/// travels into the logs.
+/// The port a vector-format record carries as a decimal string: the same
+/// zero rejection as [`port_from_number`], the echoed value bounded (a junk
+/// "port" can be arbitrarily long and the diagnostic travels into the logs).
 pub(crate) fn port_from_string(s: &str, dialect: &str) -> Result<u16, String> {
     match s.trim().parse::<u16>() {
         Ok(0) | Err(_) => Err(format!(
@@ -361,27 +333,20 @@ pub(crate) fn port_from_string(s: &str, dialect: &str) -> Result<u16, String> {
 
 /// Reject a YAML document that contains an alias reference (`*anchor`).
 ///
-/// `serde_norway` resolves every alias by jumping to the anchor's event span
-/// and re-deserializing it into fresh owned values that are retained in the
-/// result tree; its only bound is a document-global jump counter that an
-/// alias bomb stays far under. One anchor of `s` events plus `k` references
-/// materializes ~`k×s` values from a payload of ~`k+s` events, quadratic
-/// memory amplification from a feed payload bounded only by the 10 MiB fetch
-/// cap (security review f4: 20 KiB → >1 GiB heap, allocation failure aborts
-/// the whole process). Feed content has no legitimate use for aliases, so
-/// the entire class is refused before parsing rather than budgeted.
+/// `serde_norway` re-materializes the anchor's whole subtree for every
+/// reference, so one anchor of `s` events plus `k` references yields
+/// ~`k×s` values from a payload of ~`k+s` events: quadratic memory
+/// amplification from a feed payload bounded only by the 10 MiB fetch cap
+/// (security review f4: 20 KiB → >1 GiB heap, allocation failure aborts the
+/// whole process). Feed content has no legitimate use for aliases, so the
+/// entire class is refused before parsing rather than budgeted.
 ///
-/// The scan is a small YAML-token scanner, not a parser, and it is biased
-/// toward false positives: a missed alias is a security hole, a wrongly
-/// rejected payload is a visible parse error. It must therefore find every
-/// alias an attacker can write (in valid YAML a `*` at a token position is
-/// always an alias, plain scalars cannot start with an indicator), while
-/// not rejecting the quoted scalars and block scalars real configs carry
-/// (`password: pass*word` must keep parsing). Positions treated as literal
-/// text: double/single-quoted scalars (entered only at token boundaries,
-/// escapes honored, state carried across lines), comments (`#` after
-/// whitespace to end of line) and block scalars (`|`/`>` header, content
-/// skipped by indentation).
+/// The scan is a small YAML-token scanner, not a parser, biased toward false
+/// positives: a missed alias is a security hole, a wrongly rejected payload
+/// is a visible parse error. In valid YAML a `*` at a token position is
+/// always an alias, while the quoted scalars and block scalars real configs
+/// carry are treated as literal text (`password: pass*word` must keep
+/// parsing).
 pub(crate) fn reject_yaml_aliases(payload: &str) -> Result<(), String> {
     let mut block_indent: Option<usize> = None;
     let mut in_double = false;
@@ -390,7 +355,7 @@ pub(crate) fn reject_yaml_aliases(payload: &str) -> Result<(), String> {
         let indent = line.len() - line.trim_start().len();
         if let Some(header_indent) = block_indent {
             // Block-scalar content: blank lines and anything more indented
-            // than the header line is literal text, however alias-shaped.
+            // than the header line is literal text, however alias-shaped
             if line.trim().is_empty() || indent > header_indent {
                 continue;
             }
@@ -435,7 +400,7 @@ fn scan_yaml_line(
         // missed alias is a hole while a rejected odd scalar is only a
         // parse error, so the boundary set is biased wide. `?` too: in flow
         // context libyaml's scanner emits a key token for a bare `?` and
-        // reads `?*a` as an alias even without a space.
+        // reads `?*a` as an alias even without a space
         let boundary = i == 0
             || matches!(
                 bytes[i - 1],
@@ -443,7 +408,6 @@ fn scan_yaml_line(
             );
         if *in_double {
             match b {
-                // Escaped byte (possibly a quote): skip it.
                 b'\\' => i += 1,
                 b'"' => *in_double = false,
                 _ => {}
@@ -459,11 +423,10 @@ fn scan_yaml_line(
         } else if b == b'\'' && at_value_position(&line[..i]) {
             *in_single = true;
         } else if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
-            // Comment to end of line.
             break;
         } else if b == b'*' && boundary {
             // In valid YAML a `*` at a token position is always an alias:
-            // plain scalars cannot start with an indicator character.
+            // plain scalars cannot start with an indicator character
             return true;
         } else if (b == b'|' || b == b'>')
             && boundary
@@ -476,16 +439,16 @@ fn scan_yaml_line(
     false
 }
 
-/// Is the text before `prefix` a value position — the place where a
-/// quoted scalar may start? The last non-whitespace character before the
-/// quote must be a structural one (`:`, `,`, `[`, `{`, `-`, `?`), or the
-/// quote must be the first thing on its line.
+/// Is the text before `prefix` a value position, the place where a quoted
+/// scalar may start? The last non-whitespace character before the quote must
+/// be a structural one (`:`, `,`, `[`, `{`, `-`, `?`), or the quote must be
+/// the first thing on its line.
 ///
 /// A quote that is *not* in a value position belongs to a plain scalar
 /// (`name: foo "bar`) and is an ordinary character. Treating it as a
-/// quoting delimiter switched the scanner into quoted mode and kept it
-/// there for the rest of the payload, which blinded it to every alias
-/// reference behind it — the exact hole the alias scan exists to close.
+/// quoting delimiter switched the scanner into quoted mode for the rest of
+/// the payload and blinded it to every alias reference behind it, the exact
+/// hole the alias scan exists to close.
 fn at_value_position(prefix: &str) -> bool {
     for byte in prefix.bytes().rev() {
         match byte {
@@ -494,16 +457,16 @@ fn at_value_position(prefix: &str) -> bool {
             _ => return false,
         }
     }
-    // Only whitespace before the quote: it opens the line's value.
+    // Only whitespace before the quote: it opens the line's value
     true
 }
 
 /// Does the `|`/`>` starting at `header` begin a block scalar? The header
-/// must sit at a value position: after `key:`, after a `-` entry marker,
-/// or alone on the line, and may only carry the indentation digit and
-/// chomping indicator before whitespace or a comment. Text like
-/// `key: a |` is a plain scalar ending in `|`; treating it as a header
-/// would swallow the alias-bearing lines that follow.
+/// must sit at a value position: after `key:`, after a `-` entry marker, or
+/// alone on the line, and may only carry the indentation digit and chomping
+/// indicator before whitespace or a comment. Text like `key: a |` is a plain
+/// scalar ending in `|`; treating it as a header would swallow the
+/// alias-bearing lines that follow.
 fn is_block_scalar_header(prefix: &str, header: &str) -> bool {
     let mut rest = prefix.trim();
     while let Some(stripped) = rest.strip_prefix("- ") {
@@ -513,7 +476,7 @@ fn is_block_scalar_header(prefix: &str, header: &str) -> bool {
         return false;
     }
     // Indicators after the `|`/`>` byte: one indentation digit and one
-    // chomping marker, in either order.
+    // chomping marker, in either order
     let bytes = header.as_bytes();
     let mut i = 1;
     let mut saw_indent = false;
@@ -550,7 +513,7 @@ fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
         Ok(entry) => entry,
         Err(message) => return parsed("naive", line, Err(ParseError::from(message))),
     };
-    // Insert first so the serializer sees it deterministically.
+    // Insert first so the serializer sees it deterministically
     entry.params.insert(
         0,
         crate::models::Param {
@@ -568,9 +531,8 @@ impl ProxyEntry {
     ///
     /// The transport rides in a synthetic parameter the parser attaches and
     /// the serializer consumes; it is never a client-facing query key. The
-    /// parameter survives the database round-trip (the serializer needs it
-    /// to rebuild the prefix), so the accessor reads it from the stored
-    /// parameter list.
+    /// parameter survives the database round-trip, so the accessor reads it
+    /// from the stored parameter list.
     pub fn naive_transport(&self) -> Option<&str> {
         self.param(uri::NAIVE_TRANSPORT_PARAM)
     }
@@ -578,8 +540,8 @@ impl ProxyEntry {
 
 /// Serialize an entry back into a subscription line.
 ///
-/// Entries with a source line are emitted with their query bytes (almost)
-/// untouched; entries without one (Clash YAML, sing-box JSON) go through
+/// Entries with a source line keep their query bytes (almost) untouched;
+/// entries without one (Clash YAML, sing-box JSON) go through
 /// [`canonical_uri_entry`] first, so a Clash item's mihomo field names
 /// become the URI vocabulary a client understands.
 ///
@@ -594,7 +556,7 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         // cached on the entry (see `with_canonical_cache`); recomputing it
         // per call would re-parse the stored YAML blocks (`ws-opts`,
         // `reality-opts`, …) on every rendered line. Entries without the
-        // cache (records rebuilt from SQLite) take the fallback.
+        // cache (records rebuilt from SQLite) take the fallback
         translated = match &entry.canonical {
             Some(params) => ProxyEntry {
                 params: params.clone(),
@@ -613,9 +575,9 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         Scheme::Ss => ss::serialize(entry),
         Scheme::Vmess => vmess::serialize(entry),
         // The URI family shares one serializer; each arm names its registry
-        // spec — the same table `parse_line` reaches through `spec_for`.
-        // The match is exhaustive over `Scheme`, so a new variant without an
-        // arm fails to compile instead of missing its spec at runtime.
+        // spec, the same table `parse_line` reaches through `spec_for`. The
+        // match is exhaustive over `Scheme`, so a new variant without an arm
+        // fails to compile instead of missing its spec at runtime
         Scheme::Vless => uri::serialize_with_spec(&uri::VLESS_SPEC, entry),
         Scheme::Trojan => uri::serialize_with_spec(&uri::TROJAN_SPEC, entry),
         Scheme::Hysteria2 => uri::serialize_with_spec(&uri::HYSTERIA2_SPEC, entry),
@@ -629,23 +591,19 @@ pub fn serialize(entry: &ProxyEntry) -> String {
 
 /// Translate an entry's parameters from mihomo (Clash) spellings onto the
 /// canonical URI vocabulary, flattening the structured blocks Clash keeps
-/// as YAML text.
-///
-/// Emitted verbatim into a URI query, a mihomo field name is either
-/// ignored by the client (`network` selects no transport, `tls=true`
-/// enables no TLS, `servername` sets no SNI) or is outright unparseable
-/// (`ws-opts` is a multi-line YAML block). Only entries without a source
-/// line reach this: URI-parsed entries keep their stored spellings
-/// byte-for-byte, and the Clash/sing-box writers read both vocabularies,
-/// so the stored parameters are deliberately not touched.
-///
-/// When a translated key collides with one already present (`servername`
-/// next to a real `sni`), the first occurrence in stored order wins.
+/// as YAML text. Emitted verbatim into a URI query, a mihomo field name is
+/// either ignored by the client (`network` selects no transport, `servername`
+/// sets no SNI) or is outright unparseable (`ws-opts` is a multi-line YAML
+/// block). Only entries without a source line reach this: URI-parsed entries
+/// keep their stored spellings byte-for-byte, and the Clash/sing-box writers
+/// read both vocabularies, so the stored parameters are deliberately not
+/// touched. A translated key colliding with one already present (`servername`
+/// next to a real `sni`) resolves to the first occurrence in stored order.
 ///
 /// REALITY needs a value rewrite of its own: mihomo spells it as
-/// `tls: true` + `reality-opts`, so flattening the block to `pbk`/`sid`
-/// while the `tls` arm still emitted `security=tls` (or nothing at all)
-/// handed clients a plain TLS node that drops the REALITY keys.
+/// `tls: true` + `reality-opts`, so flattening the block while the `tls` arm
+/// still emitted `security=tls` handed clients a plain TLS node that drops
+/// the REALITY keys.
 fn canonical_uri_entry(entry: &ProxyEntry) -> ProxyEntry {
     let mut out = entry.clone();
     out.params.clear();
@@ -656,7 +614,7 @@ fn canonical_uri_entry(entry: &ProxyEntry) -> ProxyEntry {
     out.params
         .retain(|p| seen.insert(p.key.to_ascii_lowercase()));
     // Force the one key the translation cannot know about: a public key
-    // makes this a REALITY node whatever `security` says (or omits).
+    // makes this a REALITY node whatever `security` says (or omits)
     if matches!(entry.scheme, Scheme::Vless | Scheme::Trojan)
         && crate::params::reality(entry, &crate::params::Blocks::of(entry))
             .public_key
@@ -706,14 +664,14 @@ fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
         "client-fingerprint" => push(out, "fp", value),
         "grpc-service-name" => push(out, "servicename", value),
         "fingerprint" => push(out, "pinsha256", value),
-        // vmess JSON spells the cipher `scy` and the alter id `aid`.
+        // vmess JSON spells the cipher `scy` and the alter id `aid`
         "cipher" if scheme == Scheme::Vmess => push(out, "scy", value),
         "alterid" if scheme == Scheme::Vmess => push(out, "aid", value),
         "alpn" => push(out, "alpn", &joined_alpn(value)),
-        // Clash's `tls` boolean against the URI spellings: `security=tls`
-        // for the URI-family schemes, the `tls: "tls"` string for vmess
-        // JSON (which is also what the sing-box parser stores, hence the
-        // literal check). A falsy toggle means plaintext, i.e. nothing.
+        // Clash's `tls` boolean onto the URI spellings: `security=tls` for
+        // the URI-family schemes, the `tls: "tls"` string for vmess JSON
+        // (also what the sing-box parser stores, hence the literal check). A
+        // falsy toggle means plaintext, i.e. nothing
         "tls" => match scheme {
             Scheme::Vless | Scheme::Trojan => {
                 if crate::models::is_truthy_toggle(value) || value.eq_ignore_ascii_case("tls") {
@@ -730,9 +688,9 @@ fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
         // The one Clash-only toggle spelling: mihomo writes
         // `skip-cert-verify`, the URI family reads `allowInsecure` (vless,
         // trojan, vmess JSON) or `insecure` (hysteria2, anytls). A falsy
-        // toggle means verification on, i.e. nothing to emit. The
+        // toggle means verification on, i.e. nothing to emit; the
         // `insecure`/`allowInsecure` spellings themselves pass through
-        // untouched wherever the source already used them.
+        // untouched wherever the source already used them
         "skip-cert-verify" => {
             if crate::models::is_truthy_toggle(value) {
                 match scheme {
@@ -789,7 +747,7 @@ fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
             }
         }
         // Snell spells its obfuscation as a nested block; the URI form is
-        // the flat `obfs` / `obfs-host` pair.
+        // the flat `obfs` / `obfs-host` pair
         "obfs-opts" => {
             if let Some(map) = yaml_mapping(value) {
                 push_opt(out, "obfs", block_string(&map, "mode"));
@@ -831,8 +789,8 @@ fn push_opt(out: &mut Vec<Param>, key: &str, value: Option<String>) {
 }
 
 /// URI `alpn` is one comma-joined value; Clash feeds list it as a YAML
-/// sequence (`alpn: [h2, http/1.1]`), which the Clash parser stores as
-/// YAML text and a URI client cannot read. Plain scalars pass through.
+/// sequence, which the Clash parser stores as YAML text and a URI client
+/// cannot read. Plain scalars pass through.
 fn joined_alpn(value: &str) -> String {
     match yaml_value(value) {
         Some(serde_norway::Value::Sequence(items)) => {
@@ -840,7 +798,7 @@ fn joined_alpn(value: &str) -> String {
             if items.is_empty() {
                 // An empty (or all-non-scalar) list has no URI spelling;
                 // the empty string makes `push` drop the parameter instead
-                // of emitting the raw YAML text.
+                // of emitting the raw YAML text
                 String::new()
             } else {
                 items.join(",")
@@ -901,8 +859,8 @@ fn yaml_scalar(value: &serde_norway::Value) -> Option<String> {
 
 /// Replace line breaks in `host`, `credential` and parameter values with a
 /// space, returning `None` when the entry is already clean (the overwhelming
-/// case, so no allocation happens). `name` needs no treatment: every
-/// serializer percent-encodes or JSON-escapes it.
+/// case, so no allocation). `name` needs no treatment: every serializer
+/// percent-encodes or JSON-escapes it.
 fn sanitize_for_output(entry: &ProxyEntry) -> Option<ProxyEntry> {
     let dirty = |value: &str| value.contains(['\n', '\r']);
     let needs_fix = dirty(&entry.host)
@@ -938,7 +896,7 @@ fn serialize_naive(entry: &ProxyEntry) -> String {
     let transport = entry.naive_transport().unwrap_or("https");
     let prefix = format!("naive+{transport}://");
     // Serialize through the generic machinery, then swap the prefix; the
-    // synthetic parameter itself must not leak into the query string.
+    // synthetic parameter itself must not leak into the query string
     let mut stripped = entry.clone();
     stripped
         .params
@@ -960,9 +918,8 @@ pub struct ParsedSubscription {
     /// Unknown/malformed lines skipped.
     pub unrecognized: usize,
     /// Structured-format (Clash YAML, sing-box/Xray JSON) items that
-    /// produced no entry: unsupported types, malformed items and any
-    /// further skip class the structured parsers report. The components
-    /// are logged once per payload by the structured parsers.
+    /// produced no entry: unsupported types, malformed items and any further
+    /// skip class the structured parsers report, logged once per payload.
     pub skipped: usize,
     /// The format the payload was detected (or pinned) as.
     pub format: InputFormat,
@@ -996,11 +953,11 @@ pub fn parse_subscription(
 
 /// Unwrap the transport encoding. `auto` base64-decodes only when the payload
 /// cannot already be a plain subscription (no `://` marker) and decodes to
-/// something that looks like one: a URI list, Clash YAML, or a JSON config
+/// something subscription-shaped: a URI list, Clash YAML, or a JSON config
 /// (object or array, the v2rayN share format). The structured markers come
-/// from [`detect_structured_format`], the same function the format
-/// detection reads, so a wrapped payload with a structured marker decodes
-/// into the format that marker selects.
+/// from [`detect_structured_format`], the same function the format detection
+/// reads, so a wrapped payload with a structured marker decodes into the
+/// format that marker selects.
 fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<Cow<'_, str>> {
     match encoding {
         Encoding::Plain => Ok(Cow::Borrowed(payload)),
@@ -1022,7 +979,7 @@ fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<Cow<'_, st
                     return Ok(Cow::Owned(decoded));
                 }
                 // Decoded to text but nothing subscription-shaped inside:
-                // the source probably pinned the wrong encoding.
+                // the source probably pinned the wrong encoding
                 tracing::warn!(
                     bytes = trimmed.len(),
                     "payload looks base64-encoded but did not decode to a subscription; \
@@ -1040,7 +997,7 @@ fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<Cow<'_, st
 fn decode_base64_text(input: &str) -> Result<String, &'static str> {
     // Feeds wrap long payloads at 76 columns or pad them with blank lines;
     // base64 has no whitespace of its own, so interior whitespace (which
-    // also breaks the length-modulo check) is stripped before decoding.
+    // also breaks the length-modulo check) is stripped before decoding
     let compact = input.split_whitespace().collect::<String>();
     let Some(bytes) = uri::decode_b64_lenient(&compact) else {
         return Err(if compact.is_empty() {
@@ -1049,7 +1006,6 @@ fn decode_base64_text(input: &str) -> Result<String, &'static str> {
             "bad-base64"
         });
     };
-    // A subscription is text; reject binary garbage.
     let text = String::from_utf8(bytes).map_err(|_| "non-utf8")?;
     if text.trim().is_empty() {
         return Err("empty");
@@ -1059,22 +1015,19 @@ fn decode_base64_text(input: &str) -> Result<String, &'static str> {
 
 /// The structured-format markers of a subscription payload: JSON (an object
 /// or the v2rayN share array) means sing-box, a `proxies:` key means Clash
-/// YAML. `None` leaves the payload to the URI-list parser.
-///
-/// The one shared marker set of [`decode_payload`] (the base64 gate must
-/// unwrap anything the detection below would recognize) and of
-/// [`detect_format`].
+/// YAML. `None` leaves the payload to the URI-list parser. The one shared
+/// marker set of [`decode_payload`] (the base64 gate must unwrap anything
+/// the detection below would recognize) and of [`detect_format`].
 fn detect_structured_format(text: &str) -> Option<InputFormat> {
-    // A leading UTF-8 BOM precedes the markers in the wild; both the base64
-    // gate of `decode_payload` and `detect_format` read this, so it is
-    // stripped once here.
+    // A leading UTF-8 BOM precedes the markers in the wild; both callers
+    // read this, so it is stripped once here
     let text = text.trim_start_matches('\u{feff}');
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return Some(InputFormat::SingBoxJson);
     }
     // CRLF needs no separate `\r\nproxies:` check: that spelling contains
-    // `\nproxies:` already.
+    // `\nproxies:` already
     let has_proxies_key = trimmed.starts_with("proxies:") || text.contains("\nproxies:");
     if has_proxies_key {
         return Some(InputFormat::ClashYaml);
@@ -1082,9 +1035,6 @@ fn detect_structured_format(text: &str) -> Option<InputFormat> {
     None
 }
 
-/// Heuristic format detection: JSON (object or the v2rayN share array)
-/// means sing-box, a `proxies:` key means Clash YAML, everything else is
-/// treated as a URI list.
 fn detect_format(text: &str) -> InputFormat {
     detect_structured_format(text).unwrap_or(InputFormat::UriList)
 }
@@ -1101,8 +1051,8 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
             continue;
         }
         if result.entries.len() >= MAX_ENTRIES {
-            // The cap is reached: the rest of the payload is counted instead
-            // of parsed, so the load stays bounded and the truncation shows.
+            // Past the cap: the rest is counted instead of parsed, so the
+            // truncation shows
             result.unrecognized += 1;
             continue;
         }
@@ -1112,7 +1062,7 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
             LineOutcome::Unrecognized => {
                 result.unrecognized += 1;
                 // Keep a few samples so a payload that recognizes nothing
-                // can be diagnosed from the aggregate result alone.
+                // can be diagnosed from the aggregate result alone
                 if result.unrecognized_samples.len() < UNRECOGNIZED_SAMPLES {
                     result
                         .unrecognized_samples
@@ -1120,7 +1070,7 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
                 }
                 // One log per unknown scheme per payload, not once per
                 // line: a feed of ten thousand junk lines must not flood
-                // the log.
+                // the log
                 if let Some((scheme, _)) = line.split_once("://")
                     && unknown_schemes.insert(scheme.to_ascii_lowercase())
                 {
@@ -1136,7 +1086,7 @@ fn parse_clash_payload(text: &str) -> crate::Result<ParsedSubscription> {
     let clash_result = clash::parse_payload(text).map_err(crate::Error::Parse)?;
     let skipped = clash_result.unsupported + clash_result.invalid + clash_result.skipped;
     if skipped > 0 {
-        // The aggregate hides the components; name them once per payload.
+        // The aggregate hides the components; name them once per payload
         tracing::warn!(
             unsupported = clash_result.unsupported,
             invalid = clash_result.invalid,
@@ -1156,7 +1106,7 @@ fn parse_singbox_payload(text: &str) -> crate::Result<ParsedSubscription> {
     let result = singbox::parse_payload(text).map_err(crate::Error::Parse)?;
     let skipped = result.unsupported + result.invalid + result.skipped;
     if skipped > 0 {
-        // The aggregate hides the components; name them once per payload.
+        // The aggregate hides the components; name them once per payload
         tracing::warn!(
             unsupported = result.unsupported,
             invalid = result.invalid,
@@ -1205,8 +1155,6 @@ mod tests {
         assert_eq!(serialize(&entry), line);
     }
 
-    /// A payload with a pathological number of entries stops at the cap,
-    /// and the remainder is reported instead of parsed.
     #[test]
     fn a_payload_with_too_many_entries_is_capped() {
         let payload = (0..MAX_ENTRIES + 10)
@@ -1220,7 +1168,7 @@ mod tests {
 
     /// The naive transport rides in a synthetic parameter, so it must never
     /// reach a client: the emitted URI carries the transport in the scheme
-    /// prefix and nothing else.
+    /// prefix, nothing else.
     #[test]
     fn the_naive_transport_parameter_never_leaves_the_module() {
         let line =
@@ -1230,7 +1178,7 @@ mod tests {
         assert_eq!(serialize(&entry), line);
 
         // The stored shape (no source line): the serializer rebuilds the
-        // prefix from the synthetic parameter and drops the parameter itself.
+        // prefix from the synthetic parameter and drops the parameter itself
         entry.raw_line.clear();
         let out = serialize(&entry);
         assert!(out.starts_with("naive+quic://"), "{out}");
@@ -1246,7 +1194,7 @@ mod tests {
 
     /// A Clash vless item carries mihomo field names; served as a URI it
     /// must come out in the vocabulary a URI client understands, otherwise
-    /// the node connects without TLS or transport, or not at all.
+    /// the node connects without TLS or transport.
     #[test]
     fn clash_vless_item_serializes_onto_the_uri_vocabulary() {
         let yaml = concat!(
@@ -1297,7 +1245,7 @@ mod tests {
         }
         assert!(line.ends_with("#ws-node"), "{line}");
 
-        // The emitted line re-parses into the equivalent entry.
+        // The emitted line re-parses into the equivalent entry
         let back = entry_for(&line);
         assert_eq!(back.param("security"), Some("tls"));
         assert_eq!(back.param("sni"), Some("s.example.com"));
@@ -1396,9 +1344,7 @@ mod tests {
     }
 
     /// mihomo spells REALITY as `tls: true` + `reality-opts`; the URI
-    /// vocabulary is `security=reality`. Flattening only the block while
-    /// the `tls` boolean still emitted `security=tls` handed the client a
-    /// plain TLS node that drops the REALITY keys.
+    /// vocabulary is `security=reality`, never plain TLS.
     #[test]
     fn clash_vless_reality_item_serializes_with_security_reality() {
         let yaml = concat!(
@@ -1429,8 +1375,6 @@ mod tests {
         assert_eq!(back.param("sid"), Some("ab12"));
     }
 
-    /// Snell spells its obfuscation as a nested block; the URI form is the
-    /// flat `obfs` / `obfs-host` pair.
     #[test]
     fn clash_snell_obfs_block_flattens_to_obfs_params() {
         let yaml = concat!(
@@ -1463,8 +1407,7 @@ mod tests {
     }
 
     /// The translation is for line-less entries only: a URI line keeps its
-    /// stored spelling in the output, mihomo-looking or not (the fixture
-    /// test pins the same invariant for real feeds).
+    /// stored spelling in the output, mihomo-looking or not.
     #[test]
     fn uri_sourced_entries_are_not_translated() {
         let line = "vless://u@h.example.com:443?network=ws&servername=x.example.com&tls=true#n";
@@ -1475,8 +1418,8 @@ mod tests {
     /// The runtime half of the registry invariant behind `serialize`'s
     /// lookup: every scheme the parsers can produce renders a line. The
     /// compile-time half lives in `uri::spec_of_scheme`, whose match over
-    /// `Scheme` is exhaustive — a new variant without a registry entry is a
-    /// compile error, not a panic on this path.
+    /// `Scheme` is exhaustive, so a new variant without a registry entry is
+    /// a compile error, not a panic on this path.
     #[test]
     fn every_scheme_serializes_through_its_own_serializer() {
         for scheme in Scheme::all() {
@@ -1505,16 +1448,15 @@ mod tests {
     }
 
     /// A line break in `host`/`credential`/params splits one stored proxy
-    /// into several output lines, which smuggles a proxy of a different
-    /// scheme past a source's protocol allowlist and forges `url_list`
-    /// metadata comments.
+    /// into several output lines, smuggling a proxy of a different scheme
+    /// past a source's protocol allowlist.
     #[test]
     fn line_breaks_are_rejected_at_parse_time() {
         let clash = |body: &str| {
             parse_subscription(body, Encoding::Plain, Some(InputFormat::ClashYaml)).unwrap()
         };
 
-        // Credential: a trojan-only source would have served a vless node.
+        // Credential: a trojan-only source would have served a vless node
         let smuggled = clash(concat!(
             "proxies:\n",
             "  - name: ok\n",
@@ -1526,7 +1468,6 @@ mod tests {
         assert!(smuggled.entries.is_empty());
         assert_eq!(smuggled.skipped, 1);
 
-        // Host field.
         let bad_host = clash(concat!(
             "proxies:\n",
             "  - name: ok\n",
@@ -1538,7 +1479,7 @@ mod tests {
         assert!(bad_host.entries.is_empty());
         assert_eq!(bad_host.skipped, 1);
 
-        // vmess JSON carries the same risk through `add` and `id`.
+        // vmess JSON carries the same risk through `add` and `id`
         let json = r#"{"v":"2","ps":"x","add":"h.example.com","port":"443","id":"u\nvless://Y@8.8.8.8:443#inj"}"#;
         let b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD_NO_PAD,
@@ -1550,10 +1491,8 @@ mod tests {
         ));
     }
 
-    /// Every alias shape a feed can carry is refused. `key:*a` is a plain
-    /// scalar in block context, but the boundary set is deliberately wide:
-    /// a missed alias is a security hole, a rejected odd scalar is only a
-    /// parse error.
+    /// Every alias shape a feed can carry is refused; `key:*a` is a plain
+    /// scalar in block context, but the boundary set is deliberately wide.
     #[test]
     fn yaml_alias_forms_are_rejected() {
         for payload in [
@@ -1565,10 +1504,10 @@ mod tests {
             "x: &a 1\ny: *a\n",
             "folded: >\n  text\nnext: *a\n",
             // libyaml scans `?*a` in flow context as an alias even without a
-            // space, so a bomb hides behind a `?` from whitespace-only checks.
+            // space, so a bomb hides behind a `?` from whitespace-only checks
             "a: [?*a, ?*b]\n",
             // `x: a |` is a plain scalar ending in `|`, not a block header;
-            // the alias-shaped line after it must still be caught.
+            // the alias-shaped line after it must still be caught
             "x: a |\n *b",
         ] {
             assert!(
@@ -1579,9 +1518,8 @@ mod tests {
     }
 
     /// Quoted scalars, comments, block-scalar content and stars inside
-    /// plain scalars are literal text, real configs carrying them must
-    /// keep parsing. The quoted scalar spanning two lines carries its
-    /// state across lines, so a later alias-shaped line stays inside it.
+    /// plain scalars are literal text: real configs carrying them must keep
+    /// parsing. The two-line quoted scalar carries its state across lines.
     #[test]
     fn yaml_without_alias_references_still_parses() {
         for payload in [
@@ -1596,7 +1534,7 @@ mod tests {
             "proxies:\n  - {name: n, type: trojan, server: h, port: 443, password: 'p*w'}\n",
             // Block-scalar headers with an explicit indentation indicator, a
             // sequence-entry header and a folded header with a comment: the
-            // content lines are literal text, alias-shaped or not.
+            // content lines are literal text, alias-shaped or not
             "s: |2\n text *x",
             "- |\n *a",
             "s: >2- # c\n a *b",
@@ -1609,9 +1547,7 @@ mod tests {
     }
 
     /// A quote inside a plain scalar is an ordinary character, not a
-    /// quoting delimiter. Treating it as one switched the scanner into
-    /// quoted mode and kept it there for the rest of the payload, so
-    /// every alias behind the quote went unseen.
+    /// quoting delimiter.
     #[test]
     fn a_quote_inside_a_plain_scalar_does_not_hide_an_alias() {
         for payload in [
@@ -1626,8 +1562,8 @@ mod tests {
         }
     }
 
-    /// End to end: an alias bomb no longer reaches the YAML parser, the
-    /// source is marked failed with the rejection instead of amplifying.
+    /// End to end: an alias bomb is refused before it reaches the YAML
+    /// parser instead of amplifying.
     #[test]
     fn alias_bomb_is_rejected_at_parse_time() {
         let bomb = "proxies: &a [0,0,0,0,0,0,0,0]\n".to_string() + &"*a, ".repeat(200) + "*a\n";
@@ -1660,9 +1596,8 @@ mod tests {
         assert_eq!(line.lines().count(), 1, "{line:?}");
         assert!(!line.contains('\n') && !line.contains('\r'));
         // The name rode percent-encoded, so the forged `#` comment cannot
-        // split it off the line.
+        // split it off the line
         assert!(line.contains("%0A%23"), "{line}");
-        // A re-parse restores the original name.
         assert_eq!(entry_for(&line).name, "n\n# forged");
     }
 
@@ -1679,9 +1614,8 @@ mod tests {
     }
 
     /// Port 0 is not a dialable endpoint, so `vless://uuid@host:0` is
-    /// dropped at parse time: no record with it reaches the database, and a
-    /// subscription built from stored proxies — including the unknown-status
-    /// rows the default pipeline serves — can never carry it. The schema
+    /// dropped at parse time: no record with it reaches the database and a
+    /// subscription built from stored proxies can never carry it. The schema
     /// CHECK (migration 0018) is the second gate behind this one.
     #[test]
     fn a_zero_port_uri_produces_no_entry() {
@@ -1723,9 +1657,9 @@ mod tests {
     }
 
     /// Real producers wrap the payload at 76 columns (email-style) or add
-    /// blank lines. Interior whitespace is not base64, breaks the
-    /// length-modulo check and used to make the whole payload fall back to
-    /// being parsed as plain text, silently yielding zero entries.
+    /// blank lines; interior whitespace is not base64 and would otherwise
+    /// make the whole payload fall back to plain-text parsing, silently
+    /// yielding zero entries.
     #[test]
     fn line_wrapped_base64_payload_decodes() {
         use base64::Engine;
@@ -1742,7 +1676,7 @@ mod tests {
         let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.format, InputFormat::UriList);
-        // The pinned encoding takes the wrapped form too.
+        // The pinned encoding takes the wrapped form too
         let result = parse_subscription(&wrapped, Encoding::Base64, None).unwrap();
         assert_eq!(result.entries.len(), 2);
     }
@@ -1762,7 +1696,7 @@ mod tests {
         assert_eq!(result.format, InputFormat::SingBoxJson);
         assert_eq!(result.entries.len(), 1);
 
-        // The v2rayN share format is a bare array of configs.
+        // The v2rayN share format is a bare array of configs
         let array = r#"[{"outbounds":[{"type":"trojan","tag":"t","server":"h","server_port":443,"password":"p"}]}]"#;
         let result = parse_subscription(array, Encoding::Auto, None).unwrap();
         assert_eq!(result.format, InputFormat::SingBoxJson);
@@ -1779,10 +1713,9 @@ mod tests {
         assert_eq!(result.entries.len(), 1);
     }
 
-    /// The structured markers live in one function read by both the base64
-    /// gate and the format detection: a base64-wrapped payload carrying the
-    /// `proxies:` marker decodes and parses as Clash, instead of falling
-    /// back to a URI-list parse that recognizes nothing.
+    /// A base64-wrapped payload carrying the `proxies:` marker decodes and
+    /// parses as Clash, instead of falling back to a URI-list parse that
+    /// recognizes nothing.
     #[test]
     fn auto_detects_base64_wrapped_clash_yaml() {
         use base64::Engine;
@@ -1791,15 +1724,12 @@ mod tests {
         let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
         assert_eq!(result.format, InputFormat::ClashYaml);
         assert_eq!(result.entries.len(), 1);
-        // The pinned encoding takes the wrapped form too.
+        // The pinned encoding takes the wrapped form too
         let result = parse_subscription(&wrapped, Encoding::Base64, None).unwrap();
         assert_eq!(result.format, InputFormat::ClashYaml);
         assert_eq!(result.entries.len(), 1);
     }
 
-    /// The aggregate result counts each skip kind separately: a recognized
-    /// entry, a deliberate discard and a junk line each land in their own
-    /// counter, and the junk line leaves a truncated sample behind.
     #[test]
     fn parse_subscription_counts_each_skip_kind() {
         let payload = "vless://u@h:1#A\nhapp://x\ngarbage without a scheme\n";
@@ -1837,14 +1767,13 @@ mod tests {
     // `test.txt`. The fixture is gitignored (it may contain non-public
     // data) and is never committed; these tests skip themselves when it
     // is absent. Thresholds below are calibrated for a ~390-line sample
-    // (Sept 2026); they guard against regressions, not exact sizes.
+    // (Sept 2026); they guard against regressions, not exact sizes
 
     #[test]
     fn fixture_authority_and_query_round_trip_byte_exact() {
         // Hard invariant for the URI schemes: everything before the fragment
-        // (scheme, credential, host, port, path, query) must serialize back
-        // byte-for-byte. vmess/ss are excluded, they normalize their
-        // transport encoding by design (see module docs).
+        // serializes back byte-for-byte. vmess/ss are excluded, they
+        // normalize their transport encoding by design (see module docs)
         let mut checked = 0usize;
         let Some(lines) = fixture_lines() else {
             eprintln!("skipped: test.txt fixture is absent (gitignored debug file)");
@@ -1877,7 +1806,7 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test.txt")
     }
 
-    /// The fixture is a gitignored debug-only file and is not part of the
+    /// The fixture is a gitignored debug-only file, not part of the
     /// repository; `None` tells the fixture tests to skip themselves.
     fn fixture_lines() -> Option<Vec<String>> {
         std::fs::read_to_string(fixture_path())
@@ -1916,7 +1845,7 @@ mod tests {
         // Goal: at least 99% of lines recognized. The current
         // sample (Sept 2026) parses at 100% minus one ss2022 line whose
         // userinfo is plain text rather than base64 (SIP002 requires base64);
-        // happ:// lines, when present, are deliberately discarded.
+        // happ:// lines, when present, are deliberately discarded
         assert!(
             parsed + discarded >= (total * 99).div_ceil(100),
             "recognition rate below 99%: {parsed}+{discarded} of {total}"
@@ -1956,15 +1885,14 @@ mod tests {
     #[test]
     fn fixture_byte_round_trip_rate() {
         // Observational guard. Full-line byte-exact round-trip holds for
-        // percent-encoded lines; it intentionally does NOT hold when:
-        //   * the original fragment was raw UTF-8 (~half of real feeds) ,
-        //     the serializer emits the canonical percent-encoded form, which
-        //     decodes to the identical name;
-        //   * vmess/ss lines, their transport encoding (JSON field order,
-        //     base64 padding) is normalized by design.
-        // Authority/query fidelity is asserted strictly by
+        // percent-encoded lines; it intentionally does NOT hold when the
+        // original fragment was raw UTF-8 (the serializer emits the
+        // canonical percent-encoded form, which decodes to the identical
+        // name) or for vmess/ss lines (their transport encoding, JSON field
+        // order and base64 padding, is normalized by design). Authority/
+        // query fidelity is asserted strictly by
         // `fixture_authority_and_query_round_trip_byte_exact`; here we only
-        // make sure the overall rate does not regress silently.
+        // make sure the overall rate does not regress silently
         let mut exact = 0usize;
         let mut total = 0usize;
         let Some(lines) = fixture_lines() else {
@@ -1989,10 +1917,10 @@ mod tests {
             "fixture byte round-trip: {exact}/{total} = {:.1}%",
             rate * 100.0
         );
-        // Floor for the current sample: 51/387 ≈ 13%, it is dominated by
+        // Floor for the current sample: 51/387 ≈ 13%, dominated by
         // raw-UTF-8 names and vmess/ss normalization (all semantically
         // verified). Keep a margin: 0.10 for this sample shape, 0.40 held
-        // for the previous percent-encoded-heavy sample.
+        // for the previous percent-encoded-heavy sample
         assert!(rate >= 0.10, "byte round-trip rate regressed: {rate:.3}");
     }
 
@@ -2020,12 +1948,11 @@ mod tests {
             parsed,
             fingerprints.len()
         );
-        // Different servers must never collapse into one fingerprint: the
-        // sample is expected to yield a unique fingerprint per distinct
-        // server (some earlier samples carried name-only duplicates that
-        // legitimately collapsed, "the collapse happens" is covered by the
-        // fingerprint unit tests in fingerprint.rs, this guard pins the
-        // no-false-merge side against the real-world data).
+        // Different servers must never collapse into one fingerprint. Some
+        // earlier samples carried name-only duplicates that legitimately
+        // collapsed (covered by the fingerprint unit tests in
+        // fingerprint.rs); this guard pins the no-false-merge side against
+        // the real-world data
         assert!(
             fingerprints.len() > parsed / 2,
             "suspiciously few distinct fingerprints: {} of {parsed}",

@@ -43,15 +43,14 @@ pub fn skipped_count(format: OutputFormat, entries: &[ProxyEntry]) -> usize {
 }
 
 /// Resolve duplicate names by suffixing later occurrences with « (2)»,
-/// « (3)» and so on. The first occurrence keeps its name
-/// unchanged; suffixes themselves are checked against the taken set, so a
-/// literal «name (2)» in the input cannot shadow a generated one.
+/// « (3)» and so on. The first occurrence keeps its name unchanged;
+/// suffixes themselves are checked against the taken set, so a literal
+/// «name (2)» in the input cannot shadow a generated one.
 ///
-/// The per-name counter is remembered across occurrences and never rewinds:
-/// restarting the probe at 1 for every entry made this O(k²) in the number of
-/// proxies sharing a name, and names come straight from an untrusted feed ,
-/// 20 000 identical names cost 36 s of CPU inside a `/sub` render (security
-/// audit, 2026-09-05).
+/// The per-name counter never rewinds: restarting the probe at 1 for every
+/// entry made this O(k²) in the number of proxies sharing a name, and names
+/// come straight from an untrusted feed, 20 000 identical names cost 36 s
+/// of CPU inside a `/sub` render (security audit, 2026-09-05).
 pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut taken: HashSet<String> = HashSet::new();
     let mut next_suffix: HashMap<String, usize> = HashMap::new();
@@ -96,7 +95,7 @@ pub(crate) fn alter_id(entry: &crate::models::ProxyEntry) -> u64 {
         .or_else(|| param_value(entry, "alterId"))
         .and_then(|v| match v.parse::<i64>() {
             Ok(n) => u64::try_from(n).ok(),
-            // Beyond i64's range a u64 read still succeeds.
+            // Beyond i64's range a u64 read still succeeds
             Err(_) => v.parse::<u64>().ok(),
         })
         .unwrap_or(0)
@@ -168,9 +167,7 @@ pub(crate) fn encode_entries<V: Rename>(
     mut mapper: impl FnMut(&ProxyEntry) -> Option<V>,
 ) -> Vec<V> {
     // The mapped value travels with its entry, so every value `kept`
-    // carries is by construction one the mapper produced — the earlier
-    // `Vec<Option<_>>` plus indices needed an `expect` to reestablish
-    // that at the pairing below.
+    // carries is by construction one the mapper produced
     let kept: Vec<(&ProxyEntry, V)> = entries
         .iter()
         .filter_map(|entry| mapper(entry).map(|value| (entry, value)))
@@ -183,7 +180,7 @@ pub(crate) fn encode_entries<V: Rename>(
         );
     }
     // The names are deduplicated among the kept entries only: an
-    // unsupported entry consumes no name slot.
+    // unsupported entry consumes no name slot
     let names = dedupe_names(kept.iter().map(|(entry, _)| entry.name.as_str()));
     let mut renamed = 0;
     for ((entry, _), name) in kept.iter().zip(&names) {
@@ -221,7 +218,7 @@ mod tests {
 
     #[test]
     fn dedupe_does_not_shadow_existing_suffixes() {
-        // "a (2)" already present: the duplicate of "a" must become "a (3)".
+        // "a (2)" already present: the duplicate of "a" must become "a (3)"
         let out = dedupe_names(["a (2)", "a", "a"]);
         assert_eq!(out, vec!["a (2)", "a", "a (3)"]);
     }
@@ -255,7 +252,7 @@ mod tests {
         assert!(is_insecure(&entry(vec![param("allow_insecure", "1")])));
         // The yes/on spellings the shared toggle vocabulary accepts: a
         // `allowInsecure=yes` node must be emitted with the insecure marker
-        // like an `allowInsecure=1` one, not silently secured on output.
+        // like an `allowInsecure=1` one, not silently secured on output
         assert!(is_insecure(&entry(vec![param("allowInsecure", "yes")])));
         assert!(is_insecure(&entry(vec![param("skip-cert-verify", "on")])));
         assert!(!is_insecure(&entry(vec![param("allowInsecure", "0")])));
@@ -347,11 +344,9 @@ pub(crate) mod test_util {
     }
 }
 
-/// The two encoders must describe the same node.
-///
-/// The review's acceptance check is that they agree on whether a node
-/// needs TLS and on the transport they emit: a subscriber who moves a
-/// profile from one format to the other must not get a different node.
+/// The two encoders must describe the same node: a subscriber who moves a
+/// profile from one format to the other must not get a different node, so
+/// they must agree on whether it needs TLS and on the transport emitted.
 #[cfg(test)]
 mod agreement {
     use super::{clash, singbox, test_util};
@@ -498,7 +493,7 @@ mod agreement {
                 .and_then(|v| v.as_str())
         );
 
-        // The gRPC service name travels under two names.
+        // The gRPC service name travels under two names
         let grpc_entry = entry(Scheme::Vless, &[("type", "grpc"), ("serviceName", "svc")]);
         let clash = clash::entry_to_clash(&grpc_entry).expect("clash output");
         let singbox = singbox::entry_to_outbound(&grpc_entry).expect("sing-box output");
@@ -520,10 +515,9 @@ mod agreement {
     #[test]
     fn an_unknown_network_is_a_documented_difference() {
         // sing-box has a closed set of transport types: a transport it does
-        // not know makes the whole config fail to start, so it is left out.
+        // not know makes the whole config fail to start, so it is left out;
         // mihomo may still understand the name, so the Clash writer passes
-        // it through. The difference is deliberate, and the two documents
-        // are not meant to be identical for such a node.
+        // it through. The two documents are not meant to be identical here
         let entry = entry(Scheme::Vless, &[("type", "xhttp"), ("path", "/x")]);
         let (clash, singbox) = transport(&entry);
         assert_eq!(clash.as_deref(), Some("xhttp"));
@@ -559,7 +553,7 @@ mod agreement {
             super::skipped_count(OutputFormat::SingBox, &entries),
             entries.len() - singbox_kept
         );
-        // The plain formats carry every scheme.
+        // The plain formats carry every scheme
         assert_eq!(super::skipped_count(OutputFormat::UriList, &entries), 0);
         assert_eq!(super::skipped_count(OutputFormat::Base64, &entries), 0);
     }

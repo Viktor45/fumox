@@ -1,68 +1,38 @@
 #!/usr/bin/env bash
 # One-shot revival of vless proxies that meow-rs stranded in `removed`.
 #
-# Background. meow-rs 0.22.0 added the XHTTP transport as a real outbound
-# (0.21.x had no XHTTP at all: `grep -c '"xhttp"' crates/meow-config/src/
-# proxy_parser.rs` returns 0 on the old tag, non-zero on the new one). Before
-# that, a vless entry whose network parameter was `type=xhttp` could not be
-# tunnelled by the engine, so every T2 check failed, the fail ladder ran its
-# course, and the row ended up `removed`: terminal, with no lane that would
-# ever pick it up again. Nothing about the entry changed, only the engine's
-# ability to carry it, and Fumox already rendered the transport correctly
-# (formats/clash.rs passes an unrecognised network through verbatim), so
-# these rows are testable again and only their terminal status is wrong.
+# meow-rs 0.21.x had no XHTTP outbound (0.22.0 added it), so every vless entry
+# with `type=xhttp` failed its T2 checks and walked the fail ladder to the
+# terminal `removed` status. Fumox renders the transport verbatim, so these
+# rows are testable again under an XHTTP-capable engine and only their status
+# is wrong.
 #
-# Two populations, and they need different treatment.
+# Two populations. Linked rows (source link present) already sit in a probe
+# lane and rejoin the normal ladder once revived. Unlinked rows sit in no lane
+# at all and nothing recovers them: the upsert's `ON CONFLICT DO UPDATE` never
+# touches `status` and `[ingest].removed_as_unknown` is false as shipped, so a
+# revived unlinked row stays dead to every lane, feed and export.
 #
-# The linked ones (source link present) are the ordinary case. Every probe
-# lane selects on `EXISTS (SELECT 1 FROM proxy_source_links ...)`, so a
-# revived row is picked up on the next cycle and walks the normal ladder.
+# `--include-unlinked` also adopts the unlinked rows: it links them to a
+# source they never came from, which is what puts them back in rotation (a
+# deliberate fiction until a feed carries the proxy). Reconciliation can undo
+# the link: a fetch of the chosen source stamps the links of what it carried
+# and deletes the rest, so an adopted link survives only on a disabled source
+# (never fetched) or one with no drop rules (the alive-linger policy exempts
+# live tiers). Under `[ingest].drop_gate = true` a source with drop rules
+# loses the adoption at its next refresh; the script picks around that or
+# says so when it cannot.
 #
-# The unlinked ones are why `--include-unlinked` exists. `revive_removed`
-# skips them, and so does this script by default, because a row with no
-# source link sits in no probe lane at all: not the T1 sample, not the T2
-# batch, not the priority queue, and not the alive/ready exports. Reviving
-# one on its own changes nothing an operator can see except its badge, and
-# leaves it in a state no feed can recover from: the upsert's
-# `ON CONFLICT DO UPDATE` never touches `status`, so a re-linked `removed`
-# row stays `removed`, and `[ingest].removed_as_unknown` is false as
-# shipped, so nothing revives it either. The row is dead permanently,
-# whatever its feed does later.
-#
-# So `--include-unlinked` also adopts them: the revived rows are linked to
-# a source they never came from, which is what actually puts them back in
-# rotation. The link is a deliberate fiction, `the source carries the
-# proxy` is untrue for the adopted half until a feed starts saying so, and
-# it is the only way to give a link-less row a probe lane. Reconciliation
-# is what makes it survive: a fetch of the chosen source stamps the links
-# of what it carried and deletes the rest, so an adopted link is a
-# candidate for deletion on that source's next refresh. A disabled source
-# is never fetched, and a source with no drop rules runs the alive-linger
-# policy that exempts every live tier (`unknown` is one) from the unlink,
-# so the link outlives the refresh. A source with drop rules under
-# `[ingest].drop_gate = true` is neither, and an adoption there is undone
-# by the very next refresh; the script picks around that and says so when
-# it cannot.
-#
-# `--adopt-source` names the target explicitly (id, slug or name),
-# `--no-adopt` revives the unlinked rows without linking them, which is
-# the old behaviour: a pristine `unknown` waiting for a feed, reachable
-# by nothing.
-#
-# Scope: vless rows whose network parameter is xhttp. Snell v6 and the
-# in-process SIP003 Shadowsocks plugins are the other two 0.22.0 gains, but
-# Fumox only learned to parse Snell and AnyTLS recently, so there is no older
-# population of stranded rows for them to revive.
+# Scope: vless rows only. Snell v6 and the SIP003 plugins are other 0.22.0
+# gains with no older stranded population to revive.
 #
 # Usage:
 #   scripts/revive-xhttp-proxies.sh [--dry-run] [--include-unlinked]
 #                                   [--adopt-source ID|SLUG|NAME] [--no-adopt] [db]
 #   scripts/revive-xhttp-proxies.sh --restore BACKUP [--dry-run] [db]
 #
-# --adopt-source and --no-adopt only mean something together with
-# --include-unlinked: the adoption target is needed for the unlinked half
-# only, and the linked half keeps the link it already has. Using either
-# flag on its own is refused (exit 64) rather than silently ignored.
+# --adopt-source and --no-adopt apply only together with --include-unlinked;
+# using either alone is refused (exit 64) rather than silently ignored.
 #
 # Environment:
 #   FUMOX_REFRESH_CHECK_LIMIT      cap on the priority enqueue (default 100)
@@ -70,33 +40,24 @@
 #   FUMOX_REVIVE_CONFIRM_STOPPED=1 restore over a database that still looks busy
 #
 # Takes a backup first and refuses to touch a database that is not there.
-# Linked rows are enqueued for priority checking, so the probe picks them up
-# on its next cycle instead of waiting for the random sample. Adopted rows
-# are enqueued on the same terms: they have a link by then.
+# Linked and adopted rows are enqueued for priority checking.
 #
-# `--restore` is the undo, done the only way that is safe. It checks the
-# backup before touching anything — a damaged backup, an empty one, or one
-# that does not carry the Fumox schema is refused — refuses while anything
-# still holds the database, snapshots what it is about to overwrite, holds
-# the exclusive lock for the whole copy, stages the copy in the database's
-# own directory and renames it into place, and verifies the result. The
-# bare `cp` this script used to suggest fails in two ways, and the quiet one
-# is worse: either SQLite replays a log belonging to a different file and
-# reports `database disk image is malformed`, or the log fits, the copy
-# "succeeds", `PRAGMA integrity_check` prints `ok`, and the database holds
-# the pre-restore data after all.
+# --restore is the undo: it checks the backup (integrity, Fumox schema) before
+# touching anything, refuses while anything still holds the database,
+# snapshots the current contents, holds the exclusive lock for the whole copy,
+# stages the copy beside the database and verifies the result. A bare `cp`
+# fails two ways: SQLite replays a -wal belonging to another file (`database
+# disk image is malformed`), or the log fits and the "restored" database is
+# the pre-restore one, passing integrity_check silently.
 set -euo pipefail
 
-# The directory the operator ran the script from. The cd below moves to the
-# repository root before the arguments are parsed, so a relative db or
-# backup path on the command line has to be expanded against this one, not
-# against the new working directory.
+# Captured before the cd below moves to the repository root: a relative db or
+# backup path on the command line resolves against the invocation directory
 INVOCATION_PWD="$PWD"
 
 cd "$(dirname "$0")/.."
 
-# The backup holds the whole database, credentials included: nothing this
-# script writes may be readable by anyone else.
+# The backup holds credentials, so nothing this script writes may be world-readable
 umask 077
 
 DRY_RUN=0
@@ -127,10 +88,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h | --help)
-            # The header block: from the second line to the line before the
-            # first executable one, comment markers stripped. awk rather
-            # than sed because BSD sed has no address range with a nested
-            # delete-and-print, and macOS is where this runs.
+            # Prints the header, comment markers stripped. awk rather than
+            # sed: BSD sed lacks the nested delete-and-print address range
             awk 'NR == 1 { next } /^set -euo/ { exit }
                  { sub(/^# ?/, ""); print }' "$0"
             exit 0
@@ -145,12 +104,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-# A relative path given on the command line is the operator's, resolved
-# against the directory the script was invoked from (captured above the
-# cd); the default below is the repository root's own fumox.db. Both are
-# made absolute — the restore hint prints the paths, and the printed
-# command must mean the same file whatever directory it is run from. A
-# leading ./ is folded away so the path does not grow a redundant segment.
+# A relative db or backup path resolves against INVOCATION_PWD (captured
+# above the cd); the default db is the repository root's own fumox.db. Both
+# are made absolute so the printed restore command means the same file from
+# any directory, and a leading ./ is folded away
 if [[ -n "$DB" ]]; then
     [[ "$DB" == /* ]] || DB="$INVOCATION_PWD/${DB#./}"
 fi
@@ -167,33 +124,28 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
     exit 69
 fi
 
-# Matches `[ingest].refresh_check_limit` as shipped in config/app.toml. The
-# probe's own throttle would apply either way, but the admin revival path
-# caps its enqueue the same way, and the script reports if the cap bit.
+# Matches `[ingest].refresh_check_limit` as shipped in config/app.toml: the
+# admin revival path caps its enqueue the same way and reports when the cap bit
 ENQUEUE_LIMIT="${FUMOX_REFRESH_CHECK_LIMIT:-100}"
-# Interpolated into the LIMIT clause below, so only a plain number may sit
-# there: an environment value is user input just like a flag is.
+# Interpolated into the LIMIT clause, so the environment value must be a plain number
 if ! [[ "$ENQUEUE_LIMIT" =~ ^[0-9]+$ ]]; then
     echo "error: FUMOX_REFRESH_CHECK_LIMIT must be a number, got '${ENQUEUE_LIMIT}'" >&2
     exit 64
 fi
 
-# The daemon may be running against the same file. The sqlite3 CLI defaults to
-# a zero busy timeout, which would turn a momentary lock into an immediate
-# "database is locked" halfway through the update; wait for the writer instead.
+# The sqlite3 CLI defaults to a zero busy timeout, which turns a momentary
+# lock into a mid-update "database is locked", so wait for the writer instead
 BUSY_MS="${FUMOX_SQLITE_BUSY_TIMEOUT_MS:-5000}"
 
-# The field separator of the multi-column queries below. It has to be a
-# character that cannot appear in the data, and the sqlite3 CLI escapes the
-# control characters it prints (0x1f comes out as the two characters "^_"),
-# so the separator is set on the CLI itself rather than built into the
-# query: the shell writes it out raw, while a character inside a value
-# would be escaped and could no longer collide with it.
+# Field separator of the multi-column queries below: it has to be a character
+# that cannot appear in the data, and the sqlite3 CLI escapes the control
+# characters it prints (0x1f comes out as "^_"), so the separator is set on
+# the CLI itself rather than built into the query: the shell writes it out
+# raw, while a character inside a value would be escaped and could not collide
 FIELD_SEP=$'\x1f'
 
-# The path reaches a SQL string literal, so a quote inside it is doubled. A
-# control character would split the statement, so it is refused rather than
-# escaped.
+# The path reaches a SQL string literal: a quote is doubled, a control
+# character would split the statement and is refused instead
 sql_literal() {
     if [[ "$1" == *[[:cntrl:]]* ]]; then
         echo "error: the path contains a control character: ${1}" >&2
@@ -203,17 +155,14 @@ sql_literal() {
     printf "%s%s%s" "$quoted" "${1//\'/$quoted$quoted}" "$quoted"
 }
 
-# helpers
-# The one output that must be exactly "ok". Anything else means the file is
-# damaged, and a restore on top of a damaged file is not worth attempting.
+# Anything but exactly "ok" means the file is damaged, and restoring on top
+# of a damaged file is not worth attempting
 integrity_is_ok() {
     [[ "$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$1" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]]
 }
 
-# Whether the file carries the Fumox schema: the tables this script works
-# with, and the columns it reads and writes. A file that passes
-# integrity_check is still only a file; restoring one whose schema is not
-# Fumox's would put a database the daemon cannot use where its own was.
+# A file that passes integrity_check is still only a file: restoring one
+# whose schema is not Fumox's would give the daemon a database it cannot use
 schema_is_fumox() {
     local counts
     counts="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$1" "
@@ -234,37 +183,23 @@ SELECT
     [[ "$counts" == "4|11|5|2|1" ]]
 }
 
-# The permissions of a file, as a chmod argument. Empty when the platform
-# does not answer.
+# File permissions as a chmod argument, empty when the platform does not answer
 file_mode() {
     stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null || echo ""
 }
 
-# The owner of a file, as a numeric uid. Empty when the platform does not
-# answer.
+# File owner as a numeric uid, empty when the platform does not answer
 file_uid() {
     stat -f '%u' "$1" 2>/dev/null || stat -c '%u' "$1" 2>/dev/null || echo ""
 }
 
-# occupancy
-# Whether anything still holds the database open.
-#
-# Two probes, because one is not enough in both journal modes.
-#
-# BEGIN EXCLUSIVE asks for the exclusive lock. In rollback-journal mode
-# that means no other connection may hold even a read lock, so any live
-# connection makes the probe fail. In WAL mode readers do not block the
-# writer, so the probe succeeds even while a reader is open.
-#
-# The sidecars cover what the first probe cannot see. A WAL database keeps
-# its -wal and -shm for as long as any connection has it open, and SQLite
-# deletes them when the last one closes. A sidecar that is still there
-# after this script's own connection has closed is therefore a connection
-# this script cannot see.
-#
-# What neither probe can see is a process that has the file open and holds
-# no lock at all: an idle connection in rollback-journal mode. The printed
-# procedure still tells the operator to stop the daemon.
+# Whether anything still holds the database open. Two probes, because one is
+# not enough in either journal mode: BEGIN EXCLUSIVE fails on any live
+# connection in rollback-journal mode but succeeds while WAL readers are
+# open, and the -wal/-shm sidecars (kept while any connection holds a WAL
+# database, deleted at the last close) cover that case. What neither probe
+# sees is an idle lock-free connection in rollback-journal mode, so the
+# printed procedure still tells the operator to stop the daemon
 db_is_closed() {
     local journal
     journal="$(sqlite3 -cmd ".timeout 0" "$DB" 'PRAGMA journal_mode;' 2>/dev/null)" || return 1
@@ -278,22 +213,13 @@ db_is_closed() {
     return 0
 }
 
-# the exclusive hold
-# The restore replaces the database file. Anything that writes to it while
-# the copy is in flight writes into the file being replaced, and the result
-# is a database that is neither the old one nor the new one. So the lock is
-# taken before the copy and held until the copy is done.
-#
-# The holder is a separate process. The script's own sqlite3 calls have to
-# be able to read the database, and in rollback-journal mode an exclusive
-# transaction blocks readers as well, so the holder cannot be this script's
-# own connection.
-#
-# The holder reads its commands from a FIFO: it executes the BEGIN, prints
-# its marker, and then waits for more input. The transaction stays open
-# until the input ends, which is what keeps the lock. Closing the write end
-# ends the holder — it sees EOF, exits, and rolls the transaction back — so
-# the lock cannot outlive the script, even if the script is killed.
+# The restore replaces the database file, so a concurrent write during the
+# copy would land in the file being replaced, leaving a database that is
+# neither old nor new: the lock is taken before the copy and held until it
+# is done. The holder is a separate process, since this script's own sqlite3
+# calls must still be able to read the database. It reads commands from a
+# FIFO, so the transaction stays open until the input ends: closing the
+# write end releases the lock even if the script is killed
 HOLD_PID=""
 HOLD_DIR=""
 HOLD_FD=0
@@ -305,19 +231,16 @@ hold_exclusive_lock() {
     out="${HOLD_DIR}/held"
     err="${HOLD_DIR}/err"
     mkfifo "$fifo" || return 1
-    # The commands come from -cmd rather than from the command line: the
-    # sqlite3 CLI runs a SQL argument and exits, and it would take the
-    # transaction with it. Read from the FIFO instead, and the process
-    # waits there for more input with the transaction still open.
+    # -cmd rather than a SQL argument: the CLI runs a SQL argument and exits,
+    # taking the transaction with it. Reading from the FIFO keeps it waiting
+    # with the transaction still open
     sqlite3 -cmd ".timeout ${BUSY_MS}" -cmd "BEGIN EXCLUSIVE;" -cmd "SELECT 'held';" \
         "$DB" <"$fifo" >"$out" 2>"$err" &
     HOLD_PID=$!
-    # The handshake: the holder opens the FIFO for reading, this shell opens
-    # it for writing, and neither moves until the other has.
+    # FIFO handshake: neither open completes until the other side is ready
     exec 8>"$fifo" || return 1
     HOLD_FD=1
-    # The lock is taken when the holder prints its marker. A database that
-    # is busy prints the error on stderr and never gets there.
+    # The marker means the lock was taken, a busy database errors on stderr
     while [[ "$waited" -lt 100 ]]; do
         if grep -q held "$out" 2>/dev/null && ! grep -qi error "$err" 2>/dev/null; then
             return 0
@@ -352,19 +275,17 @@ release_exclusive_lock() {
     fi
 }
 
-# The staged copy is written next to the database, so the rename into place
-# is atomic and stays on the same filesystem, and the database is never
-# half-written: the file that replaces it is complete and verified before
-# it takes the name.
+# Staged next to the database so the rename into place is atomic and stays
+# on one filesystem, and the replacement file is complete and verified
+# before it takes the name
 stage_copy() {
     local src="$1"
     STAGED="$(mktemp "$(dirname "$DB")/.fumox-restore.XXXXXX")"
     cp -P "$src" "$STAGED"
 }
 
-# Put a file over the database, keeping the owner and mode the daemon
-# expects. The staged file gets them before it takes the name, because the
-# name is all the daemon sees afterwards.
+# Owner and mode are applied to the staged file before the rename: the name
+# is all the daemon sees afterwards
 install_over_db() {
     local staged="$1"
     local mode uid staged_uid
@@ -386,7 +307,6 @@ install_over_db() {
     mv -f "$staged" "$DB"
 }
 
-# --restore
 run_restore() {
     if [[ -n "$ADOPT_SOURCE" || "$INCLUDE_UNLINKED" -eq 1 || "$ADOPT" -eq 0 ]]; then
         echo "error: --restore does the undo, it does not revive anything, so it" >&2
@@ -399,8 +319,7 @@ run_restore() {
         echo "it replaces a database that is already there." >&2
         exit 66
     fi
-    # A symlink at the database path is refused: the operator asked for a
-    # database, not for whatever the link points at.
+    # A symlink would restore whatever it points at, not the file that was named
     if [[ -L "$DB" ]]; then
         echo "error: ${DB} is a symlink, refusing to follow it" >&2
         exit 66
@@ -409,8 +328,7 @@ run_restore() {
         echo "error: no such backup: ${RESTORE}" >&2
         exit 66
     fi
-    # The same for the backup: copying through a symlink would restore
-    # whatever the link points at, not the file that was named.
+    # Same for the backup: copying through a symlink restores the target
     if [[ -L "$RESTORE" ]]; then
         echo "error: ${RESTORE} is a symlink, refusing to copy through it" >&2
         exit 66
@@ -419,18 +337,16 @@ run_restore() {
     echo "database: ${DB}"
     echo "backup:   ${RESTORE}"
 
-    # Noted before anything opens the file. The liveness probe below is
-    # itself a connection, and SQLite deletes the sidecars when the last one
-    # closes, so by the time the restore reaches its own cleanup the log is
-    # already gone and the report would claim there was nothing to remove.
+    # Noted before anything opens the file: the probes below are connections
+    # too, and SQLite deletes the sidecars at the last close, so by the time
+    # the cleanup runs the log is already gone
     HAD_WAL=0
     for sidecar in "${DB}-wal" "${DB}-shm"; do
         [[ -e "$sidecar" ]] && HAD_WAL=1
     done
 
-    # An empty file is not a database, and SQLite says so only after it has
-    # tried. The size is read here so the rest of the run can compare the
-    # copy against it.
+    # An empty file is not a database and SQLite says so only after trying.
+    # The size is read here so the copy can be compared against it later
     BACKUP_SIZE="$(wc -c <"$RESTORE" | tr -d ' ')"
     echo "size:     ${BACKUP_SIZE} bytes"
     if [[ "$BACKUP_SIZE" -eq 0 ]]; then
@@ -440,8 +356,8 @@ run_restore() {
         exit 67
     fi
 
-    # The backup is checked before anything is touched, so a damaged backup
-    # costs an error message and not the database it was about to replace.
+    # Checked before anything is touched, so a damaged backup costs an error
+    # message and not the database it was about to replace
     if ! integrity_is_ok "$RESTORE"; then
         echo >&2
         echo "error: ${RESTORE} does not pass PRAGMA integrity_check." >&2
@@ -452,10 +368,8 @@ run_restore() {
     fi
     echo "check:    backup passes integrity_check"
 
-    # A valid database is not yet a Fumox database. Restoring a file whose
-    # schema is another one's would leave the daemon with a database it
-    # cannot query, which is worse than the state the restore was meant to
-    # undo.
+    # A valid database is not yet a Fumox database, and the daemon cannot
+    # query another schema
     if ! schema_is_fumox "$RESTORE"; then
         echo >&2
         echo "error: ${RESTORE} does not carry the Fumox schema." >&2
@@ -500,16 +414,14 @@ run_restore() {
         exit 0
     fi
 
-    # The restore is itself undoable. Without this the only way back from a
-    # restore the operator did not want is another restore, and there may not
-    # be one: this snapshot is the state they were about to throw away.
+    # The restore must itself be undoable: this snapshot is the state the
+    # operator was about to throw away, and there may be no other way back
     STAMP="$(date +%Y%m%d-%H%M%S)"
     PREV="${DB}.pre-restore-${STAMP}"
 
-    # From here on the database file is replaced. Any abort has to say how to
-    # put the old one back, so the trap is installed before the first
-    # mutating action. The snapshot's path is known before the file exists,
-    # so the trap can name it even when the snapshot itself is what failed.
+    # Installed before the first mutating action: every abort from here must
+    # say how to put the old state back, and the snapshot path is known
+    # before the file exists
     trap on_restore_err ERR
 
     if [[ -e "$PREV" || -L "$PREV" ]]; then
@@ -517,10 +429,8 @@ run_restore() {
         echo "error: ${PREV} already exists, refusing to overwrite it" >&2
         exit 73
     fi
-    # The snapshot is written beside the database, so the rename stays on the
-    # same filesystem. VACUUM INTO writes the file itself and refuses to
-    # overwrite an existing one, so a path that is already there stops the
-    # run instead of being written through.
+    # Written beside the database so the rename stays on one filesystem.
+    # VACUUM INTO refuses to overwrite, so an existing path stops the run
     if ! sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" \
         "VACUUM INTO $(sql_literal "$PREV");" 2>/dev/null; then
         echo >&2
@@ -537,8 +447,8 @@ run_restore() {
     fi
     echo "snapshot: ${PREV}  (what was there before, restorable the same way)"
 
-    # The exclusive lock is held for the whole copy: a second writer that
-    # starts now would write into the file being replaced.
+    # The lock is held for the whole copy: a second writer would write into
+    # the file being replaced
     if ! hold_exclusive_lock; then
         release_exclusive_lock
         echo >&2
@@ -549,8 +459,8 @@ run_restore() {
         exit 75
     fi
 
-    # The hold is re-checked right before the copy: the point of holding it
-    # is that it is still ours at the moment the file is replaced.
+    # Re-checked right before the copy: the hold must still be ours when the
+    # file is replaced
     if ! kill -0 "$HOLD_PID" 2>/dev/null; then
         release_exclusive_lock
         echo >&2
@@ -592,8 +502,8 @@ run_restore() {
     fi
     STAGED=""
 
-    # The size is checked again on the file that took the name: a copy that
-    # came out short is rolled back rather than left in place.
+    # Size re-checked on the installed file: a short copy is rolled back, not
+    # left in place
     NEW_SIZE="$(wc -c <"$DB" | tr -d ' ')"
     if [[ "$NEW_SIZE" -ne "$BACKUP_SIZE" ]]; then
         release_exclusive_lock
@@ -607,10 +517,9 @@ run_restore() {
 
     release_exclusive_lock
 
-    # The sidecars belong to the file that was just replaced: a log of a
-    # different database would be replayed on top of the restored file. They
-    # go only now, after the copy is confirmed, so a failed copy never
-    # leaves the database without the log it was living with.
+    # The sidecars belong to the file that was just replaced and a stale log
+    # would be replayed on top of the restored file, so they go only after
+    # the copy is confirmed
     REMOVED=()
     for sidecar in "${DB}-wal" "${DB}-shm"; do
         if [[ -e "$sidecar" ]]; then
@@ -658,9 +567,8 @@ To put the previous contents back, restore the snapshot the same way:
 EOF
 }
 
-# Put the snapshot back over the database. Used when the restore produced
-# something that does not pass the checks: the operator's database is
-# worth more than the restore.
+# Used when the restore fails its checks: the operator's database is worth
+# more than the restore
 rollback_to_prev() {
     if [[ -z "${PREV:-}" || ! -f "$PREV" ]]; then
         echo >&2
@@ -676,9 +584,8 @@ rollback_to_prev() {
     echo "the state from before the restore was put back from ${PREV}." >&2
 }
 
-# The abort handler of the restore. It runs from the first mutating action
-# onwards, so it always knows the snapshot's path and can hand the
-# operator a ready-made rollback.
+# Runs from the first mutating action on, so it always knows the snapshot's
+# path and can hand the operator a ready-made rollback
 on_restore_err() {
     local code=$?
     trap - ERR
@@ -705,9 +612,8 @@ if [[ -n "$RESTORE" ]]; then
     exit 0
 fi
 
-# The adoption flags only have a subject together with --include-unlinked.
-# Silently ignoring them would leave the operator believing a target was
-# chosen when none was.
+# Silently ignoring the adoption flags would leave the operator believing a
+# target was chosen when none was
 if [[ "$INCLUDE_UNLINKED" -eq 0 && ( -n "$ADOPT_SOURCE" || "$ADOPT" -eq 0 ) ]]; then
     echo "error: --adopt-source and --no-adopt only apply together with" >&2
     echo "--include-unlinked: the adoption target is needed for the unlinked" >&2
@@ -720,10 +626,8 @@ if [[ ! -f "$DB" ]]; then
     exit 66
 fi
 
-# Every query below reads `proxies` through the same alias, so one link
-# predicate serves all of them. Two spellings of it is how this script once
-# shipped a broken default run: the report's unaliased copy resolved, the
-# target set's did not.
+# One link predicate for every query: two spellings of it once shipped a
+# broken default run (the report's copy resolved, the target set's did not)
 LINKED="EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)"
 if [[ "$INCLUDE_UNLINKED" -eq 1 ]]; then
     SELECT_LINKED="1"
@@ -733,18 +637,17 @@ else
     SELECT_SCOPE="removed xhttp vless rows that still have a source link"
 fi
 
-# Only a row whose params really is JSON can carry a transport, and
-# json_extract raises on malformed JSON rather than returning NULL, so the
-# validity check has to guard the extraction. CASE evaluates its branches
-# in order, which is what keeps the malformed rows out of the extraction.
+# json_extract raises on malformed JSON rather than returning NULL, so
+# json_valid guards it, and CASE evaluating its branches in order keeps the
+# malformed rows out of the extraction
 XHTTP="scheme = 'vless' AND CASE WHEN json_valid(params) THEN lower(json_extract(params, '\$.type')) END = 'xhttp'"
 
-# The selection, shared by every report and by the update. json_extract keeps
-# this exact: a LIKE over `params` would also match an xhttp string living in
-# a path or a host, which is not the same thing as an xhttp transport.
+# The selection, shared by every report and the update. json_extract keeps it
+# exact: a LIKE over `params` would also match an xhttp string in a path or
+# host, which is not an xhttp transport.
 #
 # The census decides whether the run says "Nothing to revive." and exits 0, so
-# a database that cannot be read must not be mistaken for an empty one.
+# an unreadable database must not be mistaken for an empty one
 CENSUS_ERR="$(mktemp "${TMPDIR:-/tmp}/fumox-census.XXXXXX")"
 if ! CENSUS="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" 2>"${CENSUS_ERR}" <<SQL
 SELECT
@@ -803,10 +706,8 @@ if [[ "$REVIVABLE" -eq 0 ]]; then
     exit 0
 fi
 
-# Adoption target
-# Only the unlinked half is adopted; rows that already have a link keep the
-# one they have, since a second link would make reconciliation of either
-# source responsible for the other's proxies.
+# Only the unlinked half is adopted: a second link would make reconciliation
+# of either source responsible for the other's proxies
 ADOPT_ID=""
 ADOPT_NAME=""
 ADOPT_RISK=""
@@ -820,15 +721,14 @@ if [[ "$INCLUDE_UNLINKED" -eq 1 && "$UNLINKED_REMOVED" -gt 0 ]]; then
         echo "future fetch can reach them. They wait for a feed that carries them."
     elif [[ -n "$ADOPT_SOURCE" ]]; then
         # An explicit target is matched on id, then slug, then name, and an
-        # ambiguous name is refused rather than resolved by row order: a
-        # wrong source here is a link nothing will ever reconcile. The value
-        # reaches single-quoted SQL literals below, so its single quotes are
-        # doubled. The replacement goes through a variable because bash 3.2
-        # keeps the backslashes of an escaped replacement in ${var//pat/repl}.
+        # ambiguous name is refused: a wrong source here is a link nothing
+        # will ever reconcile. The value reaches SQL literals below, so its
+        # quotes are doubled through a variable because bash 3.2 keeps the
+        # backslashes of an escaped replacement in ${var//pat/repl}
         QUOTED_QUOTE="''"
         ADOPT_SOURCE_SQL="${ADOPT_SOURCE//\'/$QUOTED_QUOTE}"
-        # Name selected last: read hands the last variable everything after
-        # the third separator, so a pipe in a name cannot shift the fields.
+        # Name read last: everything after the third separator lands there,
+        # so a '|' in a name cannot shift the fields
         IFS="$FIELD_SEP" read -r MATCHES ADOPT_ID ADOPT_ENABLED ADOPT_DROPS ADOPT_NAME <<<"$(sqlite3 -cmd ".timeout ${BUSY_MS}" -cmd ".separator ${FIELD_SEP}" "$DB" <<SQL
 SELECT COUNT(*), id, enabled,
        COALESCE(json_array_length(json_extract(pipeline, '\$.drop')), 0),
@@ -847,9 +747,8 @@ SQL
             echo "error: no source matches '${ADOPT_SOURCE}' (looked at id, slug and name)" >&2
             exit 67
         fi
-        # The id reaches a SQL string literal just below, so it is checked
-        # against the shape nanoid(12) produces rather than trusted - and
-        # checked before the first literal it reaches, not after.
+        # The id reaches a SQL literal just below, so it is checked against
+        # the shape nanoid(12) produces before its first use
         if ! [[ "$ADOPT_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
             echo >&2
             echo "error: source id '${ADOPT_ID}' is not a plain nanoid, refusing to interpolate it" >&2
@@ -863,17 +762,14 @@ SQL
             exit 67
         fi
     else
-        # Preference order, cheapest safety first: a source that is enabled
-        # and has no drop rules serves the proxy in its /sub output and
-        # still keeps the link (no drop rules means the alive-linger policy
-        # holds under any drop_gate), a disabled source keeps the link but
-        # serves nothing, and a source with drop rules is only safe while
-        # drop_gate is off, which is a config fact this script does not
-        # read, so it goes last and gets a warning.
+        # Cheapest safety first: enabled with no drop rules serves /sub and
+        # keeps the link (alive-linger holds under any drop_gate), disabled
+        # keeps the link but serves nothing, and drop rules are only safe
+        # while [ingest].drop_gate is off, a config fact this script does
+        # not read, so such a source goes last with a warning.
         #
-        # The fields are separated by a unit separator rather than a pipe:
-        # a '|' in a source name must not shift the drop-rule count, which
-        # would move the source into the wrong safety branch.
+        # A unit separator rather than a pipe: a '|' in a source name must
+        # not shift the drop-rule count into the wrong safety branch
         CANDIDATES="$(sqlite3 -cmd ".timeout ${BUSY_MS}" -cmd ".separator ${FIELD_SEP}" "$DB" <<SQL
 WITH ranked AS (
   SELECT id, name, enabled, created_at,
@@ -892,10 +788,9 @@ SQL
         while IFS="$FIELD_SEP" read -r RANK_ID RANK_ENABLED RANK_DROPS RANK_NAME; do
             [[ -n "$RANK_ID" ]] || continue
             SEEN_CANDIDATES=$((SEEN_CANDIDATES + 1))
-            # The id reaches a SQL string literal below, so only an id that
-            # is a plain nanoid may be used. A source whose id is not one is
-            # skipped, not adopted: the alternative is a literal that carries
-            # a quote into the statement.
+            # The id reaches a SQL literal below: a source whose id is not a
+            # plain nanoid is skipped rather than adopted, since its id could
+            # carry a quote into the statement
             if ! [[ "$RANK_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
                 continue
             fi
@@ -950,16 +845,14 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${DB}.pre-xhttp-revival-${STAMP}"
 echo "backup:   ${BACKUP}"
 
-# The backup path must be free. VACUUM INTO refuses to overwrite an existing
-# file, and a symlink planted at the path would be written through if the
-# copy were made by any other means.
+# The backup path must be free: VACUUM INTO refuses to overwrite, and a
+# symlink planted there would be written through
 if [[ -e "$BACKUP" || -L "$BACKUP" ]]; then
     echo "error: ${BACKUP} already exists, refusing to overwrite it" >&2
     exit 73
 fi
-# WAL mode: the .db alone is not a consistent snapshot, let sqlite make it.
-# VACUUM INTO writes the copy itself, so the path never reaches a dot
-# command as text that sqlite would have to parse.
+# WAL mode: the .db alone is not a consistent snapshot, so VACUUM INTO makes
+# the copy itself and the path never reaches a dot command as text
 if ! sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" \
     "VACUUM INTO $(sql_literal "$BACKUP");" 2>/dev/null; then
     echo >&2
@@ -978,16 +871,12 @@ for sidecar in "${DB}-wal" "${DB}-shm"; do
     [[ -e "$sidecar" ]] && echo "note: ${sidecar} exists, the backup above already checkpointed it"
 done
 
-# The undo instructions, in one place because they are wrong in one obvious
-# way and that way is what an operator reaches for. `cp backup db` swaps the
-# main file while the -wal and -shm of the *current* database stay next to
-# it, and SQLite then replays a write-ahead log that belongs to a different
-# file. The result is either a hard `database disk image is malformed` (the
-# log's frames do not fit the restored file) or, worse, no error at all: the
-# log replays cleanly on top of the backup and the "restored" database is
-# the pre-restore one, verified `ok` and silently not the file you copied.
-# Both come from the same copy, and both mean the sidecars have to go and
-# the writers have to be stopped first.
+# Why a bare cp is never suggested: it swaps the main file while the -wal and
+# -shm of the current database stay next to it, and SQLite then replays a log
+# that belongs to a different file. That reads as a hard
+# `database disk image is malformed`, or worse as no error at all: the log
+# replays cleanly and the "restored" database is the pre-restore one, passing
+# integrity_check while silently not being the file that was copied
 restore_hint() {
     cat <<EOF
 To undo, restore ${BACKUP}. Stop whatever writes to ${DB} first: with a
@@ -1019,8 +908,7 @@ database it overwrites and no verification of the backup.
 EOF
 }
 
-# The shorter advice for the aborts after the backup. Never a bare cp: the
-# header explains what the current -wal/-shm do to a restored file.
+# Shorter advice for aborts after the backup, never a bare cp
 undo_hint() {
     echo "the backup ${BACKUP} is intact. To undo, stop the daemon and run" >&2
     echo "  scripts/revive-xhttp-proxies.sh --restore ${BACKUP} ${DB}" >&2
@@ -1032,8 +920,8 @@ undo_hint() {
 
 NOW="$(date +%s)"
 
-# From here on the backup exists, so any abort must say how to undo itself:
-# `set -e` would otherwise exit silently with the database already touched.
+# The backup now exists, so every abort must say how to undo itself: `set -e`
+# would otherwise exit silently with the database already touched
 on_err() {
     local code=$?
     echo >&2
@@ -1046,11 +934,10 @@ on_err() {
 }
 trap on_err ERR
 
-# The target set is materialised first so the update, the adoption and the
-# enqueue agree on exactly the same rows, without a RETURNING clause the
-# reader would have to know the SQLite version for. The link predicate rides
-# on the row so the adoption can tell the two populations apart without
-# re-deriving it.
+# Materialised first so the update, the adoption and the enqueue agree on the
+# same rows, without a RETURNING clause the reader would have to know the
+# SQLite version for. The link predicate rides on the row so the adoption can
+# tell the two populations apart without re-deriving it
 ADOPT_SQL=""
 if [[ -n "$ADOPT_ID" ]]; then
     ADOPT_SQL="
@@ -1063,11 +950,9 @@ SELECT id, '${ADOPT_ID}', ${NOW} FROM xhttp_adopt;
 SELECT 'adopted', changes();"
 fi
 
-# `changes()` is read straight after the statement it describes, so nothing
-# may sit between them: it reports the rows that INSERT actually added, not
-# the rows the table happens to hold for those ids. Counting the table
-# instead is how this script once reported ten enqueues it never made, the
-# ten being rows another enqueue had left there earlier.
+# `changes()` is read straight after the statement it describes: it reports
+# the rows INSERT actually added, not what the table holds for those ids.
+# Counting the table instead once reported ten enqueues that were never made
 RESULT="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
 CREATE TEMP TABLE xhttp_revive AS
 SELECT p.id AS id, ${LINKED} AS linked
@@ -1098,9 +983,8 @@ SELECT p.id, ${NOW} FROM proxies p
 
 SELECT 'queued', changes();
 
--- Counted in the same connection: the temp table above is gone by the time a
--- second sqlite3 runs, and a durable recount could not tell our rows from
--- anything else enqueued in the same second.
+-- Counted in this same connection: the temp table is gone once sqlite3 exits,
+-- and a later recount could not tell our rows from anything else enqueued
 SELECT 'revived', (SELECT COUNT(*) FROM xhttp_revive)
 UNION ALL
 SELECT 'revived_linked', (SELECT COUNT(*) FROM xhttp_revive WHERE linked = 1);
@@ -1115,8 +999,8 @@ REVIVED_LINKED="$(read_count revived_linked)"
 ADOPTED="$(read_count adopted)"
 QUEUED="$(read_count queued)"
 
-# The counts come back as text; a silent parse failure would surface much
-# later as an arithmetic error on an empty string, far from its cause.
+# The counts come back as text: a silent parse failure would surface later as
+# arithmetic on an empty string, far from its cause
 for pair in "revived:${REVIVED}" "linked:${REVIVED_LINKED}" "queued:${QUEUED}"; do
     if ! [[ "${pair#*:}" =~ ^[0-9]+$ ]]; then
         echo "error: could not read the ${pair%%:*} count back from sqlite3" >&2
@@ -1133,7 +1017,7 @@ ADOPTED="${ADOPTED:-0}"
 
 if [[ "$REVIVED" -ne "$REVIVABLE" ]]; then
     # Expected only if the daemon moved rows while the script ran, which the
-    # busy timeout is there to absorb rather than to fail on.
+    # busy timeout absorbs rather than fails on
     echo "note: ${REVIVABLE} row(s) matched the selection but ${REVIVED} were"
     echo "revived, so something else changed them in between."
 fi
@@ -1152,9 +1036,8 @@ elif [[ "$INCLUDE_UNLINKED" -eq 1 && "$UNLINKED_REMOVED" -gt 0 ]]; then
 fi
 echo "enqueued for priority checking: ${QUEUED}"
 
-# Only rows that ended up with a link are enqueueable at all, so the cap is
-# worth mentioning only when there were some: a run that revived nothing
-# enqueueable has not hit the cap, it simply had nothing to enqueue.
+# Only rows that ended up with a link are enqueueable, so a run that revived
+# nothing enqueueable has not hit the cap, it simply had nothing to enqueue
 ENQUEUEABLE=$((REVIVED_LINKED + ADOPTED))
 if [[ "${QUEUED}" -lt "${ENQUEUEABLE}" ]]; then
     echo

@@ -1,30 +1,25 @@
-# Dependabot version updates for Fumox.
-#
+# Dependabot version updates for Fumox
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-#
-# Shape of the config: one grouped PR per ecosystem per run instead of one
-# PR per dependency, a raised PR limit so a group never blocks the next
-# batch, and a cooldown so a release that is retracted or superseded within
-# a few days never becomes a PR. Cooldown applies to version updates only —
-# security updates still arrive immediately.
-#
-# `prefix: build` + `include: scope` produces `build(deps): ...`, which is
-# what cliff.toml's commit_parsers drop from the changelog: a dependency
-# bump is not a change to the shipped image.
-#
+# One grouped PR per ecosystem per run instead of one PR per dependency, a
+# raised PR limit so a group never blocks the next batch, and a cooldown so
+# a retracted or superseded release never becomes a PR (cooldown applies to
+# version updates only, security updates still arrive immediately)
+# `prefix: build` + `include: scope` produces `build(deps): ...`, which
+# cliff.toml's commit_parsers drop from the changelog: a dependency bump is
+# not a change to the shipped image
 # What Dependabot CANNOT see, and why:
-#   - the meow-rs release pin (version + two archive sha256 sums). No
-#     ecosystem tracks a GitHub release tarball; .github/workflows/update-meow.yml
-#     proposes that bump instead.
-#   - the cargo-chef release pin and its two checksums in the Dockerfile.
-#     Same reason; bump CARGO_CHEF_VERSION and the sums by hand.
-#   - the `# syntax=docker/dockerfile:1@sha256:...` frontend directive. The
-#     Dockerfile parser does not inspect directives. Bump it with
-#     `docker buildx imagetools inspect docker/dockerfile:1`.
-#   - dtolnay/rust-toolchain, ignored below: the pin tracks the `stable`
-#     BRANCH, not a release.
-#   - the actionlint and cargo-audit CLI versions in ci.yml; update those
-#     explicit install-command pins manually.
+#   - the meow-rs release pin (version + two archive sha256 sums): no
+#     ecosystem tracks a GitHub release tarball, .github/workflows/update-meow.yml
+#     proposes that bump instead
+#   - the cargo-chef release pin and its two checksums in the Dockerfile:
+#     bump CARGO_CHEF_VERSION and the sums by hand
+#   - the `# syntax=docker/dockerfile:1@sha256:...` frontend directive: the
+#     Dockerfile parser does not inspect directives; bump it via
+#     `docker buildx imagetools inspect docker/dockerfile:1`
+#   - dtolnay/rust-toolchain (ignored below): the pin tracks the `stable`
+#     BRANCH, not a release
+#   - the actionlint and cargo-audit CLI versions in ci.yml: update those
+#     explicit install-command pins manually
 
 version: 2
 updates:
@@ -46,8 +41,8 @@ updates:
           - "*"
 
   # Every `uses:` in .github/workflows is pinned to a commit SHA with a
-  # version comment. Dependabot resolves the SHA to a tag itself and
-  # rewrites both the SHA and the comment, so the pins stay exact.
+  # version comment; Dependabot resolves the SHA to a tag and rewrites both,
+  # so the pins stay exact
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -63,16 +58,15 @@ updates:
       include: "scope"
     groups:
       # One PR for the whole action set: the docker/* actions release
-      # together and bumping them apart only creates merge conflicts.
+      # together, bumping them apart only creates merge conflicts
       actions:
         patterns:
           - "*"
     ignore:
-      # The pin is the head of the `stable` branch, which is AHEAD of the
-      # repository's only tag (v1). Dependabot resolves a SHA pin through
+      # The pin is the head of the `stable` branch, AHEAD of the
+      # repository's only tag (v1); Dependabot resolves a SHA pin through
       # tags, so a bump here would move the toolchain backwards. Bump it
-      # deliberately: gh api repos/dtolnay/rust-toolchain/branches/stable
-      #   --jq .commit.sha
+      # deliberately: gh api repos/dtolnay/rust-toolchain/branches/stable --jq .commit.sha
       - dependency-name: "dtolnay/rust-toolchain"
 
   # The workspace crates (fumox-core, fumox-server, fumox-probe) and
@@ -97,18 +91,16 @@ updates:
       prefix: "build"
       include: "scope"
     groups:
-      # One PR per batch of related Rust dependencies: a workspace-wide
-      # resolution is tested once by `cargo test --locked`, not once per
-      # crate.
+      # One PR per batch: a workspace-wide resolution is tested once by
+      # `cargo test --locked`, not once per crate
       rust:
         patterns:
           - "*"
 
   # The Dockerfiles pin their base images by digest; Dependabot tracks the
   # tag the pin was taken from and proposes a digest bump when the tag
-  # moves. Each Dockerfile directory has its own entry. Literal FROM and
-  # supported Compose image fields are tracked; interpolated references
-  # such as ${FUMOX_IMAGE:-...} are not.
+  # moves. Literal FROM and supported Compose image fields are tracked,
+  # interpolated references such as ${FUMOX_IMAGE:-...} are not
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
@@ -123,7 +115,7 @@ updates:
       include: "scope"
     groups:
       # The chef and runtime stages share bases; one PR keeps them in
-      # step instead of landing a base-image bump twice.
+      # step instead of landing a base-image bump twice
       root-images:
         patterns:
           - "*"

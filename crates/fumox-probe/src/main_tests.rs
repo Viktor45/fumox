@@ -879,6 +879,12 @@ fn test_config(fail_limit: u32, meow_addr: &str, meow_config: PathBuf) -> AppCon
             backoff_max_secs: 900,
             ipv6: false,
         },
+        network: fumox_core::config::NetworkConfig {
+            // The integration harness below drives the delay lane only; the
+            // speed/trace lanes are unit-tested on their own clients
+            speed_enabled: false,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -954,6 +960,17 @@ fn row_from_entry(id: i64, entry: fumox_core::models::ProxyEntry) -> proxies::Pr
         removed_at: None,
         latency_ms: None,
         speed_mbps: None,
+        speed_at: None,
+        egress_ip: None,
+        cf_colo: None,
+        cf_loc: None,
+        cf_warp: None,
+        trace_json: None,
+        egress_country: None,
+        egress_asn: None,
+        egress_asn_org: None,
+        egress_geo_attempts: 0,
+        last_egress_geo_attempt_at: None,
         created_at: 1,
         updated_at: 1,
     }
@@ -978,7 +995,9 @@ fn mixed_batch_writes_exactly_the_supported_proxy() {
     ];
 
     let records = engine_records(&rows, &std::collections::HashMap::new());
-    let (yaml, included) = clash::generate(&records, false).unwrap();
+    let generated = clash::generate(&records, false, &clash::SpeedPlan::empty()).unwrap();
+    let yaml = generated.yaml;
+    let included = generated.included;
     let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
     let proxies = parsed["proxies"].as_sequence().unwrap();
     assert_eq!(proxies.len(), 1, "{yaml}");

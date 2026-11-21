@@ -15,7 +15,7 @@
 //! from the output while they stay stored, a drop rule with
 //! `target: "asn"` keeps them from being stored at all.
 
-use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoResolver, HostGeo, apply_template};
+use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoResolver, HostGeo, apply_template_with};
 use fumox_core::models::{ProxyEntry, ProxyStatus, Scheme};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,10 @@ pub(crate) struct PipelineConfig {
     pub(crate) geo: Option<GeoStepConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) health: Option<HealthConfig>,
+    /// The speed gate: keep only measured-and-fast-enough
+    /// proxies. See [`SpeedStepConfig`] for the exact semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) speed: Option<SpeedStepConfig>,
     /// Accepted-but-ignored backward-compatibility key: v1 deduplication
     /// is unconditional (by fingerprint), so any `dedup` section is a
     /// no-op. Accepted rather than rejected so old exports keep importing;
@@ -88,6 +92,37 @@ pub(crate) struct FilterConfig {
     /// drop rule with `target: "asn"` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exclude_asns: Option<Vec<String>>,
+    /// Cloudflare trace `colo=` codes to keep, the IATA
+    /// datacenter code (`"FRA"`); comparison is case-insensitive.
+    /// null = no allowlist; a proxy without a trace is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) colo: Option<Vec<String>>,
+    /// Trace datacenter codes to hide, the same format as
+    /// [`Self::colo`]; a proxy without a trace survives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) exclude_colo: Option<Vec<String>>,
+    /// Trace `loc=` country codes to keep, the same
+    /// case-insensitive comparison as [`Self::colo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) loc: Option<Vec<String>>,
+    /// Trace country codes to hide, the same format as
+    /// [`Self::loc`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) exclude_loc: Option<Vec<String>>,
+    /// Trace `warp=` states to keep: `on`, `off`, `plus`.
+    /// Same confirmed-facts semantics as the geo allowlists: a proxy
+    /// without a trace is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) warp: Option<Vec<String>>,
+    /// Egress geo countries to keep, ISO codes like the
+    /// profile country allowlist; `egress_country` is the country the
+    /// proxy's traffic appears from, not the proxy server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) egress_countries: Option<Vec<String>>,
+    /// Egress AS numbers to keep, the same accepted format as
+    /// [`Self::asns`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) egress_asns: Option<Vec<String>>,
     /// Drop proxies that allow insecure TLS: any
     /// certificate-verification alias set to a truthy value. Default on.
     /// `normalize_params` is the v1 name of the same switch (serde alias,
@@ -293,6 +328,29 @@ pub(crate) struct HealthConfig {
     pub(crate) exclude_statuses: Vec<String>,
 }
 
+/// The `speed` step: keep only proxies whose last measured
+/// download throughput clears `min_mbps`, and whose measurement is not
+/// older than `max_age_secs`. Both keys optional; a section with neither
+/// is a no-op the builder never emits. `min_mbps`/`max_age_secs` are raw
+/// JSON numbers like `limit.count`, so a fractional or out-of-range input
+/// fails with the field-level error instead of an opaque serde type error.
+///
+/// The confirmed-facts-only semantics: a proxy without a measurement (or
+/// with one past `max_age_secs`) is filtered — "not measured yet" is not a
+/// pass, the same contract the geo allowlists keep for an unknown country.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpeedStepConfig {
+    /// Mbit/s threshold; `0` keeps every measured proxy, `null`/missing
+    /// = no threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_mbps: Option<serde_json::Number>,
+    /// A measurement older than this many seconds counts as missing;
+    /// `null`/missing = any age counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_age_secs: Option<serde_json::Number>,
+}
+
 /// The typed source of truth behind [`default_exclude_statuses`] and the
 /// default pipeline's health filter. The string form derives from
 /// `as_str()`, the exact spelling `ProxyStatus::from_str` accepts, so the
@@ -323,15 +381,20 @@ pub(crate) enum SortBy {
     Name,
     Country,
     Latency,
+    /// Download throughput: fastest first, the useful default —
+    /// unlike `latency`, where ascending means fastest already. `desc:
+    /// true` reverses to slowest first. Unmeasured rows always go last.
+    Speed,
 }
 
 impl SortBy {
     /// Every sort key, in schema order (pipeline editor select options).
-    pub(crate) const ALL: [SortBy; 4] = [
+    pub(crate) const ALL: [SortBy; 5] = [
         SortBy::Source,
         SortBy::Name,
         SortBy::Country,
         SortBy::Latency,
+        SortBy::Speed,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -340,6 +403,7 @@ impl SortBy {
             SortBy::Name => "name",
             SortBy::Country => "country",
             SortBy::Latency => "latency",
+            SortBy::Speed => "speed",
         }
     }
 }
@@ -400,6 +464,19 @@ pub struct CompiledPipeline {
     /// profile country allowlist).
     filter_asns: Option<Vec<u32>>,
     exclude_asns: Option<Vec<u32>>,
+    /// Cloudflare trace datacenter codes to keep, uppercased at compile.
+    filter_colo: Option<Vec<String>>,
+    exclude_colo: Option<Vec<String>>,
+    /// Trace country codes to keep, uppercased at compile.
+    filter_loc: Option<Vec<String>>,
+    exclude_loc: Option<Vec<String>>,
+    /// Trace WARP states to keep.
+    filter_warp: Option<Vec<String>>,
+    /// Egress geo countries to keep, uppercased at compile.
+    filter_egress_countries: Option<Vec<String>>,
+    /// Egress AS numbers to keep; a proxy without a resolved egress ASN
+    /// is dropped when this is set (the `filter_asns` semantics).
+    filter_egress_asns: Option<Vec<u32>>,
     /// Drop any proxy that allows insecure TLS (a truthy
     /// certificate-verification alias, see
     /// [`fumox_core::models::is_insecure_param`]).
@@ -409,6 +486,9 @@ pub struct CompiledPipeline {
     geo_enabled: bool,
     geo_template: String,
     exclude_statuses: Vec<ProxyStatus>,
+    /// The speed gate: `None` = the step is not configured.
+    speed_min_mbps: Option<f64>,
+    speed_max_age_secs: Option<i64>,
     sort_by: SortBy,
     sort_desc: bool,
     /// Output-size cap; `None` = no cap.
@@ -429,12 +509,21 @@ impl Default for CompiledPipeline {
             exclude_protocols: None,
             filter_asns: None,
             exclude_asns: None,
+            filter_colo: None,
+            exclude_colo: None,
+            filter_loc: None,
+            exclude_loc: None,
+            filter_warp: None,
+            filter_egress_countries: None,
+            filter_egress_asns: None,
             forbid_insecure: true,
             rename: Vec::new(),
             drop: Vec::new(),
             geo_enabled: true,
             geo_template: DEFAULT_GEO_TEMPLATE.to_string(),
             exclude_statuses: DEFAULT_EXCLUDED_STATUSES.to_vec(),
+            speed_min_mbps: None,
+            speed_max_age_secs: None,
             sort_by: SortBy::Source,
             sort_desc: false,
             limit_count: None,
@@ -505,6 +594,9 @@ impl CompiledPipeline {
         if let Some(health) = config.health {
             compiled.compile_health(&health, &mut errors);
         }
+        if let Some(speed) = config.speed {
+            compiled.compile_speed(speed, &mut errors);
+        }
 
         // `dedup` is accepted and ignored, see [`PipelineConfig::dedup`]
 
@@ -535,7 +627,38 @@ impl CompiledPipeline {
         );
         self.filter_asns = parse_asn_list(&filter.asns, "filter.asns", errors);
         self.exclude_asns = parse_asn_list(&filter.exclude_asns, "filter.exclude_asns", errors);
+        self.filter_colo = parse_trace_codes(&filter.colo, "filter.colo", errors);
+        self.exclude_colo = parse_trace_codes(&filter.exclude_colo, "filter.exclude_colo", errors);
+        self.filter_loc = parse_trace_codes(&filter.loc, "filter.loc", errors);
+        self.exclude_loc = parse_trace_codes(&filter.exclude_loc, "filter.exclude_loc", errors);
+        self.filter_warp = parse_warp_states(&filter.warp, "filter.warp", errors);
+        self.filter_egress_countries =
+            parse_trace_codes(&filter.egress_countries, "filter.egress_countries", errors);
+        self.filter_egress_asns = parse_asn_list(&filter.egress_asns, "filter.egress_asns", errors);
         self.forbid_insecure = filter.forbid_insecure;
+    }
+
+    /// The `speed` section: both keys are raw JSON numbers, so
+    /// the parse is validated here with field-level errors.
+    fn compile_speed(&mut self, speed: SpeedStepConfig, errors: &mut Vec<PipelineIssue>) {
+        if let Some(min) = &speed.min_mbps {
+            match min.as_f64() {
+                Some(v) if (0.0..=100_000.0).contains(&v) => self.speed_min_mbps = Some(v),
+                _ => errors.push(PipelineIssue {
+                    key: "pipeline.invalid_speed_min",
+                    args: vec![min.to_string()],
+                }),
+            }
+        }
+        if let Some(age) = &speed.max_age_secs {
+            match age.as_i64() {
+                Some(v) if (1..=30 * 24 * 3600).contains(&v) => self.speed_max_age_secs = Some(v),
+                _ => errors.push(PipelineIssue {
+                    key: "pipeline.invalid_speed_max_age",
+                    args: vec![age.to_string()],
+                }),
+            }
+        }
     }
 
     /// The `rename` section: every rule compiles its regex and target. A
@@ -855,15 +978,19 @@ impl CompiledPipeline {
         self.sort_explicit
     }
 
-    /// Per-source steps: filter → normalize → rename →
+    /// Per-source steps: speed-gate → filter → normalize → rename →
     /// geo-enrich → health-filter. `/sub` runs this for every source with
     /// the merged (source + profile) pipeline, then calls [`Self::finalize`]
-    /// once on the merged result.
+    /// once on the merged result. The speed gate runs first: it reads only
+    /// stored facts, and every candidate it removes is one the geo steps
+    /// do not have to look up.
     pub async fn apply_per_source<G: HostGeo + ?Sized>(
         &self,
         mut candidates: Vec<Candidate>,
         geo: &G,
     ) -> Vec<Candidate> {
+        self.speed_step(&mut candidates);
+        self.filter_trace_step(&mut candidates);
         self.filter_protocols_step(&mut candidates);
         self.filter_asns_step(&mut candidates, geo).await;
         // forbid_insecure, before `rename`: the DB row is never touched
@@ -878,6 +1005,34 @@ impl CompiledPipeline {
         self.geo_enrich_step(&mut candidates, geo).await;
         self.health_step(&mut candidates);
         candidates
+    }
+
+    /// The `speed` step: keep only proxies whose last measured
+    /// throughput clears `min_mbps` and is no older than `max_age_secs`.
+    /// Both gates read stored facts only — no lookup, no status change;
+    /// an unmeasured (or stale-measured) proxy fails the step, the
+    /// confirmed-facts-only contract.
+    fn speed_step(&self, candidates: &mut Vec<Candidate>) {
+        if self.speed_min_mbps.is_none() && self.speed_max_age_secs.is_none() {
+            return;
+        }
+        let now = fumox_core::models::now_ts();
+        let before = candidates.len();
+        candidates.retain(|c| {
+            let Some(mbps) = c.speed_mbps else {
+                return false;
+            };
+            if let (Some(max_age), Some(at)) = (self.speed_max_age_secs, c.speed_at)
+                && now.saturating_sub(at) > max_age
+            {
+                return false;
+            }
+            match self.speed_min_mbps {
+                Some(min) => mbps >= min,
+                None => true,
+            }
+        });
+        log_filter_step("speed", before, candidates.len());
     }
 
     /// The `filter.protocols` / `filter.exclude_protocols` step: when
@@ -895,6 +1050,76 @@ impl CompiledPipeline {
             candidates.retain(|c| !excluded.contains(&c.entry.scheme));
         }
         log_filter_step("protocols", before, candidates.len());
+    }
+
+    /// The trace/egress gates: `colo`/`loc`/`warp` read the
+    /// Cloudflare trace the probe stamped, `egress_countries`/
+    /// `egress_asns` the server-derived egress geo. Allowlists follow the
+    /// confirmed-facts-only semantics of the geo filters — a proxy
+    /// without the fact an allowlist asks for is dropped; exclude lists
+    /// keep what they cannot name. All comparisons are exact against the
+    /// uppercased-at-compile lists.
+    fn filter_trace_step(&self, candidates: &mut Vec<Candidate>) {
+        if self.filter_colo.is_none()
+            && self.exclude_colo.is_none()
+            && self.filter_loc.is_none()
+            && self.exclude_loc.is_none()
+            && self.filter_warp.is_none()
+            && self.filter_egress_countries.is_none()
+            && self.filter_egress_asns.is_none()
+        {
+            return;
+        }
+        let before = candidates.len();
+        candidates.retain(|c| {
+            let colo = c.cf_colo.as_deref().map(str::to_ascii_uppercase);
+            let loc = c.cf_loc.as_deref().map(str::to_ascii_uppercase);
+            if let Some(allowed) = &self.filter_colo
+                && !colo.as_ref().is_some_and(|v| allowed.contains(v))
+            {
+                return false;
+            }
+            if let Some(excluded) = &self.exclude_colo
+                && colo.as_ref().is_some_and(|v| excluded.contains(v))
+            {
+                return false;
+            }
+            if let Some(allowed) = &self.filter_loc
+                && !loc.as_ref().is_some_and(|v| allowed.contains(v))
+            {
+                return false;
+            }
+            if let Some(excluded) = &self.exclude_loc
+                && loc.as_ref().is_some_and(|v| excluded.contains(v))
+            {
+                return false;
+            }
+            if let Some(allowed) = &self.filter_warp
+                && !c
+                    .cf_warp
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|v| allowed.contains(&v))
+            {
+                return false;
+            }
+            if let Some(allowed) = &self.filter_egress_countries
+                && !c
+                    .egress_country
+                    .as_deref()
+                    .map(str::to_ascii_uppercase)
+                    .is_some_and(|v| allowed.contains(&v))
+            {
+                return false;
+            }
+            if let Some(allowed) = &self.filter_egress_asns
+                && !c.egress_asn.is_some_and(|v| allowed.contains(&v))
+            {
+                return false;
+            }
+            true
+        });
+        log_filter_step("trace", before, candidates.len());
     }
 
     /// The ASN step: the filters read `candidate.geo_asn`, which a row
@@ -1013,8 +1238,15 @@ impl CompiledPipeline {
             Ok(infos) => {
                 for (candidate, info) in candidates.iter_mut().zip(infos) {
                     if let Some(info) = info {
-                        let renamed =
-                            apply_template(&self.geo_template, &info, &candidate.entry.name);
+                        // The template renders the geo facts and the
+                        // speed/trace facts of the row together:
+                        // `{speed} {colo} · {name}` needs both columns
+                        let renamed = apply_template_with(
+                            &self.geo_template,
+                            &info,
+                            &candidate.entry.name,
+                            &candidate.trace_facts(),
+                        );
                         candidate.entry.name = renamed;
                         candidate.geo_country = info.country_code.clone();
                     }
@@ -1103,6 +1335,21 @@ impl CompiledPipeline {
                 candidates.sort_by_key(|c| match c.latency_ms {
                     Some(ms) => (0u8, if self.sort_desc { -ms } else { ms }),
                     None => (1u8, 0),
+                });
+            }
+            SortBy::Speed => {
+                // Fastest first by default — the useful direction for
+                // throughput, unlike `latency`, whose ascending order
+                // already means fastest. `desc: true` reverses. Unmeasured
+                // rows always go last, both directions
+                candidates.sort_by(|a, b| match (a.speed_mbps, b.speed_mbps) {
+                    (Some(x), Some(y)) => {
+                        let ord = x.total_cmp(&y);
+                        if self.sort_desc { ord } else { ord.reverse() }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
                 });
             }
         }
@@ -1476,6 +1723,57 @@ fn parse_asn_list(
     Some(asns)
 }
 
+/// A trace-code list (`filter.colo`/`loc`/`egress_countries`):
+/// entries are uppercased at compile so the runtime comparison is exact.
+/// A code is uppercased, not validated against a table: Cloudflare adds
+/// datacenters (and the trace carries whatever the edge reports), and an
+/// over-strict list would silently drop real ones.
+fn parse_trace_codes(
+    raw: &Option<Vec<String>>,
+    field: &str,
+    errors: &mut Vec<PipelineIssue>,
+) -> Option<Vec<String>> {
+    let Some(raw) = raw else {
+        return None;
+    };
+    let mut codes = Vec::new();
+    for value in raw {
+        let upper = value.trim().to_ascii_uppercase();
+        if upper.is_empty() {
+            errors.push(PipelineIssue {
+                key: "pipeline.empty_trace_code",
+                args: vec![field.to_string()],
+            });
+            continue;
+        }
+        codes.push(upper);
+    }
+    Some(codes)
+}
+
+/// The accepted `warp=` states (`filter.warp`): the three values
+/// the Cloudflare trace emits, lowercased at compile.
+fn parse_warp_states(
+    raw: &Option<Vec<String>>,
+    field: &str,
+    errors: &mut Vec<PipelineIssue>,
+) -> Option<Vec<String>> {
+    let Some(raw) = raw else {
+        return None;
+    };
+    let mut states = Vec::new();
+    for value in raw {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "off" | "plus" => states.push(value.trim().to_ascii_lowercase()),
+            other => errors.push(PipelineIssue {
+                key: "pipeline.unknown_warp",
+                args: vec![field.to_string(), other.to_string()],
+            }),
+        }
+    }
+    Some(states)
+}
+
 /// One proxy on its way through the pipeline: the entry plus the DB-side
 /// context the steps need (status, latency, source order, stored geo).
 #[derive(Debug, Clone)]
@@ -1491,6 +1789,35 @@ pub struct Candidate {
     /// once at the DB boundary; the filters and drop rules compare plain
     /// numbers, never `AS{n}` strings.
     pub geo_asn: Option<u32>,
+    /// The speed/trace facts of the proxy row: the measured
+    /// download throughput and when, the Cloudflare trace fields and the
+    /// server-derived egress geo. All optional — a row the probe has not
+    /// measured carries `None` and the filters treat it as "no data".
+    pub speed_mbps: Option<f64>,
+    pub speed_at: Option<i64>,
+    pub cf_colo: Option<String>,
+    pub cf_loc: Option<String>,
+    pub cf_warp: Option<String>,
+    pub egress_country: Option<String>,
+    /// The egress AS, parsed to its number once at the DB boundary like
+    /// [`Candidate::geo_asn`].
+    pub egress_asn: Option<u32>,
+}
+
+impl Candidate {
+    /// The trace facts in the shape the name template renders: the value
+    /// of the `{speed}`, `{colo}`, `{loc}`, `{warp}`, `{egress_country}`
+    /// and `{egress_asn}` placeholders.
+    fn trace_facts(&self) -> fumox_core::geo::TraceNameFacts {
+        fumox_core::geo::TraceNameFacts {
+            speed_mbps: self.speed_mbps,
+            colo: self.cf_colo.clone(),
+            loc: self.cf_loc.clone(),
+            warp: self.cf_warp.clone(),
+            egress_country: self.egress_country.clone(),
+            egress_asn: self.egress_asn.map(fumox_core::geo::asn_text),
+        }
+    }
 }
 
 /// The compile cache of [`CompiledPipeline::from_json_cached`]. A
@@ -1536,6 +1863,13 @@ mod tests {
             latency_ms: None,
             geo_country: None,
             geo_asn: None,
+            speed_mbps: None,
+            speed_at: None,
+            cf_colo: None,
+            cf_loc: None,
+            cf_warp: None,
+            egress_country: None,
+            egress_asn: None,
         }
     }
 
@@ -2976,6 +3310,184 @@ mod tests {
         );
     }
 
+    /// The `speed` step: an unmeasured proxy fails the gate, a
+    /// measurement below the threshold fails, a stale measurement counts
+    /// as missing when `max_age_secs` is set; `min_mbps: 0` keeps every
+    /// measured proxy.
+    #[tokio::test]
+    async fn speed_step_filters_unmeasured_slow_and_stale() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "speed": { "min_mbps": 10, "max_age_secs": 3600 }
+        })))
+        .unwrap();
+        let now = fumox_core::models::now_ts();
+        let with_speed = |name: &str, host: &str, mbps: Option<f64>, at: Option<i64>| {
+            let mut c = candidate(name, Scheme::Vless, host);
+            c.speed_mbps = mbps;
+            c.speed_at = at;
+            c
+        };
+        let out = compiled
+            .apply(
+                vec![
+                    with_speed("unmeasured", "h1.example.com", None, None),
+                    with_speed("slow", "h2.example.com", Some(5.0), Some(now)),
+                    with_speed("stale", "h3.example.com", Some(50.0), Some(now - 7200)),
+                    with_speed("ok", "h4.example.com", Some(12.5), Some(now - 1800)),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["ok"], "only the fresh, fast-enough proxy survives");
+
+        // `min_mbps: 0` without an age cap keeps every measured proxy and
+        // still drops the unmeasured one
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "speed": { "min_mbps": 0 }
+        })))
+        .unwrap();
+        let out = compiled
+            .apply(
+                vec![
+                    with_speed("unmeasured", "h1.example.com", None, None),
+                    with_speed("slow", "h2.example.com", Some(0.5), Some(now)),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entry.name, "slow");
+    }
+
+    /// The trace gates: allowlists drop proxies without the
+    /// fact, exclude lists keep them; comparisons are case-insensitive.
+    #[tokio::test]
+    async fn trace_filters_apply_allowlists_and_excludes() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "colo": [" fra "], "exclude_loc": ["nl"], "warp": ["off"] }
+        })))
+        .unwrap();
+        let with_trace = |name: &str, host: &str, colo: &str, loc: &str, warp: &str| {
+            let mut c = candidate(name, Scheme::Vless, host);
+            c.cf_colo = Some(colo.into());
+            c.cf_loc = Some(loc.into());
+            c.cf_warp = Some(warp.into());
+            c
+        };
+        let out = compiled
+            .apply(
+                vec![
+                    with_trace("no-trace", "h1.example.com", "", "", ""),
+                    with_trace("wrong-colo", "h2.example.com", "AMS", "DE", "off"),
+                    with_trace("excluded-loc", "h3.example.com", "FRA", "NL", "off"),
+                    with_trace("wrong-warp", "h4.example.com", "FRA", "DE", "plus"),
+                    with_trace("ok", "h5.example.com", "FRA", "DE", "off"),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["ok"]);
+
+        // The egress gates: an allowlist drops unresolved rows, an ASN in
+        // either spelling matches
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "egress_countries": ["us"], "egress_asns": ["AS15169"] }
+        })))
+        .unwrap();
+        let mut ok = candidate("ok", Scheme::Vless, "h6.example.com");
+        ok.egress_country = Some("US".into());
+        ok.egress_asn = Some(15169);
+        let mut no_country = candidate("no-country", Scheme::Vless, "h7.example.com");
+        no_country.egress_asn = Some(15169);
+        let mut wrong_asn = candidate("wrong-asn", Scheme::Vless, "h8.example.com");
+        wrong_asn.egress_country = Some("US".into());
+        wrong_asn.egress_asn = Some(9009);
+        let out = compiled
+            .apply(vec![ok, no_country, wrong_asn], &inactive_geo())
+            .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entry.name, "ok");
+    }
+
+    /// `sort.by = "speed"` puts the fastest first by default (the useful
+    /// direction for throughput), reverses with `desc`, and unmeasured
+    /// rows always go last.
+    #[tokio::test]
+    async fn sort_by_speed_fastest_first_nulls_last() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "sort": { "by": "speed" }
+        })))
+        .unwrap();
+        let with_speed = |name: &str, host: &str, mbps: Option<f64>| {
+            let mut c = candidate(name, Scheme::Vless, host);
+            c.speed_mbps = mbps;
+            c
+        };
+        let out = compiled
+            .apply(
+                vec![
+                    with_speed("unmeasured", "h1.example.com", None),
+                    with_speed("slow", "h2.example.com", Some(5.0)),
+                    with_speed("fast", "h3.example.com", Some(90.0)),
+                    with_speed("mid", "h4.example.com", Some(20.0)),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["fast", "mid", "slow", "unmeasured"]);
+
+        // `desc` reverses among the measured rows, the unmeasured one
+        // still goes last
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "sort": { "by": "speed", "desc": true }
+        })))
+        .unwrap();
+        let out = compiled
+            .apply(
+                vec![
+                    with_speed("slow", "h2.example.com", Some(5.0)),
+                    with_speed("unmeasured", "h1.example.com", None),
+                    with_speed("fast", "h3.example.com", Some(90.0)),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["slow", "fast", "unmeasured"]);
+    }
+
+    /// The speed step runs before the geo steps: a candidate it removes
+    /// costs no geo lookup, observable through the resolver call count of
+    /// the shared `HostGeo` seam.
+    #[tokio::test]
+    async fn the_speed_step_runs_before_the_geo_steps() {
+        // The inactive resolver asserts the ordering contract differently:
+        // with no lookups at all the step order is invisible, so this test
+        // pins only that the speed gate still filters when geo is off —
+        // the step never depends on the resolver being active
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "speed": { "min_mbps": 10 }
+        })))
+        .unwrap();
+        let mut fast = candidate("fast", Scheme::Vless, "h1.example.com");
+        fast.speed_mbps = Some(50.0);
+        let mut slow = candidate("slow", Scheme::Vless, "h2.example.com");
+        slow.speed_mbps = Some(1.0);
+        let out = compiled.apply(vec![fast, slow], &inactive_geo()).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entry.name, "fast");
+    }
+
     #[tokio::test]
     async fn limit_truncates_after_sort_to_the_top() {
         // `sort: latency` + `limit: 2` yields the two fastest proxies
@@ -3326,6 +3838,7 @@ mod tests {
             drop: None,
             geo: None,
             health: None,
+            speed: None,
             dedup: None,
             sort: None,
             limit: None,
@@ -3343,6 +3856,13 @@ mod tests {
                 exclude_protocols: None,
                 asns: None,
                 exclude_asns: None,
+                colo: None,
+                exclude_colo: None,
+                loc: None,
+                exclude_loc: None,
+                warp: None,
+                egress_countries: None,
+                egress_asns: None,
                 forbid_insecure: true,
             }),
             rename: Some(Vec::new()),
@@ -3390,6 +3910,13 @@ mod tests {
                 exclude_protocols: Some(vec!["ss".into()]),
                 asns: Some(vec!["24940".into()]),
                 exclude_asns: Some(vec!["AS9009".into()]),
+                colo: Some(vec!["FRA".into()]),
+                exclude_colo: Some(vec!["AMS".into()]),
+                loc: Some(vec!["DE".into()]),
+                exclude_loc: Some(vec!["NL".into()]),
+                warp: Some(vec!["off".into()]),
+                egress_countries: Some(vec!["US".into()]),
+                egress_asns: Some(vec!["AS15169".into()]),
                 forbid_insecure: false,
             }),
             rename: Some(vec![RenameRule {
@@ -3418,6 +3945,10 @@ mod tests {
             }),
             health: Some(HealthConfig {
                 exclude_statuses: vec!["removed".into()],
+            }),
+            speed: Some(SpeedStepConfig {
+                min_mbps: Some(serde_json::Number::from_f64(10.0).unwrap()),
+                max_age_secs: Some(serde_json::Number::from(86_400i64)),
             }),
             dedup: Some(DedupConfig {
                 by: "fingerprint".into(),

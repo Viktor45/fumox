@@ -407,6 +407,9 @@ mod tests {
             "idx_proxies_updated_at",
             "idx_proxies_geo_attempt",
             "idx_proxies_last_t2_checked_at",
+            "idx_proxies_speed",
+            "idx_proxies_egress_country",
+            "idx_proxies_colo",
         ] {
             assert!(indexes.contains(&expected), "missing index {expected}");
         }
@@ -423,6 +426,25 @@ mod tests {
             "the proxy row must carry the T2 recency stamp"
         );
 
+        // The speed/trace/egress facts of migration 0022 are on the proxy
+        // row
+        for column in [
+            "speed_at",
+            "egress_ip",
+            "cf_colo",
+            "cf_loc",
+            "cf_warp",
+            "trace_json",
+            "egress_country",
+            "egress_asn",
+            "egress_asn_org",
+        ] {
+            assert!(
+                columns.contains(&column),
+                "the proxy row must carry the speed/trace column {column}"
+            );
+        }
+
         // The geo-unknown flag of migration 0021 is on the profile row
         let profile_columns: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM pragma_table_info('profiles')")
@@ -438,10 +460,10 @@ mod tests {
             "the profile row must carry the geo-unknown flag"
         );
 
-        // Schema version is stamped into meta by db::migrate; 21 is
-        // migration 0021 (the profiles.include_unknown_country flag)
+        // Schema version is stamped into meta by db::migrate; 22 is
+        // migration 0022 (the speed/trace/egress columns on `proxies`)
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("21"));
+        assert_eq!(version.as_deref(), Some("22"));
 
         // The fetch-attempt stamp of migration 0015 is on the source row
         let source_columns: Vec<(String,)> =

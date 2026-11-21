@@ -11,7 +11,7 @@
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::pipeline::{
     DEFAULT_GEO_TEMPLATE, DropRule, FilterConfig, GeoStepConfig, HealthConfig, LimitConfig,
-    PipelineConfig, PipelineIssue, RenameRule, SortBy, SortConfig,
+    PipelineConfig, PipelineIssue, RenameRule, SortBy, SortConfig, SpeedStepConfig,
 };
 use askama::Template;
 use fumox_core::models::{ProxyStatus, Scheme};
@@ -103,6 +103,23 @@ pub(crate) struct BuilderState {
     pub asns: String,
     /// AS numbers to drop, the same comma-separated form.
     pub exclude_asns: String,
+    /// Cloudflare trace datacenter codes to keep, comma-separated
+    /// free text (`FRA, SXC`). Not a registry-driven list: the datacenter
+    /// set is large and grows, so the widget validates instead of
+    /// enumerating.
+    pub colo: String,
+    /// Trace datacenter codes to drop, the same comma-separated form.
+    pub exclude_colo: String,
+    /// Trace country codes to keep, the same comma-separated form.
+    pub loc: String,
+    /// Trace country codes to drop, the same comma-separated form.
+    pub exclude_loc: String,
+    /// Trace WARP states to keep, the fixed three-value vocabulary.
+    pub warp: Vec<String>,
+    /// Egress geo countries to keep, the same comma-separated form.
+    pub egress_countries: String,
+    /// Egress AS numbers to keep, the same comma-separated form as `asns`.
+    pub egress_asns: String,
     /// Drop proxies that allow insecure TLS. Defaults on;
     /// `false` is the only non-default value the emit ever writes.
     pub forbid_insecure: bool,
@@ -122,6 +139,15 @@ pub(crate) struct BuilderState {
     pub health_set: bool,
     pub health_defaults: bool,
     pub exclude_statuses: Vec<String>,
+    /// The `speed` section, the same tri-state as sort: keep
+    /// only measured-and-fast-enough proxies.
+    pub speed_set: bool,
+    pub speed_defaults: bool,
+    /// Mbit/s threshold as free text; a mistyped entry rides along to the
+    /// validation like `limit_count`.
+    pub speed_min_mbps: String,
+    /// Measurement max age in seconds as free text, the same contract.
+    pub speed_max_age_secs: String,
     pub sort_set: bool,
     pub sort_defaults: bool,
     /// Empty or `"source"` is the default (never emitted).
@@ -314,6 +340,7 @@ impl BuilderState {
         let (filter_set, filter_defaults) = mode_flags(&get("ped_filter"));
         let (geo_set, geo_defaults) = mode_flags(&get("ped_geo"));
         let (health_set, health_defaults) = mode_flags(&get("ped_health"));
+        let (speed_set, speed_defaults) = mode_flags(&get("ped_speed"));
         let (sort_set, sort_defaults) = mode_flags(&get("ped_sort"));
         let (limit_set, limit_defaults) = mode_flags(&get("ped_limit"));
         let rename_mode = get("ped_rename");
@@ -326,6 +353,13 @@ impl BuilderState {
             exclude_protocols: get_all("ped_filter_exclude"),
             asns: get("ped_filter_asns"),
             exclude_asns: get("ped_filter_exclude_asns"),
+            colo: get("ped_filter_colo"),
+            exclude_colo: get("ped_filter_exclude_colo"),
+            loc: get("ped_filter_loc"),
+            exclude_loc: get("ped_filter_exclude_loc"),
+            warp: get_all("ped_filter_warp"),
+            egress_countries: get("ped_filter_egress_countries"),
+            egress_asns: get("ped_filter_egress_asns"),
             forbid_insecure: flag("ped_forbid_insecure", true),
             rename,
             rename_skip: rename_mode == "skip",
@@ -340,6 +374,10 @@ impl BuilderState {
             health_set,
             health_defaults,
             exclude_statuses: get_all("ped_health_exclude"),
+            speed_set,
+            speed_defaults,
+            speed_min_mbps: get("ped_speed_min_mbps"),
+            speed_max_age_secs: get("ped_speed_max_age_secs"),
             sort_set,
             sort_defaults,
             sort_by: get("ped_sort_by"),
@@ -374,6 +412,7 @@ impl BuilderState {
             drop: None,
             geo: None,
             health: None,
+            speed: None,
             dedup: None,
             sort: None,
             limit: None,
@@ -384,6 +423,7 @@ impl BuilderState {
         self.emit_drop(&mut config);
         self.emit_geo(&mut config);
         self.emit_health(&mut config);
+        let mistyped_speed = self.emit_speed(&mut config, &mut issues);
         let mistyped_sort = self.emit_sort(&mut config, &mut issues);
         let mistyped_limit = self.emit_limit(&mut config, &mut issues);
 
@@ -403,6 +443,21 @@ impl BuilderState {
             return None; // only "version", nothing configured
         }
         let mut document = readable.clone();
+        // The mistyped speed values ride along, exactly like the mistyped
+        // cap: the typed config cannot hold them, the preview must still
+        // show what was typed so the validation can report it
+        let (raw_min, raw_age) = mistyped_speed;
+        if raw_min.is_some() || raw_age.is_some() {
+            let speed = document["speed"].as_object_mut();
+            if let Some(map) = speed {
+                if let Some(raw) = raw_min {
+                    map.insert("min_mbps".into(), serde_json::json!(raw));
+                }
+                if let Some(raw) = raw_age {
+                    map.insert("max_age_secs".into(), serde_json::json!(raw));
+                }
+            }
+        }
         if let Some(raw) = &mistyped_limit {
             document["limit"] = serde_json::json!({ "count": raw });
         }
@@ -431,15 +486,35 @@ impl BuilderState {
                 exclude_protocols: None,
                 asns: None,
                 exclude_asns: None,
+                colo: None,
+                exclude_colo: None,
+                loc: None,
+                exclude_loc: None,
+                warp: None,
+                egress_countries: None,
+                egress_asns: None,
                 forbid_insecure: true,
             });
         } else if self.filter_set {
             let asns = split_asn_field(&self.asns);
             let exclude_asns = split_asn_field(&self.exclude_asns);
+            let colo = split_code_field(&self.colo);
+            let exclude_colo = split_code_field(&self.exclude_colo);
+            let loc = split_code_field(&self.loc);
+            let exclude_loc = split_code_field(&self.exclude_loc);
+            let egress_countries = split_code_field(&self.egress_countries);
+            let egress_asns = split_asn_field(&self.egress_asns);
             let has_values = !self.protocols.is_empty()
                 || !self.exclude_protocols.is_empty()
                 || asns.is_some()
                 || exclude_asns.is_some()
+                || colo.is_some()
+                || exclude_colo.is_some()
+                || loc.is_some()
+                || exclude_loc.is_some()
+                || !self.warp.is_empty()
+                || egress_countries.is_some()
+                || egress_asns.is_some()
                 || !self.forbid_insecure;
             if has_values {
                 // Empty lists are "not set" for the emit (the schema's
@@ -450,10 +525,89 @@ impl BuilderState {
                         .then(|| self.exclude_protocols.clone()),
                     asns,
                     exclude_asns,
+                    colo,
+                    exclude_colo,
+                    loc,
+                    exclude_loc,
+                    warp: (!self.warp.is_empty()).then(|| self.warp.clone()),
+                    egress_countries,
+                    egress_asns,
                     forbid_insecure: self.forbid_insecure,
                 });
             }
         }
+    }
+
+    /// The `speed` section: an explicit `{}` in the defaults
+    /// mode, the parsed numbers in the set mode. A mistyped number is
+    /// reported through `issues` and returned as the raw value that rides
+    /// along in the emitted document, the same contract as the limit cap.
+    /// Returns `(raw min_mbps, raw max_age_secs)` for the caller's patch.
+    fn emit_speed(
+        &self,
+        config: &mut PipelineConfig,
+        issues: &mut Vec<PipelineIssue>,
+    ) -> (Option<String>, Option<String>) {
+        if self.speed_defaults {
+            // An explicit `{}`: a profile resets the source's speed gate
+            config.speed = Some(SpeedStepConfig {
+                min_mbps: None,
+                max_age_secs: None,
+            });
+            return (None, None);
+        }
+        if !self.speed_set {
+            return (None, None);
+        }
+        let raw_min = self.speed_min_mbps.trim();
+        let raw_age = self.speed_max_age_secs.trim();
+        let min = if raw_min.is_empty() {
+            None
+        } else {
+            match raw_min.parse::<f64>() {
+                Ok(v) if (0.0..=100_000.0).contains(&v) => Some(serde_json::json!(v).as_f64()),
+                _ => {
+                    issues.push(PipelineIssue {
+                        key: "pipeline.invalid_speed_min",
+                        args: vec![raw_min.to_string()],
+                    });
+                    Some(None)
+                }
+            }
+        };
+        let age = if raw_age.is_empty() {
+            None
+        } else {
+            match raw_age.parse::<i64>() {
+                Ok(v) if (1..=30 * 24 * 3600).contains(&v) => Some(Some(v)),
+                _ => {
+                    issues.push(PipelineIssue {
+                        key: "pipeline.invalid_speed_max_age",
+                        args: vec![raw_age.to_string()],
+                    });
+                    Some(None)
+                }
+            }
+        };
+        let typed_min = min.flatten();
+        let typed_age = age.flatten();
+        if typed_min.is_some() || typed_age.is_some() {
+            config.speed = Some(SpeedStepConfig {
+                min_mbps: typed_min.and_then(serde_json::Number::from_f64),
+                max_age_secs: typed_age.map(serde_json::Number::from),
+            });
+        }
+        let raw_min = if min == Some(None) {
+            Some(raw_min.to_string())
+        } else {
+            None
+        };
+        let raw_age = if age == Some(None) {
+            Some(raw_age.to_string())
+        } else {
+            None
+        };
+        (raw_min, raw_age)
     }
 
     /// The rename section: an explicit `[]` in the defaults mode, the
@@ -865,6 +1019,7 @@ impl BuilderState {
         state.ingest_drop(config.drop);
         state.ingest_geo(config.geo);
         state.ingest_health(config.health);
+        state.ingest_speed(config.speed);
         state.ingest_sort(config.sort);
         state.ingest_limit(config.limit);
         // `dedup` has no builder field: the section is accepted and
@@ -887,6 +1042,16 @@ impl BuilderState {
                 .is_some_and(|p| !p.is_empty())
             || filter.asns.as_ref().is_some_and(|a| !a.is_empty())
             || filter.exclude_asns.as_ref().is_some_and(|a| !a.is_empty())
+            || filter.colo.as_ref().is_some_and(|a| !a.is_empty())
+            || filter.exclude_colo.as_ref().is_some_and(|a| !a.is_empty())
+            || filter.loc.as_ref().is_some_and(|a| !a.is_empty())
+            || filter.exclude_loc.as_ref().is_some_and(|a| !a.is_empty())
+            || filter.warp.as_ref().is_some_and(|a| !a.is_empty())
+            || filter
+                .egress_countries
+                .as_ref()
+                .is_some_and(|a| !a.is_empty())
+            || filter.egress_asns.as_ref().is_some_and(|a| !a.is_empty())
             || !filter.forbid_insecure;
         if has_values {
             self.filter_set = true;
@@ -897,10 +1062,37 @@ impl BuilderState {
             // does not rewrite what was configured
             self.asns = filter.asns.unwrap_or_default().join(", ");
             self.exclude_asns = filter.exclude_asns.unwrap_or_default().join(", ");
+            // The trace codes are stored uppercased by the compiler; the
+            // fields show them as stored, the round trip stays faithful
+            self.colo = filter.colo.unwrap_or_default().join(", ");
+            self.exclude_colo = filter.exclude_colo.unwrap_or_default().join(", ");
+            self.loc = filter.loc.unwrap_or_default().join(", ");
+            self.exclude_loc = filter.exclude_loc.unwrap_or_default().join(", ");
+            self.warp = filter.warp.unwrap_or_default();
+            self.egress_countries = filter.egress_countries.unwrap_or_default().join(", ");
+            self.egress_asns = filter.egress_asns.unwrap_or_default().join(", ");
             self.forbid_insecure = filter.forbid_insecure;
         } else {
             self.filter_defaults = true;
         }
+    }
+
+    /// The `speed` section: an explicit `{}` (both keys absent)
+    /// maps to the defaults mode, the parsed numbers rebuild the fields.
+    fn ingest_speed(&mut self, speed: Option<SpeedStepConfig>) {
+        let Some(speed) = speed else {
+            return;
+        };
+        if speed.min_mbps.is_none() && speed.max_age_secs.is_none() {
+            self.speed_defaults = true;
+            return;
+        }
+        self.speed_set = true;
+        self.speed_min_mbps = speed.min_mbps.map(|v| v.to_string()).unwrap_or_default();
+        self.speed_max_age_secs = speed
+            .max_age_secs
+            .map(|v| v.to_string())
+            .unwrap_or_default();
     }
 
     /// The rename section: an explicit `[]` maps to the defaults mode, the
@@ -1056,6 +1248,8 @@ pub(crate) struct BuilderView {
     pub protocols: Vec<(String, bool)>,
     pub exclude_protocols: Vec<(String, bool)>,
     pub statuses: Vec<(String, bool)>,
+    /// The fixed `warp=` vocabulary with the selected flags.
+    pub warp_states: Vec<(String, bool)>,
     pub sort_options: Vec<(String, bool)>,
 }
 
@@ -1087,10 +1281,18 @@ impl BuilderView {
         if !state.sort_by.is_empty() {
             append_outsiders(&mut sort_options, std::slice::from_ref(&state.sort_by));
         }
+        // The three states the Cloudflare trace emits, in their natural
+        // order; a value outside the vocabulary cannot be typed here (the
+        // field is a checkbox list, not free text)
+        let warp_states: Vec<(String, bool)> = ["on", "off", "plus"]
+            .iter()
+            .map(|name| (name.to_string(), state.warp.iter().any(|v| v == name)))
+            .collect();
         Self {
             protocols,
             exclude_protocols,
             statuses,
+            warp_states,
             sort_options,
             state: BuilderState {
                 rename: display_rows(&state.rename),
@@ -1131,6 +1333,13 @@ impl BuilderView {
     /// (the JSON omits `health` entirely).
     pub(crate) fn health_section_active(&self) -> bool {
         self.state.health_set || self.state.health_defaults
+    }
+
+    /// The speed section is being overridden ("set"/"defaults");
+    /// when `skip`, the threshold fields are hidden (the JSON omits
+    /// `speed` entirely).
+    pub(crate) fn speed_section_active(&self) -> bool {
+        self.state.speed_set || self.state.speed_defaults
     }
 
     /// The sort section is being overridden ("set"/"defaults"); when
@@ -1202,12 +1411,16 @@ impl Schema {
         SortBy::ALL.iter().map(|s| s.as_str()).collect()
     }
 
-    /// Geo template placeholders, all six that
-    /// `fumox_core::geo::apply_template` renders, so the hint cannot drift
-    /// from the engine: the names come from the engine's own registry,
-    /// braced here for the template hint.
-    pub(crate) fn geo_placeholders() -> [String; 6] {
-        fumox_core::geo::TEMPLATE_PLACEHOLDERS.map(|name| format!("{{{name}}}"))
+    /// Geo template placeholders, all of them that
+    /// `fumox_core::geo::apply_template` renders (geo facts plus the Phase
+    /// 5 trace facts), so the hint cannot drift from the engine: the names
+    /// come from the engine's own registry, braced here for the template
+    /// hint.
+    pub(crate) fn geo_placeholders() -> Vec<String> {
+        fumox_core::geo::TEMPLATE_PLACEHOLDERS
+            .iter()
+            .map(|name| format!("{{{name}}}"))
+            .collect()
     }
 }
 
@@ -1232,6 +1445,15 @@ fn split_asn_field(raw: &str) -> Option<Vec<String>> {
     } else {
         Some(entries)
     }
+}
+
+/// Split the comma-separated trace-code text field (`colo`, `loc`,
+/// `egress_countries`) into trimmed entries, the same contract as
+/// [`split_asn_field`]: `None` when the field holds no entry at all, an
+/// entry survives verbatim (the compiler uppercases it, the validator
+/// reports nothing — there is no closed code table to check against).
+fn split_code_field(raw: &str) -> Option<Vec<String>> {
+    split_asn_field(raw)
 }
 
 /// `#ped-preview` content: the generated JSON plus its validation outcome
@@ -2695,15 +2917,23 @@ mod tests {
         );
         assert_eq!(
             Schema::sort_options(),
-            ["source", "name", "country", "latency"]
+            ["source", "name", "country", "latency", "speed"]
         );
         // The hint's placeholders are the geo engine's own registry,
         // braced for the template hint
         assert_eq!(
             Schema::geo_placeholders(),
-            fumox_core::geo::TEMPLATE_PLACEHOLDERS.map(|name| format!("{{{name}}}"))
+            fumox_core::geo::TEMPLATE_PLACEHOLDERS
+                .iter()
+                .map(|name| format!("{{{name}}}"))
+                .collect::<Vec<_>>()
         );
         assert_eq!(Schema::geo_placeholders()[0], "{flag}");
+        assert_eq!(
+            Schema::geo_placeholders()[6],
+            "{speed}",
+            "the trace placeholders follow the geo ones"
+        );
     }
 
     #[test]
@@ -2958,10 +3188,12 @@ mod tests {
     }
 
     /// Sections that carry the tri-state radio on the source form.
-    const SOURCE_FORM_SECTIONS: [&str; 5] = ["filter", "geo", "health", "sort", "limit"];
+    const SOURCE_FORM_SECTIONS: [&str; 6] = ["filter", "geo", "health", "speed", "sort", "limit"];
     /// The sections that carry it on the profile form: the source form's
     /// set plus the two rule lists.
-    const ALL_SECTIONS: [&str; 7] = ["filter", "rename", "drop", "geo", "health", "sort", "limit"];
+    const ALL_SECTIONS: [&str; 8] = [
+        "filter", "rename", "drop", "geo", "health", "speed", "sort", "limit",
+    ];
     /// The rule lists: profile-only by design, the source form carries no
     /// rename/drop toggle at all.
     const PROFILE_ONLY_SECTIONS: [&str; 2] = ["rename", "drop"];
@@ -3218,6 +3450,15 @@ mod tests {
             assert_eq!(json["filter"]["asns"][0], "24940");
             assert_eq!(json["filter"]["asns"][1], "AS13335");
             assert_eq!(json["filter"]["exclude_asns"][0], "9009");
+            // The emit carries the typed text verbatim (the compiler
+            // uppercases, the same way `asns` keeps both spellings)
+            assert_eq!(json["filter"]["colo"][0], "fra");
+            assert_eq!(json["filter"]["exclude_colo"][0], "AMS");
+            assert_eq!(json["filter"]["loc"][0], "de");
+            assert_eq!(json["filter"]["exclude_loc"][0], "NL");
+            assert_eq!(json["filter"]["warp"][0], "off");
+            assert_eq!(json["filter"]["egress_countries"][0], "us");
+            assert_eq!(json["filter"]["egress_asns"][0], "15169");
             assert_eq!(json["filter"]["forbid_insecure"], false);
             // rename
             assert_eq!(json["rename"][0]["match"], "a");
@@ -3236,6 +3477,9 @@ mod tests {
             assert_eq!(json["health"]["exclude_statuses"][0], "removed");
             assert_eq!(json["health"]["exclude_statuses"][1], "quarantine");
             assert_eq!(json["health"]["exclude_statuses"][2], "unknown");
+            // speed
+            assert_eq!(json["speed"]["min_mbps"], 25.0);
+            assert_eq!(json["speed"]["max_age_secs"], 86400);
             // sort
             assert_eq!(json["sort"]["by"], "latency");
             assert_eq!(json["sort"]["desc"], true);
@@ -3248,6 +3492,13 @@ mod tests {
             ("ped_filter_exclude".into(), "trojan".into()),
             ("ped_filter_asns".into(), "24940, AS13335".into()),
             ("ped_filter_exclude_asns".into(), " 9009 ".into()),
+            ("ped_filter_colo".into(), " fra ".into()),
+            ("ped_filter_exclude_colo".into(), "AMS".into()),
+            ("ped_filter_loc".into(), "de".into()),
+            ("ped_filter_exclude_loc".into(), "NL".into()),
+            ("ped_filter_warp".into(), "off".into()),
+            ("ped_filter_egress_countries".into(), "us".into()),
+            ("ped_filter_egress_asns".into(), "15169".into()),
             // forbid_insecure explicitly off
             ("ped_forbid_insecure".into(), "0".into()),
             ("ped_rename_0_match".into(), "a".into()),
@@ -3266,6 +3517,8 @@ mod tests {
             ("ped_health_exclude".into(), "removed".into()),
             ("ped_health_exclude".into(), "quarantine".into()),
             ("ped_health_exclude".into(), "unknown".into()),
+            ("ped_speed_min_mbps".into(), "25".into()),
+            ("ped_speed_max_age_secs".into(), "86400".into()),
             ("ped_sort_by".into(), "latency".into()),
             ("ped_sort_desc".into(), "1".into()),
             ("ped_limit_count".into(), "100".into()),
@@ -3277,6 +3530,7 @@ mod tests {
             ("ped_filter".into(), "set".into()),
             ("ped_geo".into(), "set".into()),
             ("ped_health".into(), "set".into()),
+            ("ped_speed".into(), "set".into()),
             ("ped_sort".into(), "set".into()),
             ("ped_limit".into(), "set".into()),
         ]);
@@ -3288,6 +3542,7 @@ mod tests {
             ("ped_filter".into(), "set".into()),
             ("ped_geo".into(), "set".into()),
             ("ped_health".into(), "set".into()),
+            ("ped_speed".into(), "set".into()),
             ("ped_sort".into(), "set".into()),
             ("ped_limit".into(), "set".into()),
         ]);
@@ -3307,6 +3562,7 @@ mod tests {
         s.drop_defaults = true;
         s.geo_defaults = true;
         s.health_defaults = true;
+        s.speed_defaults = true;
         s.sort_defaults = true;
         s.limit_defaults = true;
         let json = s.doc().expect("all-defaults state must emit");
@@ -3315,6 +3571,7 @@ mod tests {
         assert_eq!(json["drop"], serde_json::json!([]));
         assert_eq!(json["geo"], serde_json::json!({}));
         assert_eq!(json["health"], serde_json::json!({}));
+        assert_eq!(json["speed"], serde_json::json!({}));
         assert_eq!(json["sort"], serde_json::json!({}));
         assert_eq!(json["limit"], serde_json::json!({ "count": null }));
     }

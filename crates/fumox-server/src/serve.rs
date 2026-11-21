@@ -1360,6 +1360,14 @@ fn rows_to_candidates(
             // The stored `AS{n}` spelling parses exactly once, here: the
             // pipeline compares plain numbers downstream
             geo_asn: row.geo_asn.as_deref().and_then(pipeline::asn_number),
+            // The speed/trace facts of the row, read as stored
+            speed_mbps: row.speed_mbps,
+            speed_at: row.speed_at,
+            cf_colo: row.cf_colo.clone(),
+            cf_loc: row.cf_loc.clone(),
+            cf_warp: row.cf_warp.clone(),
+            egress_country: row.egress_country.clone(),
+            egress_asn: row.egress_asn.as_deref().and_then(pipeline::asn_number),
         });
     }
     candidates

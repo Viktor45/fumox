@@ -119,8 +119,24 @@ pub fn canonical_asn(input: &str) -> Option<String> {
     }
 }
 
-/// The placeholders the geo name template understands.
-pub const TEMPLATE_PLACEHOLDERS: [&str; 6] = ["flag", "country", "city", "asn", "asn_org", "name"];
+/// The placeholders the geo name template understands. The first six are
+/// geo facts; the last six are the speed/trace facts the proxy
+/// row carries, rendered by [`apply_template_with`] and left empty when
+/// the row has not been measured yet.
+pub const TEMPLATE_PLACEHOLDERS: [&str; 12] = [
+    "flag",
+    "country",
+    "city",
+    "asn",
+    "asn_org",
+    "name",
+    "speed",
+    "colo",
+    "loc",
+    "warp",
+    "egress_country",
+    "egress_asn",
+];
 
 /// The placeholders in `template` the renderer does not know. An unknown
 /// placeholder is rendered verbatim (`{foo}` stays `{foo}`), so the admin
@@ -143,14 +159,50 @@ pub fn unknown_placeholders(template: &str) -> Vec<String> {
     unknown
 }
 
+/// The speed/trace name facts, the value of the `{speed}`,
+/// `{colo}`, `{loc}`, `{warp}`, `{egress_country}` and `{egress_asn}`
+/// template placeholders. All optional: an absent fact renders as empty
+/// and the separator collapse drops it, exactly the way a missing city
+/// renders. `speed_mbps` renders with one decimal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TraceNameFacts {
+    pub speed_mbps: Option<f64>,
+    /// trace `colo=`: the Cloudflare datacenter (IATA code).
+    pub colo: Option<String>,
+    /// trace `loc=`: the country the egress appears from.
+    pub loc: Option<String>,
+    /// trace `warp=`: `on` | `off` | `plus`.
+    pub warp: Option<String>,
+    /// The egress GeoIP country (server-derived from `egress_ip`).
+    pub egress_country: Option<String>,
+    /// The egress autonomous system, canonical `AS<n>` form.
+    pub egress_asn: Option<String>,
+}
+
+impl TraceNameFacts {
+    /// Whether any fact is present: a row nothing was ever measured or
+    /// traced for renders the name without the trace placeholders at all.
+    pub fn is_empty(&self) -> bool {
+        self.speed_mbps.is_none()
+            && self.colo.is_none()
+            && self.loc.is_none()
+            && self.warp.is_none()
+            && self.egress_country.is_none()
+            && self.egress_asn.is_none()
+    }
+}
+
 /// Apply the rename template.
 ///
 /// Placeholders: `{flag}`, `{country}`, `{city}`, `{asn}`, `{asn_org}`,
-/// `{name}`. The original name is returned unchanged only when there is no
-/// geo data at all. Individual missing values substitute as empty strings,
-/// and the result is then collapsed (whitespace runs → single space,
-/// trimmed), so `"{flag} {country} {city} · {name}"` without a city still
-/// renders cleanly.
+/// `{name}` (geo facts), plus the trace placeholders `{speed}`,
+/// `{colo}`, `{loc}`, `{warp}`, `{egress_country}`, `{egress_asn}` — the
+/// three-argument form takes no trace facts, so those render empty. The
+/// original name is returned unchanged only when there is no geo data at
+/// all. Individual missing values substitute as empty strings, and the
+/// result is then collapsed (whitespace runs → single space, trimmed), so
+/// `"{flag} {country} {city} · {name}"` without a city still renders
+/// cleanly.
 ///
 /// Two substitutions have a canonical spelling: `{asn}` renders the `AS{n}`
 /// text ([`asn_text`], the same form the `geo_asn` column stores), and
@@ -166,7 +218,20 @@ pub fn unknown_placeholders(template: &str) -> Vec<String> {
 /// identifies the proxy in every output format. An empty template renders
 /// the name alone.
 pub fn apply_template(template: &str, geo: &GeoInfo, name: &str) -> String {
-    if !geo.has_facts() {
+    apply_template_with(template, geo, name, &TraceNameFacts::default())
+}
+
+/// [`apply_template`] with the speed/trace facts of the proxy row: the
+/// pipeline passes the row's measurement so `{speed}`/`{colo}`/… render.
+/// The name is returned unchanged only when neither the geo nor the trace
+/// facts carry anything.
+pub fn apply_template_with(
+    template: &str,
+    geo: &GeoInfo,
+    name: &str,
+    trace: &TraceNameFacts,
+) -> String {
+    if !geo.has_facts() && trace.is_empty() {
         return name.to_string();
     }
     let template = template.trim();
@@ -190,6 +255,17 @@ pub fn apply_template(template: &str, geo: &GeoInfo, name: &str) -> String {
             "asn" => geo.asn.map(asn_text).unwrap_or_default(),
             "asn_org" => geo.asn_org.clone().unwrap_or_default(),
             "name" => name.to_string(),
+            // {egress_asn} before {egress_country}: the country placeholder
+            // is a suffix of the AS one
+            "speed" => trace
+                .speed_mbps
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_default(),
+            "colo" => trace.colo.clone().unwrap_or_default(),
+            "loc" => trace.loc.clone().unwrap_or_default(),
+            "warp" => trace.warp.clone().unwrap_or_default(),
+            "egress_country" => trace.egress_country.clone().unwrap_or_default(),
+            "egress_asn" => trace.egress_asn.clone().unwrap_or_default(),
             // A placeholder the renderer does not know stays verbatim, so
             // the loader and the admin panel reject it instead of the
             // operator finding a literal brace in every proxy name
@@ -1719,6 +1795,73 @@ mod tests {
             country_name: Some("Germany".into()),
             ..Default::default()
         }
+    }
+
+    fn traced_facts() -> TraceNameFacts {
+        TraceNameFacts {
+            speed_mbps: Some(42.3),
+            colo: Some("FRA".into()),
+            loc: Some("DE".into()),
+            warp: Some("off".into()),
+            egress_country: Some("DE".into()),
+            egress_asn: Some("AS15169".into()),
+        }
+    }
+
+    /// The trace placeholders render the row's speed/trace facts;
+    /// the speed renders with one decimal.
+    #[test]
+    fn template_renders_the_trace_placeholders() {
+        let geo = german_geo();
+        assert_eq!(
+            apply_template_with("{speed} · {colo} · {name}", &geo, "Node-1", &traced_facts()),
+            "42.3 · FRA · Node-1"
+        );
+        assert_eq!(
+            apply_template_with(
+                "{flag} {country} · {loc} {warp} {egress_asn} · {name}",
+                &geo,
+                "Node-1",
+                &traced_facts()
+            ),
+            "🇩🇪 Germany · DE off AS15169 · Node-1"
+        );
+    }
+
+    /// The three-argument form takes no trace facts: the trace
+    /// placeholders render empty and the separator collapse drops them.
+    #[test]
+    fn template_without_trace_facts_collapses_the_trace_slots() {
+        let geo = german_geo();
+        assert_eq!(
+            apply_template("{speed} · {colo} · {name}", &geo, "Node-1"),
+            "Node-1"
+        );
+    }
+
+    /// A row with trace facts but no geo facts still renders the trace
+    /// placeholders; the name is returned unchanged only when neither
+    /// carries anything.
+    #[test]
+    fn trace_facts_render_without_geo_facts() {
+        let no_geo = GeoInfo {
+            ip: "1.2.3.4".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_template_with("{speed} · {name}", &no_geo, "Node-1", &traced_facts()),
+            "42.3 · Node-1"
+        );
+        // Neither side carries anything: the plain name
+        assert_eq!(
+            apply_template_with(
+                "{speed} · {name}",
+                &no_geo,
+                "Node-1",
+                &TraceNameFacts::default()
+            ),
+            "Node-1"
+        );
     }
 
     #[test]

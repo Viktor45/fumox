@@ -177,6 +177,10 @@ macro_rules! impl_presentation {
                     fumox_core::repo::probe::T2_UNVERIFIED_KIND => {
                         self.lang.t("px.kind_t2_unverified").to_string()
                     }
+                    // The measurement diagnostics: neither touches the
+                    // status machine, the labels say so by wording
+                    fumox_core::repo::probe::SPEED_KIND => self.lang.t("px.kind_speed").to_string(),
+                    fumox_core::repo::probe::TRACE_KIND => self.lang.t("px.kind_trace").to_string(),
                     _ => kind.to_string(),
                 }
             }

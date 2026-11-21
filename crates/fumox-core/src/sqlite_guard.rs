@@ -84,6 +84,17 @@ const RULES: &[TableRule] = &[
             "last_t2_failed_at",
             "last_t2_checked_at",
             "updated_at",
+            // Speed and Cloudflare trace facts (0022) are measured by the
+            // probe. The egress GeoIP columns derived from `egress_ip`
+            // (`egress_country`/`egress_asn`/`egress_asn_org`) are NOT here:
+            // like the `geo_*` columns, only the server holds the mmdb
+            // files, so they stay server-written
+            "speed_at",
+            "egress_ip",
+            "cf_colo",
+            "cf_loc",
+            "cf_warp",
+            "trace_json",
         ],
     },
 ];
@@ -281,6 +292,9 @@ mod tests {
             "geo_asn",
             "resolved_ip",
             "speed_mbps",
+            "egress_country",
+            "egress_asn",
+            "egress_asn_org",
             "created_at",
         ] {
             assert!(
@@ -305,6 +319,12 @@ mod tests {
             "last_t2_failed_at",
             "last_t2_checked_at",
             "updated_at",
+            "speed_at",
+            "egress_ip",
+            "cf_colo",
+            "cf_loc",
+            "cf_warp",
+            "trace_json",
         ] {
             assert!(
                 write_allowed("proxies", ffi::SQLITE_UPDATE, Some(column)),

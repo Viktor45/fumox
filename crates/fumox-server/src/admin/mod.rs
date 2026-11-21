@@ -278,7 +278,7 @@ impl AdminState {
     }
 
     /// The live `[network]` block (the DNS resolution timeout of the
-    /// source fetcher).
+    /// source fetcher, plus the speed/trace measurement endpoints).
     pub fn network(&self) -> NetworkConfig {
         self.live().network
     }

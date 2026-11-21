@@ -199,6 +199,22 @@ struct ProbeTemplate {
     /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
     /// order, zero-filled, each links into the filtered proxy browser.
     coverage: Vec<(String, i64)>,
+    /// Whether `[network].speed_enabled` is on: the speed card renders its
+    /// numbers only then, otherwise every counter would read as a
+    /// worrying zero.
+    speed_enabled: bool,
+    /// Rows carrying a speed measurement (`speed_mbps` set), retired
+    /// ones excluded.
+    speed_measured: i64,
+    /// Of those [`Self::speed_measured`]: rows whose measurement is older
+    /// than `[network].speed_interval_secs` — the next T2 cycle re-measures
+    /// them, so a high number here is latency of the re-measure queue,
+    /// not data loss.
+    speed_stale: i64,
+    /// Failed `speed`-kind journal attempts over the last 24 h.
+    speed_fail_24h: i64,
+    /// Failed `trace`-kind journal attempts over the last 24 h.
+    trace_fail_24h: i64,
     /// True count of proxies in `status = 'quarantine'` (from
     /// `proxy_counts`). The `queue` table view is truncated to 50 rows,
     /// so it cannot be used to size the card.
@@ -537,7 +553,18 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     // none of them waits for another. One `try_join!` runs them
     // concurrently (SQLite reads run concurrently in WAL mode) and
     // leaves one error site instead of nine
-    let (proxy_counts, coverage, queue, due_count, oldest_quarantined_at, meta) = match tokio::try_join!(
+    let network = state.network();
+    let (
+        proxy_counts,
+        coverage,
+        queue,
+        due_count,
+        oldest_quarantined_at,
+        meta,
+        speed_measured,
+        speed_stale,
+        journal_failures,
+    ) = match tokio::try_join!(
         proxies::count_by_status(pool),
         proxies::count_by_check_coverage(pool),
         proxies::list_quarantine_queue(pool, 50),
@@ -552,6 +579,19 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
                 probe_repo::meta::LAST_ROTATION_KEY,
                 probe_repo::meta::SERVER_RETENTION_KEY,
             ],
+        ),
+        proxies::count_speed_measured(pool),
+        // "Stale" is measured against the re-measure interval the probe
+        // itself works with, not a hardcoded day: the card's verdict and
+        // the daemon's next due row must agree on what old means
+        proxies::count_speed_stale(
+            pool,
+            now.saturating_sub(i64::try_from(network.speed_interval_secs).unwrap_or(i64::MAX)),
+        ),
+        probe_repo::failure_counts_by_kind(
+            pool,
+            &[probe_repo::SPEED_KIND, probe_repo::TRACE_KIND],
+            now.saturating_sub(24 * 3600),
         ),
     ) {
         Ok(reads) => reads,
@@ -628,6 +668,17 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             retention_removed_days: retention.removed_proxies_days,
             meow_memory,
             coverage,
+            speed_enabled: network.speed_enabled,
+            speed_measured,
+            speed_stale,
+            speed_fail_24h: journal_failures
+                .get(probe_repo::SPEED_KIND)
+                .copied()
+                .unwrap_or(0),
+            trace_fail_24h: journal_failures
+                .get(probe_repo::TRACE_KIND)
+                .copied()
+                .unwrap_or(0),
             quarantine_count,
             queue,
             probe_view,

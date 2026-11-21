@@ -7,6 +7,7 @@
 mod admin;
 mod alive_export;
 mod cache;
+mod egress_backfill;
 mod events;
 mod fetcher;
 mod geo_backfill;
@@ -509,6 +510,14 @@ async fn run_listeners(
     // above by the configured startup budget. It runs after the download
     // had its budget, so it sees the database that just landed
     tokio::spawn(geo_backfill::backfill_missing_geo_within_budget(
+        pool.clone(),
+        geo.clone(),
+        config.geo.startup_download_budget(),
+    ));
+    // The egress geo facts are the server's to derive: the probe
+    // stamps `egress_ip` from the trace but holds no mmdb. Same budget, so
+    // the two walks share the startup window the geo download opened
+    tokio::spawn(egress_backfill::backfill_missing_egress_geo_within_budget(
         pool.clone(),
         geo.clone(),
         config.geo.startup_download_budget(),

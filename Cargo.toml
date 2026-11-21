@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/fumox-core", "crates/fumox-server", "crates/fumox-probe"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -31,6 +31,9 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     # RequestBuilder::query() is a feature since reqwest 0.13 (meow T2 calls).
     "query",
+    # Response::bytes_stream() for the probe's speed measurement: the
+    # payload is counted chunk by chunk and never written to disk.
+    "stream",
 ] }
 # T1 TLS handshakes in the probe daemon (health checks, not a trust boundary).
 # default-features = false keeps tokio-rustls from re-enabling the aws-lc-rs

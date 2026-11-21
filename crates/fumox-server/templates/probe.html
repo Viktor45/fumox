@@ -124,6 +124,47 @@
   </div>
 </div>
 
+{#- The speed/trace diagnostics the probe journals
+    alongside the health checks. Rendered only while the feature is on —
+    with it off, four zeros would read as a fault instead of a disabled
+    feature. -#}
+<div class="panel">
+  <h2>{{ self.t("probe.speed_title") }}</h2>
+  <p class="muted small">{{ self.t("probe.speed_note") }}</p>
+  {% if speed_enabled %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>{{ self.t("probe.speed_fact") }}</th>
+            <th>{{ self.t("probe.coverage_count") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="small">{{ self.t("probe.speed_measured_label") }}</td>
+            <td><a href="/admin/proxies?speed=measured" aria-label="{{ self.t("probe.speed_measured_label") }}: {{ speed_measured }}">{{ speed_measured }}</a></td>
+          </tr>
+          <tr>
+            <td class="small">{{ self.t("probe.speed_stale_label") }}</td>
+            <td class="num">{{ speed_stale }}</td>
+          </tr>
+          <tr>
+            <td class="small">{{ self.t("probe.speed_fail_label") }}</td>
+            <td class="num">{{ speed_fail_24h }}</td>
+          </tr>
+          <tr>
+            <td class="small">{{ self.t("probe.trace_fail_label") }}</td>
+            <td class="num">{{ trace_fail_24h }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="muted">{{ self.t("probe.speed_disabled") }}</p>
+  {% endif %}
+</div>
+
 <div class="panel">
   <h2>{{ self.t("probe.retention_title") }}</h2>
   {% match last_rotation %}

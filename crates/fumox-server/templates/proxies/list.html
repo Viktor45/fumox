@@ -178,6 +178,26 @@
       <option value="both" {% if self.coverage_selected("both") %}selected{% endif %}>{{ self.t("px.checks_both") }}</option>
     </select>
   </div>
+  {# Speed-measurement bucket: the same tolerance as the coverage one —
+     an empty value filters nothing. The pipeline's freshness threshold
+     lives there, this is only "has a number at all". #}
+  <div class="field">
+    <label for="px-speed">{{ self.t("px.speed_filter_label") }}</label>
+    <select id="px-speed" name="speed">
+      <option value="">{{ self.t("common.all") }}</option>
+      <option value="measured" {% if self.speed_selected("measured") %}selected{% endif %}>{{ self.t("px.speed_measured_only") }}</option>
+      <option value="unmeasured" {% if self.speed_selected("unmeasured") %}selected{% endif %}>{{ self.t("px.speed_unmeasured") }}</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="px-egress">{{ self.t("px.egress_country") }}</label>
+    <select id="px-egress" name="egress">
+      <option value="">{{ self.t("common.all") }}</option>
+      {% for country in egress_countries %}
+        <option value="{{ country }}" {% if self.egress_country_selected(country) %}selected{% endif %}>{{ country }}</option>
+      {% endfor %}
+    </select>
+  </div>
   <div class="field">
     <label for="px-q">{{ self.t("common.search") }}</label>
     <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
@@ -213,8 +233,10 @@
             <th>{{ self.t("common.protocol") }}</th>
             <th>{{ self.t("px.address") }}</th>
             <th>{{ self.t("common.country") }}</th>
+            <th title="{{ self.t("px.egress_hint") }}">{{ self.t("px.egress_label") }}</th>
             <th>{{ self.t("common.name") }}</th>
             <th>{{ self.t("common.latency") }}</th>
+            <th title="{{ self.t("px.speed_filter_label") }}">{{ self.t("px.speed") }}</th>
             <th>{{ self.t("px.checks_label") }}</th>
           </tr>
         </thead>
@@ -239,12 +261,35 @@
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
+            {#- Egress facts: the derived egress country with
+                the Cloudflare datacenter; `–` until the first trace and
+                the server backfill both wrote their facts. -#}
+            <td class="small">
+              {% if row.egress_country.is_some() || row.cf_colo.is_some() %}
+                {{ self.flag(row.egress_country) }}
+                {% match row.egress_country %}
+                  {% when Some with (country) %}{{ country }}
+                  {% when None %}<span class="muted">–</span>
+                {% endmatch %}
+                {% if let Some(colo) = row.cf_colo %}
+                  <span class="muted mono" title="{{ self.t("px.cf_colo") }}">· {{ colo }}</span>
+                {% endif %}
+              {% else %}
+                <span class="muted">–</span>
+              {% endif %}
+            </td>
             <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
               {% if row.detached %}<span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}</span>{% endif %}
             </td>
             <td class="num small">
               {% match row.latency_ms %}
                 {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+                {% when None %}<span class="muted">–</span>
+              {% endmatch %}
+            </td>
+            <td class="num small">
+              {% match row.speed_mbps %}
+                {% when Some with (mbps) %}{{ mbps }} {{ self.t("px.speed_unit") }}
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>

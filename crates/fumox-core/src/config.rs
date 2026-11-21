@@ -217,6 +217,7 @@ impl AppConfig {
         }
         self.validate_trust_proxy_ips()?;
         self.validate_meow_test_urls()?;
+        self.validate_network_speed_trace()?;
         self.validate_probe_queue()?;
         Ok(())
     }
@@ -248,6 +249,57 @@ impl AppConfig {
                     "meow.test_url entry '{entry}' points at {ip} ({reason}): \
                      set probe.allow_private_targets = true to allow it"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The speed payload and the trace answer are fetched *through* the
+    /// proxy under test, so both URLs must be absolute `http(s)` — the same
+    /// bar the `test_url` deserializer enforces for the delay check. The
+    /// speed URL must carry `{bytes}` (the download needs a size to chase);
+    /// a `{…}` token that is neither `bytes` nor `rand` would be sent to the
+    /// endpoint literally, which is a typo worth refusing at load.
+    fn validate_network_speed_trace(&self) -> crate::Result<()> {
+        let speed = &self.network.speed_url;
+        if !speed.contains("{bytes}") {
+            return Err(crate::Error::Config(
+                "network.speed_url must contain the {bytes} placeholder: \
+                 without it the download has no size to chase"
+                    .to_string(),
+            ));
+        }
+        for token in speed.match_indices('{').filter_map(|(start, _)| {
+            let rest = &speed[start + 1..];
+            let end = rest.find('}')?;
+            Some(&rest[..end])
+        }) {
+            if token != "bytes" && token != "rand" {
+                return Err(crate::Error::Config(format!(
+                    "network.speed_url has an unknown placeholder {{{token}}}: \
+                     only {{bytes}} and {{rand}} are expanded"
+                )));
+            }
+        }
+        for (key, url) in [
+            ("network.speed_url", speed.as_str()),
+            ("network.trace_url", self.network.trace_url.as_str()),
+        ] {
+            let Ok(parsed) = url::Url::parse(url) else {
+                return Err(crate::Error::Config(format!(
+                    "{key} is not a valid URL: {url}"
+                )));
+            };
+            match parsed.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(crate::Error::Config(format!(
+                        "{key} uses the '{other}' scheme: only http and https are allowed"
+                    )));
+                }
+            }
+            if parsed.host_str().is_none_or(str::is_empty) {
+                return Err(crate::Error::Config(format!("{key} has no host")));
             }
         }
         Ok(())
@@ -337,6 +389,23 @@ impl AppConfig {
                 self.geo.startup_download_budget_secs,
             ),
             ("network.dns_timeout_secs", self.network.dns_timeout_secs),
+            ("network.speed_bytes", self.network.speed_bytes),
+            (
+                "network.speed_time_ceiling_secs",
+                self.network.speed_time_ceiling_secs,
+            ),
+            (
+                "network.speed_concurrency",
+                self.network.speed_concurrency as u64,
+            ),
+            (
+                "network.speed_interval_secs",
+                self.network.speed_interval_secs,
+            ),
+            (
+                "network.speed_listener_port_base",
+                u64::from(self.network.speed_listener_port_base),
+            ),
             (
                 "admin.session_ttl_hours",
                 u64::from(self.admin.session_ttl_hours),
@@ -1101,7 +1170,10 @@ pub const MAX_STARTUP_DOWNLOAD_BUDGET_SECS: u64 = 300;
 /// resolves a feed-supplied host before the probe or the fetcher may
 /// connect to it, and that resolution belongs to the address policy, not to
 /// the geo enrichment (which resolves the same names for a different
-/// reason: to label them).
+/// reason: to label them). The section also carries the outbound
+/// measurement endpoints — the speed payload and the Cloudflare trace the
+/// probe dials *through* a freshly checked proxy — and the sizing of that
+/// measurement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -1111,12 +1183,81 @@ pub struct NetworkConfig {
     /// which is a misconfiguration, not a policy.
     #[serde(default = "defaults::network_dns_timeout_secs")]
     pub dns_timeout_secs: u64,
+    /// Download-speed measurement: after a proxy passes the delay check,
+    /// the probe downloads a synthetic payload *through* the proxy and
+    /// stores the throughput in `proxies.speed_mbps`. The status machine
+    /// does not see the result — a failed measurement never changes a
+    /// status.
+    #[serde(default = "defaults::network_speed_enabled")]
+    pub speed_enabled: bool,
+    /// The payload the speed test downloads, without saving it to disk.
+    /// `{bytes}` (required) expands to
+    /// [`speed_bytes`][NetworkConfig::speed_bytes], `{rand}` (optional) to
+    /// a fresh random number per request, so caches and anti-replay quirks
+    /// never serve a second measurement from memory. Must be an absolute
+    /// `http(s)` URL.
+    #[serde(default = "defaults::network_speed_url")]
+    pub speed_url: String,
+    /// The payload size in bytes the speed test asks for (the `{bytes}`
+    /// placeholder). Measured with a time ceiling, so an undersized payload
+    /// only costs a fast proxy some resolution, not the test itself.
+    #[serde(default = "defaults::network_speed_bytes")]
+    pub speed_bytes: u64,
+    /// The time ceiling of one download: a proxy that has not delivered the
+    /// whole payload in this many seconds gets the partial throughput it
+    /// managed, which is the honest number for a link that cannot finish
+    /// 25 MiB in a reasonable time.
+    #[serde(default = "defaults::network_speed_time_ceiling_secs")]
+    pub speed_time_ceiling_secs: u64,
+    /// How many speed downloads (and trace fetches) run at once. Each holds
+    /// one pinned meow-rs listener, so the kernel's config renders this
+    /// many extra `mixed` listeners on consecutive ports from
+    /// [`speed_listener_port_base`][NetworkConfig::speed_listener_port_base].
+    #[serde(default = "defaults::network_speed_concurrency")]
+    pub speed_concurrency: usize,
+    /// A fresh measurement happens no more often than this. The last
+    /// measurement is the value the pipeline sees; re-measuring everything
+    /// every cycle would spend the proxies' traffic budget on numbers that
+    /// rarely change overnight.
+    #[serde(default = "defaults::network_speed_interval_secs")]
+    pub speed_interval_secs: u64,
+    /// First port of the pinned speed-test listeners; lane `i` takes
+    /// `base + i`. Bound so that `base + speed_concurrency - 1` stays
+    /// inside the u16 port range at the maximum concurrency the range table
+    /// allows.
+    #[serde(default = "defaults::network_speed_listener_port_base")]
+    pub speed_listener_port_base: u16,
+    /// The trace endpoint the probe fetches *through* each freshly checked
+    /// proxy: the plain-text `key=value` answer carries the egress facts
+    /// (`ip=`, `colo=`, `loc=`, `warp=`, …) the pipeline filters on. Must
+    /// be an absolute `http(s)` URL.
+    #[serde(default = "defaults::network_trace_url")]
+    pub trace_url: String,
+    /// Which trace fields to keep. The first four (`ip`, `colo`, `loc`,
+    /// `warp`) land in their own columns; every other requested field goes
+    /// into `proxies.trace_json` as one object. An empty list disables the
+    /// trace step entirely. Accepts a TOML array or a comma-separated
+    /// string, like `test_url`.
+    #[serde(
+        default = "defaults::network_trace_fields",
+        deserialize_with = "de_trace_fields"
+    )]
+    pub trace_fields: Vec<String>,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             dns_timeout_secs: defaults::network_dns_timeout_secs(),
+            speed_enabled: defaults::network_speed_enabled(),
+            speed_url: defaults::network_speed_url(),
+            speed_bytes: defaults::network_speed_bytes(),
+            speed_time_ceiling_secs: defaults::network_speed_time_ceiling_secs(),
+            speed_concurrency: defaults::network_speed_concurrency(),
+            speed_interval_secs: defaults::network_speed_interval_secs(),
+            speed_listener_port_base: defaults::network_speed_listener_port_base(),
+            trace_url: defaults::network_trace_url(),
+            trace_fields: defaults::network_trace_fields(),
         }
     }
 }
@@ -1613,6 +1754,67 @@ fn check_test_url<E: serde::de::Error>(entry: &str) -> Result<String, E> {
     Ok(entry.to_string())
 }
 
+/// `[network].trace_fields`: like `test_url`, the field accepts a TOML array or
+/// a comma-separated string (env overrides are strings). Each entry must be
+/// a bare lowercase identifier — a trace line is parsed as `key=value`, so
+/// anything else would silently never match. An empty list is legal and
+/// means «do not fetch the trace at all».
+fn de_trace_fields<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a field name, an array of names, or a comma-separated string")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            finish_trace_fields(split_trace_fields(v).collect())
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut fields = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                fields.extend(split_trace_fields(&item));
+            }
+            finish_trace_fields(fields)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
+}
+
+fn split_trace_fields(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+}
+
+fn finish_trace_fields<E: serde::de::Error>(fields: Vec<String>) -> Result<Vec<String>, E> {
+    for field in &fields {
+        let ok = !field.is_empty()
+            && field
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !ok {
+            return Err(E::custom(format!(
+                "network.trace_fields entry '{field}' is not a trace key: \
+                 lowercase letters, digits and '_' only"
+            )));
+        }
+    }
+    Ok(fields)
+}
+
 /// `[probe].recheck_delays_secs`: the quarantine recheck ladder. Bounded to
 /// 16 steps of at most 30 days each so a typo cannot schedule rechecks
 /// years out or build an unbounded ladder; an empty list is legal and means
@@ -1833,6 +2035,21 @@ pub mod bounds {
         ),
         // 0 = follow [geo].dns_timeout_secs
         ("network.dns_timeout_secs", Range::new(0, 60)),
+        // Speed measurement: 1 MiB is the smallest payload that yields a
+        // usable Mbit/s reading over a lossy tunnel; 1 GiB would take even
+        // a fast proxy past the time ceiling. The concurrency holds that
+        // many pinned listeners and simultaneous downloads inside the
+        // kernel's 256 MiB container quota, 16 is generous against it. The
+        // port base must leave room for `speed_concurrency - 1` more ports
+        // at that maximum
+        (
+            "network.speed_bytes",
+            Range::new(1024 * 1024, 1024 * 1024 * 1024),
+        ),
+        ("network.speed_time_ceiling_secs", Range::new(1, 600)),
+        ("network.speed_concurrency", Range::new(1, 16)),
+        ("network.speed_interval_secs", Range::new(60, 7 * 24 * 3600)),
+        ("network.speed_listener_port_base", Range::new(1024, 65_000)),
         ("admin.session_ttl_hours", Range::new(1, 24 * 365)),
         ("admin.rate_limit.limit", Range::new(1, 1_000_000)),
         ("admin.login_rate_limit.limit", Range::new(1, 1_000_000)),
@@ -2118,6 +2335,60 @@ mod defaults {
     /// meow-rs' own `ipv6` default (mihomo parity): IPv4-only resolution.
     pub const fn meow_ipv6() -> bool {
         false
+    }
+    /// Speed measurement is on by default: it only runs for proxies that
+    /// already passed the delay check, so the marginal cost is bounded by
+    /// the time ceiling and the concurrency cap.
+    pub const fn network_speed_enabled() -> bool {
+        true
+    }
+    /// Cloudflare's speed endpoint: a synthetic payload of `{bytes}` bytes,
+    /// `measId` is an anti-cache request id the endpoint ignores but the
+    /// URL schema wants. HTTPS: the download goes through the proxy under
+    /// test, a hostile proxy must not be able to forge the payload.
+    pub fn network_speed_url() -> String {
+        "https://speed.cloudflare.com/__down?measId={rand}&bytes={bytes}".to_string()
+    }
+    /// 25 MiB: with the 15 s ceiling this measures anything from ~14 Mbit/s
+    /// up to link speed, and a partial download still yields a number.
+    pub const fn network_speed_bytes() -> u64 {
+        25 * 1024 * 1024
+    }
+    pub const fn network_speed_time_ceiling_secs() -> u64 {
+        15
+    }
+    pub const fn network_speed_concurrency() -> usize {
+        4
+    }
+    pub const fn network_speed_interval_secs() -> u64 {
+        24 * 3600
+    }
+    /// Dynamic/private port range, comfortably clear of both the
+    /// well-known ports and the ephemeral range most stacks start at
+    /// (32768): a listener binding inside the ephemeral range could
+    /// collide with an outgoing connection of the same process
+    pub const fn network_speed_listener_port_base() -> u16 {
+        30000
+    }
+    /// The www host, not the bare `cloudflare.com`: the bare host answers
+    /// with a redirect the trace parser would have to follow. Plain text,
+    /// fetched through the proxy under test, so HTTPS again
+    pub fn network_trace_url() -> String {
+        "https://www.cloudflare.com/cdn-cgi/trace".to_string()
+    }
+    /// The pipeline's filterable facts first (these get columns), then the
+    /// informational ones (these land in `trace_json`)
+    pub fn network_trace_fields() -> Vec<String> {
+        vec![
+            "ip".to_string(),
+            "colo".to_string(),
+            "loc".to_string(),
+            "warp".to_string(),
+            "http".to_string(),
+            "tls".to_string(),
+            "fl".to_string(),
+            "gateway".to_string(),
+        ]
     }
     pub fn meow_api_addr() -> String {
         "127.0.0.1:9090".to_string()

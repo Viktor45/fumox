@@ -925,6 +925,72 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| bool_field(raw, key, cfg, lang, errors),
     },
+    // The speed measurement and the trace fetch. `trace_fields`
+    // renders as a textarea (one field per line) like `test_url`, but an
+    // empty list is legal there — it disables the trace step
+    Setting {
+        key: "network.speed_enabled",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.network.speed_enabled));
+        },
+        apply: |raw, key, cfg, lang, errors| bool_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.speed_url",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_url.clone());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.speed_bytes",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_bytes.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.speed_time_ceiling_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_time_ceiling_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.speed_concurrency",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_concurrency.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| usize_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.speed_interval_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_interval_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.speed_listener_port_base",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_listener_port_base.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.trace_url",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.trace_url.clone());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "network.trace_fields",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.trace_fields.join("\n"));
+        },
+        apply: |raw, key, cfg, lang, errors| trace_field_list(raw, key, cfg, lang, errors),
+    },
     Setting {
         key: "retention.probe_results_days",
         render: |c, key, raw| {
@@ -2256,6 +2322,38 @@ fn url_list(
             errors.push((
                 field.into(),
                 lang.t_args("val.url_ssrf", &[reason.to_string()]),
+            ));
+            return;
+        }
+    }
+    set_field(cfg, field, item::string_array(items), lang, errors);
+}
+
+/// `[network].trace_fields` as a textarea (one field per line). Unlike
+/// `test_url`, an empty list is legal: it disables the trace step. Each
+/// entry must be a bare lowercase identifier — the probe parses the trace
+/// answer line by line as `key=value`, and anything else would never match.
+fn trace_field_list(
+    raw: &HashMap<String, String>,
+    field: &str,
+    cfg: &mut EditableConfig,
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) {
+    let Some(v) = raw_get(raw, field) else { return };
+    let items: Vec<String> = v
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for entry in &items {
+        let ok = entry
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !ok {
+            errors.push((
+                field.into(),
+                lang.t_args("val.trace_field_invalid", std::slice::from_ref(entry)),
             ));
             return;
         }

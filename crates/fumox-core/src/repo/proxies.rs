@@ -107,6 +107,27 @@ pub struct ProxyRow {
     pub removed_at: Option<i64>,
     pub latency_ms: Option<i64>,
     pub speed_mbps: Option<f64>,
+    /// When `speed_mbps` was measured (unix seconds); NULL = never
+    /// measured. The T2 lane re-measures when this is older than
+    /// `[network].speed_interval_secs`.
+    pub speed_at: Option<i64>,
+    /// The Cloudflare trace facts of the row: the egress address
+    /// the proxy appears from, the datacenter and country it hit, and the
+    /// WARP state; everything beyond these four lives in `trace_json`. All
+    /// probe-written; NULL = not traced yet.
+    pub egress_ip: Option<String>,
+    pub cf_colo: Option<String>,
+    pub cf_loc: Option<String>,
+    pub cf_warp: Option<String>,
+    pub trace_json: Option<String>,
+    /// The egress GeoIP facts, server-derived from `egress_ip`
+    /// by the egress backfill; the probe's authorizer denies them.
+    pub egress_country: Option<String>,
+    pub egress_asn: Option<String>,
+    pub egress_asn_org: Option<String>,
+    /// The egress backfill's bookkeeping (the `geo_*` pattern of 0012).
+    pub egress_geo_attempts: i64,
+    pub last_egress_geo_attempt_at: Option<i64>,
     /// When the most recent T2 attempt failed; NULL means either no T2
     /// attempt yet or a successful T2 since. Filters T1 candidates
     /// ([`select_t1_candidates`]) until the next T2 succeeds.
@@ -153,6 +174,20 @@ impl ProxyRow {
             .field("removed_at", &self.removed_at)
             .field("latency_ms", &self.latency_ms)
             .field("speed_mbps", &self.speed_mbps)
+            .field("speed_at", &self.speed_at)
+            .field("egress_ip", &self.egress_ip)
+            .field("cf_colo", &self.cf_colo)
+            .field("cf_loc", &self.cf_loc)
+            .field("cf_warp", &self.cf_warp)
+            .field("trace_json", &self.trace_json)
+            .field("egress_country", &self.egress_country)
+            .field("egress_asn", &self.egress_asn)
+            .field("egress_asn_org", &self.egress_asn_org)
+            .field("egress_geo_attempts", &self.egress_geo_attempts)
+            .field(
+                "last_egress_geo_attempt_at",
+                &self.last_egress_geo_attempt_at,
+            )
             .field("last_t2_failed_at", &self.last_t2_failed_at)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
@@ -792,6 +827,173 @@ where
     Ok(())
 }
 
+// ─── Egress GeoIP backfill ────────────────────────────────────────────────
+//
+// The probe stamps `egress_ip` from the Cloudflare trace but holds no mmdb,
+// so the server derives the egress geo facts from it with the same walk the
+// host geo backfill runs. These helpers mirror the `geo_*` ones above; the
+// facts they write are server-owned (the probe's authorizer denies them).
+
+/// The egress geo facts of one proxy row, as the resolver produced them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EgressGeoStamp {
+    /// ISO country code of the egress address.
+    pub country: Option<String>,
+    /// Autonomous system in the canonical `AS<n>` form of `geo_asn`.
+    pub asn: Option<String>,
+    /// The AS organization name, when the ASN database carries one.
+    pub asn_org: Option<String>,
+}
+
+impl EgressGeoStamp {
+    /// Map one resolver answer onto the egress stamp.
+    pub fn from_info(info: &crate::geo::GeoInfo) -> Self {
+        Self {
+            country: info.country_code.clone(),
+            asn: info.asn.map(|n| format!("AS{n}")),
+            asn_org: info.asn_org.clone(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.country.is_none() && self.asn.is_none() && self.asn_org.is_none()
+    }
+}
+
+/// Rows whose egress geo facts this installation could still fill, oldest
+/// id first: `(id, egress_ip)` pairs. Same shape and retry window as
+/// [`list_missing_geo`] — a row whose address nothing knows is marked and
+/// left alone until the window passed.
+pub async fn list_missing_egress_geo(
+    pool: &DbPool,
+    after_id: i64,
+    limit: i64,
+    mask: GeoFactMask,
+    now: i64,
+) -> crate::Result<Vec<(i64, String)>> {
+    let Some(criterion) = missing_egress_geo_criterion(mask) else {
+        return Ok(Vec::new());
+    };
+    let sql = format!(
+        "SELECT id, egress_ip FROM proxies
+         WHERE id > ? AND egress_ip IS NOT NULL AND ({criterion})
+           AND status != 'removed'
+           AND (last_egress_geo_attempt_at IS NULL OR last_egress_geo_attempt_at <= ?)
+         ORDER BY id LIMIT ?"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(after_id)
+        .bind(now - GEO_RETRY_WINDOW_SECS)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// How many rows still miss an egress fact the loaded databases can
+/// supply; the egress backfill's "still missing" figure.
+pub async fn count_missing_egress_geo(pool: &DbPool, mask: GeoFactMask) -> crate::Result<i64> {
+    let Some(criterion) = missing_egress_geo_criterion(mask) else {
+        return Ok(0);
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM proxies
+         WHERE egress_ip IS NOT NULL AND ({criterion}) AND status != 'removed'"
+    );
+    let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// The `egress_* IS NULL` predicate for the facts this installation could
+/// still fill, or `None` when it could fill none of them. The egress stamp
+/// carries no city: the City database is consulted for the country only.
+fn missing_egress_geo_criterion(mask: GeoFactMask) -> Option<&'static str> {
+    match (mask.country, mask.asn) {
+        (true, true) => Some("egress_country IS NULL OR egress_asn IS NULL"),
+        (true, false) => Some("egress_country IS NULL"),
+        (false, true) => Some("egress_asn IS NULL"),
+        (false, false) => None,
+    }
+}
+
+/// Store the egress geo facts on one proxy row. Only the facts the stamp
+/// carries are written (a partial answer fills its gap without erasing
+/// what a previous pass established), and a filled row clears the attempt
+/// counter — the same contract [`update_geo`] keeps for the host geo.
+pub async fn update_egress_geo(
+    pool: &DbPool,
+    id: i64,
+    stamp: &EgressGeoStamp,
+) -> crate::Result<()> {
+    update_egress_geo_on(pool, id, stamp).await
+}
+
+/// [`update_egress_geo`] against an open transaction, the pair the
+/// backfill commits one batch through.
+pub async fn update_egress_geo_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    stamp: &EgressGeoStamp,
+) -> crate::Result<()> {
+    update_egress_geo_on(&mut **tx, id, stamp).await
+}
+
+async fn update_egress_geo_on<'e, E>(ex: E, id: i64, stamp: &EgressGeoStamp) -> crate::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "UPDATE proxies
+         SET egress_country = COALESCE(?, egress_country),
+             egress_asn = COALESCE(?, egress_asn),
+             egress_asn_org = COALESCE(?, egress_asn_org),
+             egress_geo_attempts = 0,
+             last_egress_geo_attempt_at = NULL
+         WHERE id = ?",
+    )
+    .bind(&stamp.country)
+    .bind(&stamp.asn)
+    .bind(&stamp.asn_org)
+    .bind(id)
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Record that the egress geo lookup for this row failed: the row keeps
+/// its (missing) facts and is left alone until the retry window passed.
+pub async fn mark_egress_geo_attempt(pool: &DbPool, id: i64, now: i64) -> crate::Result<()> {
+    mark_egress_geo_attempt_on(pool, id, now).await
+}
+
+/// [`mark_egress_geo_attempt`] against an open transaction.
+pub async fn mark_egress_geo_attempt_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    now: i64,
+) -> crate::Result<()> {
+    mark_egress_geo_attempt_on(&mut **tx, id, now).await
+}
+
+async fn mark_egress_geo_attempt_on<'e, E>(ex: E, id: i64, now: i64) -> crate::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "UPDATE proxies
+         SET egress_geo_attempts = egress_geo_attempts + 1,
+             last_egress_geo_attempt_at = ?
+         WHERE id = ?",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
 /// Store the full outcome of an on-demand geo resolution: the facts plus
 /// the IP they were resolved from (admin proxy-card action).
 ///
@@ -1319,6 +1521,14 @@ pub struct ProxyListFilter {
     /// input mean themselves (`100%` finds `100%`, not `100` + anything).
     pub query: String,
     pub coverage: Option<CheckCoverage>,
+    /// The speed-measurement bucket of the browser: `Some(true)` = rows
+    /// with a measurement, `Some(false)` = rows without one, `None` = no
+    /// filter. A measurement is `speed_mbps IS NOT NULL`; its age is the
+    /// pipeline's concern, the browser does not second-guess it.
+    pub speed_measured: Option<bool>,
+    /// Exact match against `egress_country` (`""` = no filter); the
+    /// dropdown is fed by [`distinct_egress_countries`].
+    pub egress_country: String,
 }
 
 impl ProxyListFilter {
@@ -1360,6 +1570,14 @@ impl ProxyListFilter {
         if let Some(coverage) = self.coverage {
             wf = wf.clause(coverage.filter_clause());
         }
+        match self.speed_measured {
+            Some(true) => wf = wf.clause("p.speed_mbps IS NOT NULL"),
+            Some(false) => wf = wf.clause("p.speed_mbps IS NULL"),
+            None => {}
+        }
+        if !self.egress_country.is_empty() {
+            wf = wf.text("p.egress_country = ?", &self.egress_country);
+        }
         wf
     }
 
@@ -1383,6 +1601,12 @@ pub struct ProxyListRow {
     pub status: String,
     pub latency_ms: Option<i64>,
     pub geo_country: Option<String>,
+    /// The measurement facts the browser shows: the measured download rate, the
+    /// egress country the server derived from `egress_ip`, and the
+    /// Cloudflare datacenter the trace hit. All three may be absent.
+    pub speed_mbps: Option<f64>,
+    pub egress_country: Option<String>,
+    pub cf_colo: Option<String>,
     /// The moment the row was last touched; the sort key of the default
     /// order and part of its keyset cursor.
     pub updated_at: i64,
@@ -1464,7 +1688,7 @@ pub async fn list_filtered(
     };
     let sql = format!(
         "SELECT p.id, p.scheme, p.name, p.host, p.port, p.status, p.latency_ms, p.geo_country,
-                p.updated_at,
+                p.speed_mbps, p.egress_country, p.cf_colo, p.updated_at,
                 COALESCE({alias}.t1, 0) AS t1_checked,
                 COALESCE({alias}.t2, 0) AS t2_checked,
                 (lnk.proxy_id IS NULL AND p.status != 'removed') AS detached
@@ -1512,6 +1736,48 @@ pub async fn distinct_countries(pool: &DbPool) -> crate::Result<Vec<String>> {
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Country codes the egress backfill derived (`egress_country`), ascending;
+/// the egress-country filter dropdown of the admin proxy browser. Empty
+/// until the first trace wrote an `egress_ip` the backfill resolved.
+pub async fn distinct_egress_countries(pool: &DbPool) -> crate::Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT egress_country FROM proxies
+         WHERE egress_country IS NOT NULL ORDER BY egress_country",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Rows carrying a speed measurement (`speed_mbps` set), retired ones
+/// excluded: the same population the probe overview's speed card talks
+/// about ([`count_speed_stale`] mirrors the status guard).
+pub async fn count_speed_measured(pool: &DbPool) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxies
+         WHERE speed_mbps IS NOT NULL AND status != 'removed'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Rows whose measurement is older than `stale_before` (or lost its
+/// `speed_at`, which the column pair's invariant forbids but a future
+/// migration could regress): the "freshness" line of the probe overview's
+/// speed card.
+pub async fn count_speed_stale(pool: &DbPool, stale_before: i64) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxies
+         WHERE speed_mbps IS NOT NULL AND status != 'removed'
+           AND (speed_at IS NULL OR speed_at < ?)",
+    )
+    .bind(stale_before)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 /// Number of not-yet-retired proxies of a scheme the probe cannot judge
@@ -2892,6 +3158,84 @@ pub async fn check_succeeded(
     } else {
         Transition::Unchanged
     })
+}
+
+/// The trace facts of one proxy, parsed from the Cloudflare
+/// `/cdn-cgi/trace` answer. `ip`/`colo`/`loc`/`warp` are the
+/// first-class columns the pipeline filters on; everything else the
+/// operator asked to keep rides in `extra` as one JSON object (already
+/// serialized by the caller — the probe owns the field list).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TraceFacts {
+    /// trace `ip=`: the proxy's egress address, IPv4 or IPv6.
+    pub ip: Option<String>,
+    /// trace `colo=`: the Cloudflare datacenter (IATA code).
+    pub colo: Option<String>,
+    /// trace `loc=`: the country the egress appears from.
+    pub loc: Option<String>,
+    /// trace `warp=`: `on` | `off` | `plus`.
+    pub warp: Option<String>,
+    /// The remaining saved fields as a JSON object string; `None` when
+    /// nothing beyond the four columns was requested or answered.
+    pub extra: Option<String>,
+}
+
+/// Stamp the trace facts of a proxy row (probe-written; the egress GeoIP
+/// columns derived from `ip` stay server-owned, the probe has no mmdb).
+/// Called after a successful trace fetch through a pinned listener; a
+/// failed fetch journals and touches nothing here.
+pub async fn trace_succeeded(
+    pool: &DbPool,
+    id: i64,
+    now: i64,
+    facts: &TraceFacts,
+) -> crate::Result<()> {
+    sqlx::query(
+        "UPDATE proxies SET
+             egress_ip = ?,
+             cf_colo = ?,
+             cf_loc = ?,
+             cf_warp = ?,
+             trace_json = ?,
+             updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(facts.ip.as_deref())
+    .bind(facts.colo.as_deref())
+    .bind(facts.loc.as_deref())
+    .bind(facts.warp.as_deref())
+    .bind(facts.extra.as_deref())
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stamp the last speed measurement on the proxy row (probe-written; the
+/// column pair `speed_mbps`/`speed_at` moves together, so the pipeline
+/// can tell a stale number from a fresh one). The column existed reserved
+/// since 0001; the writer arrived with migration 0022.
+pub async fn speed_succeeded(
+    pool: &DbPool,
+    id: i64,
+    now: i64,
+    speed_mbps: f64,
+) -> crate::Result<()> {
+    sqlx::query(
+        "UPDATE proxies SET
+             speed_mbps = ?,
+             speed_at = ?,
+             updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(speed_mbps)
+    .bind(now)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Apply a failed regular check (proxy was `unknown`, `alive` or `ready`).

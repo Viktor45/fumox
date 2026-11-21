@@ -24,6 +24,49 @@ pub struct BatchRow {
     pub vetted: Option<std::net::IpAddr>,
 }
 
+/// The speed-measurement plan of one batch: which rows are due
+/// for a (re)measurement and on which ports the pinned listeners are
+/// rendered. Empty = no listeners at all, the batch is delay-only.
+pub struct SpeedPlan {
+    /// The ids due for a measurement. `due` is the *input* (the caller
+    /// decides from `speed_at` staleness); the lanes rendered from it are
+    /// capped at [`max_lanes`][SpeedPlan::max_lanes] and reported back in
+    /// the generated batch, because a row the config skipped (its entry
+    /// cannot be serialized) must not get a lane.
+    pub due: std::collections::HashSet<i64>,
+    /// First port of the listener lanes; lane `i` takes `port_base + i`.
+    pub port_base: u16,
+    /// How many lanes the batch may render (=
+    /// `[network].speed_concurrency`): the downloads run speed_concurrency
+    /// at a time, so more listeners would be idle ports, and the port
+    /// range check (`port_base + lanes - 1 <= 65535`) would need more
+    /// headroom than the config bounds promise.
+    pub max_lanes: usize,
+}
+
+impl SpeedPlan {
+    pub fn empty() -> Self {
+        Self {
+            due: std::collections::HashSet::new(),
+            port_base: 0,
+            max_lanes: 0,
+        }
+    }
+}
+
+/// The generated batch config plus what the caller needs to drive it:
+/// the ids actually carried by the YAML (a record the core mapping cannot
+/// express is skipped) and the pinned-listener lanes of the speed plan.
+pub struct GeneratedBatch {
+    pub yaml: String,
+    pub included: Vec<i64>,
+    /// `(proxy id, listener port)` in lane order: lane `i` is the
+    /// `i`-th *included* row that was due, listening on `port_base + i`,
+    /// and every flow it accepts is forced through that proxy's tunnel
+    /// (the `proxy:` route override, upstream RawListener).
+    pub speed_lanes: Vec<(i64, u16)>,
+}
+
 fn num(value: i64) -> Value {
     Value::Number(value.into())
 }
@@ -56,19 +99,45 @@ pub fn required_field_problem(entry: &ProxyEntry) -> Option<&'static str> {
     }
 }
 
-/// Generate the full Clash config for one T2 batch, returning the YAML plus
-/// the ids of the records actually included in it.
+/// Generate the full Clash config for one T2 batch, returning the YAML
+/// plus the ids of the records actually included in it and the pinned
+/// listener lanes of the speed plan.
 ///
 /// The insecure parameters travel in from an untrusted feed and are not
 /// carried into the T2 config: T2 carries the proxy's own credential
 /// through the tunnel, so the generator drops them before the mapping runs
 /// (see [`proxy_to_value`]) instead of tunnel-testing with verification
 /// off behind the operator's back.
-pub fn generate(rows: &[BatchRow], ipv6: bool) -> serde_norway::Result<(String, Vec<i64>)> {
+pub fn generate(
+    rows: &[BatchRow],
+    ipv6: bool,
+    speed: &SpeedPlan,
+) -> serde_norway::Result<GeneratedBatch> {
     let mut included = Vec::new();
     let mut proxies = Vec::new();
+    let mut speed_lanes = Vec::new();
     for row in rows {
         if let Some(value) = proxy_to_value(row) {
+            // A lane is rendered only for a row that made it into the
+            // config: a skipped row would leave the plan pointing at a
+            // listener whose flows fail closed ("missing target"), and a
+            // measurement would need a tunnel that is not there
+            if speed.max_lanes > 0
+                && speed.due.contains(&row.id)
+                && speed_lanes.len() < speed.max_lanes
+            {
+                let port = speed
+                    .port_base
+                    .checked_add(speed_lanes.len() as u16)
+                    .ok_or_else(|| {
+                        <serde_norway::Error as serde::de::Error>::custom(format!(
+                            "speed listener port {} + lane {} overflows the port range",
+                            speed.port_base,
+                            speed_lanes.len()
+                        ))
+                    })?;
+                speed_lanes.push((row.id, port));
+            }
             included.push(row.id);
             proxies.push(value);
         }
@@ -91,7 +160,51 @@ pub fn generate(rows: &[BatchRow], ipv6: bool) -> serde_norway::Result<(String, 
     // behavioural choice (IPv4-only) that `[meow].ipv6` should own
     root.insert(Value::String("ipv6".into()), Value::Bool(ipv6));
     root.insert(Value::String("proxies".into()), Value::Sequence(proxies));
-    Ok((serde_norway::to_string(&Value::Mapping(root))?, included))
+    if !speed_lanes.is_empty() {
+        // One pinned listener per measurement lane: `proxy:` forces every
+        // flow of the listener through that proxy's tunnel, bypassing
+        // rules and mode dispatch, so the probe's download through port
+        // `base + i` is measured on exactly the proxy it names. `listen`
+        // as `host:port` overrides the global bind-address; `0.0.0.0`
+        // because the probe reaches the kernel over the container network
+        // (or the pod loopback), never through a shared filesystem
+        let listeners: Vec<Value> = speed_lanes
+            .iter()
+            .map(|(id, port)| {
+                let mut listener = serde_norway::Mapping::new();
+                listener.insert(
+                    Value::String("name".into()),
+                    Value::String(speed_listener_name(*port)),
+                );
+                listener.insert(Value::String("type".into()), Value::String("mixed".into()));
+                listener.insert(
+                    Value::String("listen".into()),
+                    Value::String(format!("0.0.0.0:{port}")),
+                );
+                listener.insert(
+                    Value::String("proxy".into()),
+                    Value::String(proxy_name(*id)),
+                );
+                Value::Mapping(listener)
+            })
+            .collect();
+        root.insert(
+            Value::String("listeners".into()),
+            Value::Sequence(listeners),
+        );
+    }
+    Ok(GeneratedBatch {
+        yaml: serde_norway::to_string(&Value::Mapping(root))?,
+        included,
+        speed_lanes,
+    })
+}
+
+/// Deterministic name of the pinned listener bound to `port` (the lane's
+/// address is what the probe connects to; the name is only for the
+/// kernel's own logging).
+pub fn speed_listener_name(port: u16) -> String {
+    format!("fumox-sp-{port}")
 }
 
 /// Map one batch record onto a Clash proxy definition; returns `None` for
@@ -280,7 +393,7 @@ mod tests {
             ),
         ];
 
-        let (yaml, _) = generate(&rows, false).unwrap();
+        let yaml = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies.len(), 6);
@@ -337,7 +450,9 @@ mod tests {
         assert!(!fumox_core::formats::clash::is_supported(Scheme::Naive));
 
         let rows = vec![record(9, entry(Scheme::Tuic, "c", &[]))];
-        let (yaml, included) = generate(&rows, false).unwrap();
+        let generated = generate(&rows, false, &SpeedPlan::empty()).unwrap();
+        let yaml = generated.yaml;
+        let included = generated.included;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
         assert!(
@@ -403,7 +518,9 @@ mod tests {
             pinned(1, entry(Scheme::AnyTls, "pw", &[])),
             record(2, entry(Scheme::Snell, "psk", &[])),
         ];
-        let (yaml, included) = generate(&rows, false).unwrap();
+        let generated = generate(&rows, false, &SpeedPlan::empty()).unwrap();
+        let yaml = generated.yaml;
+        let included = generated.included;
         assert_eq!(included, vec![1, 2]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
@@ -449,7 +566,7 @@ mod tests {
             ),
             record(5, entry(Scheme::Trojan, "pass", &[("allow_insecure", "1")])),
         ];
-        let (yaml, _) = generate(&rows, false).unwrap();
+        let yaml = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
 
@@ -480,7 +597,9 @@ mod tests {
             ),
         )];
 
-        let (yaml, included) = generate(&rows, false).unwrap();
+        let generated = generate(&rows, false, &SpeedPlan::empty()).unwrap();
+        let yaml = generated.yaml;
+        let included = generated.included;
         assert_eq!(included, vec![1]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
@@ -495,7 +614,7 @@ mod tests {
             1,
             entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
         )];
-        let (yaml, _) = generate(&rows, false).unwrap();
+        let yaml = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("h.example.com"));
@@ -511,7 +630,7 @@ mod tests {
             pinned(2, entry(Scheme::Trojan, "pw", &[])),
         ];
 
-        let (yaml, _) = generate(&rows, false).unwrap();
+        let yaml = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies[0]["server"].as_str(), Some("203.0.113.10"));
@@ -532,7 +651,9 @@ mod tests {
             pinned(4, entry(Scheme::Hysteria2, "pw", &[])),
         ];
 
-        let (yaml, included) = generate(&rows, false).unwrap();
+        let generated = generate(&rows, false, &SpeedPlan::empty()).unwrap();
+        let yaml = generated.yaml;
+        let included = generated.included;
         assert_eq!(included, vec![1, 2, 3, 4]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
@@ -608,8 +729,10 @@ mod tests {
             .map(|(i, (scheme, params, _))| pinned(i as i64 + 1, entry(*scheme, "c", params)))
             .collect();
 
-        let (plain, _) = generate(&plain, false).unwrap();
-        let (pinned, _) = generate(&pinned_rows, false).unwrap();
+        let plain = generate(&plain, false, &SpeedPlan::empty()).unwrap().yaml;
+        let pinned = generate(&pinned_rows, false, &SpeedPlan::empty())
+            .unwrap()
+            .yaml;
         let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
         let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
         let plain = plain["proxies"].as_sequence().unwrap();
@@ -670,8 +793,10 @@ mod tests {
             ),
         ];
 
-        let (plain, _) = generate(&plain, false).unwrap();
-        let (pinned, _) = generate(&pinned_rows, false).unwrap();
+        let plain = generate(&plain, false, &SpeedPlan::empty()).unwrap().yaml;
+        let pinned = generate(&pinned_rows, false, &SpeedPlan::empty())
+            .unwrap()
+            .yaml;
         let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
         let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
         let plain = plain["proxies"].as_sequence().unwrap();
@@ -697,7 +822,7 @@ mod tests {
         ip_entry.host = "203.0.113.10".into();
         let rows = vec![pinned(1, ip_entry)];
 
-        let (yaml, _) = generate(&rows, false).unwrap();
+        let yaml = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("203.0.113.10"));
@@ -725,7 +850,7 @@ mod tests {
             ),
         ];
 
-        let (yaml, _) = generate(&rows, false).unwrap();
+        let yaml = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         for (index, proxy) in proxies.iter().enumerate().take(3) {
@@ -759,12 +884,63 @@ mod tests {
     fn ipv6_flag_is_rendered_explicitly() {
         let rows = vec![record(7, entry(Scheme::Vless, "uuid-7", &[]))];
 
-        let (off, _) = generate(&rows, false).unwrap();
-        let (on, _) = generate(&rows, true).unwrap();
+        let off = generate(&rows, false, &SpeedPlan::empty()).unwrap().yaml;
+        let on = generate(&rows, true, &SpeedPlan::empty()).unwrap().yaml;
         let off: serde_norway::Value = serde_norway::from_str(&off).unwrap();
         let on: serde_norway::Value = serde_norway::from_str(&on).unwrap();
 
         assert_eq!(off["ipv6"].as_bool(), Some(false));
         assert_eq!(on["ipv6"].as_bool(), Some(true));
+    }
+
+    /// The speed plan renders one pinned listener per due row, in lane
+    /// order, capped at `max_lanes`; a row the core mapping skipped gets
+    /// no lane, and a non-due row gets none either.
+    #[test]
+    fn speed_plan_renders_pinned_listeners_for_due_rows() {
+        let rows = vec![
+            record(1, entry(Scheme::Vless, "uuid-1", &[])),
+            record(2, entry(Scheme::Trojan, "pw-2", &[])),
+            record(3, entry(Scheme::Ss, "aes-256-gcm:pw", &[])),
+            record(4, entry(Scheme::Tuic, "skipped-by-mapping", &[])),
+        ];
+        let mut due = std::collections::HashSet::new();
+        due.insert(1);
+        due.insert(2);
+        due.insert(3);
+        due.insert(4);
+        let plan = SpeedPlan {
+            due,
+            port_base: 30000,
+            max_lanes: 2,
+        };
+
+        let generated = generate(&rows, false, &plan).unwrap();
+        // Lane order follows the batch order of the included rows: 1 and 2
+        // fit under the cap, 3 stays due but lane-less, 4 is not even in
+        // the config
+        assert_eq!(generated.speed_lanes, vec![(1, 30000), (2, 30001)]);
+        assert_eq!(generated.included, vec![1, 2, 3]);
+
+        let parsed: serde_norway::Value = serde_norway::from_str(&generated.yaml).unwrap();
+        let listeners = parsed["listeners"].as_sequence().unwrap();
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0]["name"].as_str(), Some("fumox-sp-30000"));
+        assert_eq!(listeners[0]["type"].as_str(), Some("mixed"));
+        assert_eq!(listeners[0]["listen"].as_str(), Some("0.0.0.0:30000"));
+        assert_eq!(listeners[0]["proxy"].as_str(), Some("fumox-1"));
+        assert_eq!(listeners[1]["listen"].as_str(), Some("0.0.0.0:30001"));
+        assert_eq!(listeners[1]["proxy"].as_str(), Some("fumox-2"));
+    }
+
+    /// No due rows (speed disabled or everything fresh): no `listeners`
+    /// key at all, the config stays exactly the delay-only shape.
+    #[test]
+    fn an_empty_speed_plan_renders_no_listeners_key() {
+        let rows = vec![record(1, entry(Scheme::Vless, "uuid-1", &[]))];
+        let generated = generate(&rows, false, &SpeedPlan::empty()).unwrap();
+        assert!(generated.speed_lanes.is_empty());
+        let parsed: serde_norway::Value = serde_norway::from_str(&generated.yaml).unwrap();
+        assert!(parsed.get("listeners").is_none(), "{}", generated.yaml);
     }
 }

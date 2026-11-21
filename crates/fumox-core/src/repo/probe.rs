@@ -8,6 +8,7 @@
 use crate::db::DbPool;
 use crate::repo::proxies::{T1_EXCLUDED_SCHEMES, T1Candidate, t1_lane_predicate};
 use sqlx::FromRow;
+use std::collections::HashMap;
 
 /// `probe_results.probe_kind` of a tunnel check that produced a verdict:
 /// the engine answered and the tunnel either came up or died.
@@ -31,6 +32,19 @@ pub const T2_KINDS_SQL: &str = "'t2', 't2_unverified'";
 pub fn is_t2_kind(kind: &str) -> bool {
     matches!(kind, T2_KIND | T2_UNVERIFIED_KIND)
 }
+
+/// `probe_results.probe_kind` of a Cloudflare trace fetch: the
+/// attempt to read the egress facts (`ip=`/`colo=`/`loc=`/`warp=`) through
+/// a freshly delay-verified tunnel. Diagnostics only — the state machine
+/// never sees it, exactly like the speed attempt below.
+pub const TRACE_KIND: &str = "trace";
+
+/// `probe_results.probe_kind` of a download-speed measurement:
+/// the attempt to pull the synthetic payload through the tunnel. A failed
+/// attempt journals the reason and leaves `speed_mbps`/`speed_at` alone;
+/// the status machine is the tunnel check's alone (owner decision,
+/// 2026-11-21).
+pub const SPEED_KIND: &str = "speed";
 
 // Cross-process `meta` payloads (probe daemon <-> admin panel)
 
@@ -475,6 +489,35 @@ where
     .fetch_all(executor)
     .await?;
     Ok(rows)
+}
+
+/// Failure counts per `probe_kind` over a rolling window, only the kinds
+/// asked for (the measurement diagnostics: `speed` / `trace`).
+/// Kinds with no failures in the window come back absent — the caller
+/// zero-fills the ones it renders. The kind set is built from bound
+/// placeholders, so even a caller-supplied list cannot reach the SQL text.
+pub async fn failure_counts_by_kind(
+    pool: &DbPool,
+    kinds: &[&str],
+    since_ts: i64,
+) -> crate::Result<HashMap<String, i64>> {
+    if kinds.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; kinds.len()].join(", ");
+    let sql = format!(
+        "SELECT probe_kind, COUNT(*) FROM probe_results
+         WHERE ok = 0 AND checked_at >= ? AND probe_kind IN ({placeholders})
+         GROUP BY probe_kind"
+    );
+    // The interpolated part is the `?`-placeholder list built from
+    // `kinds.len()`, the values themselves travel bound — audited safe
+    let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql)).bind(since_ts);
+    for kind in kinds {
+        query = query.bind(*kind);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// One row of the proxy card's probe history: a preserved check attempt.

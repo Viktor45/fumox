@@ -20,6 +20,45 @@ are stamped when the batch is published.
 
 ### Added
 
+- Speed measurements and Cloudflare trace facts for `ready` proxies. Right after a successful delay verdict, the probe fetches
+  `[network].trace_url` through the proxy and stores ip/colo/loc/warp (plus
+  the configured `[network].trace_fields` in `trace_json`, migration 0022),
+  then streams a payload through the same tunnel from `[network].speed_url`
+  without writing to disk: the full `[network].speed_bytes` (25 MiB) or the
+  `[network].speed_time_ceiling_secs` (15 s) ceiling, whichever comes first —
+  an interrupted download yields an honest number over the bytes actually
+  read. The measurement runs through per-row pinned listeners (`type:
+  mixed` with `proxy: fumox-{id}`), so no request bypasses the tunnel;
+  only the first `[network].speed_concurrency` rows of a T2 batch get
+  listeners (ports from `[network].speed_listener_port_base`), and re-measuring
+  happens no more often than `[network].speed_interval_secs` (24 h). A failed
+  measurement journals its reason and never touches the status machine —
+  the speed is a metric only (owner decision, 2026-11-21); a failed trace
+  skips that cycle's download.
+- The pipeline reads the new facts: a `speed` section (`min_mbps` +
+  `max_age_secs`, unmeasured and stale-measured proxies are dropped),
+  `filter.colo`/`exclude_colo`, `filter.loc`/`exclude_loc`,
+  `filter.warp` (`on`/`off`/`plus`), `filter.egress_countries` and
+  `filter.egress_asns` over the trace facts (allowlists drop unmeasured
+  proxies: confirmed facts only), `sort.by = "speed"` (fastest first by
+  default), and six new name placeholders: `{speed}`, `{colo}`, `{loc}`,
+  `{warp}`, `{egress_country}`, `{egress_asn}`.
+- Egress geo backfill: the server derives `egress_country`/`egress_asn`/
+  `egress_asn_org` from `egress_ip` through the GeoLite2 databases in a
+  background pass (at startup and on the six-hour geo-backfill tick) — the
+  probe has no access to the mmdb files. The retry window for
+  unresolvable egress IPs mirrors the host-geo one (6 h).
+- The proxy card shows the measured speed with its measurement timestamp,
+  the egress facts (egress IP, colo, loc, warp, the derived egress country
+  and ASN) and the pretty-printed `trace_json`; the probe history decodes
+  the new `speed`/`trace` kinds. The proxy browser grew speed/egress
+  filters and Egress/Speed columns; the **Probe** screen summarizes the
+  measurements (how many proxies carry one, how many went stale, how many
+  speed/trace attempts failed over 24 h).
+- Nine `[network]` settings for all of the above in `config/app.toml` and on
+  the settings edit page: `speed_enabled`, `speed_url`, `speed_bytes`,
+  `speed_time_ceiling_secs`, `speed_concurrency`, `speed_interval_secs`,
+  `speed_listener_port_base`, `trace_url`, `trace_fields`.
 - `[database].allow_checksum_repair` (default `false`): the opt-in that
   lets the boot re-stamp an applied migration whose file changed since it
   was applied. Off by default, and the refusal is explicit: a mismatch

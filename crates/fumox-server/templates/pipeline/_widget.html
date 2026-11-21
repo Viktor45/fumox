@@ -160,6 +160,58 @@
             <div class="hint">{{ self.t("ped.exclude_asns_hint") }}</div>
           </div>
         </div>
+        <div class="ped-columns">
+          <div class="field">
+            <label for="ped-colo">{{ self.t("ped.colo_label") }}</label>
+            <input type="text" name="ped_filter_colo" id="ped-colo" value="{{ builder.state.colo }}"
+                   placeholder="{{ self.t("ped.colo_placeholder") }}" autocomplete="off">
+            <div class="hint">{{ self.t("ped.colo_hint") }}</div>
+          </div>
+          <div class="field">
+            <label for="ped-excl-colo">{{ self.t("ped.exclude_colo_label") }}</label>
+            <input type="text" name="ped_filter_exclude_colo" id="ped-excl-colo" value="{{ builder.state.exclude_colo }}"
+                   placeholder="{{ self.t("ped.colo_placeholder") }}" autocomplete="off">
+            <div class="hint">{{ self.t("ped.exclude_colo_hint") }}</div>
+          </div>
+        </div>
+        <div class="ped-columns">
+          <div class="field">
+            <label for="ped-loc">{{ self.t("ped.loc_label") }}</label>
+            <input type="text" name="ped_filter_loc" id="ped-loc" value="{{ builder.state.loc }}"
+                   placeholder="{{ self.t("ped.loc_placeholder") }}" autocomplete="off">
+            <div class="hint">{{ self.t("ped.loc_hint") }}</div>
+          </div>
+          <div class="field">
+            <label for="ped-excl-loc">{{ self.t("ped.exclude_loc_label") }}</label>
+            <input type="text" name="ped_filter_exclude_loc" id="ped-excl-loc" value="{{ builder.state.exclude_loc }}"
+                   placeholder="{{ self.t("ped.loc_placeholder") }}" autocomplete="off">
+            <div class="hint">{{ self.t("ped.exclude_loc_hint") }}</div>
+          </div>
+        </div>
+        <div class="ped-columns">
+          <div class="field">
+            <label for="ped-egress-countries">{{ self.t("ped.egress_countries_label") }}</label>
+            <input type="text" name="ped_filter_egress_countries" id="ped-egress-countries" value="{{ builder.state.egress_countries }}"
+                   placeholder="{{ self.t("ped.loc_placeholder") }}" autocomplete="off">
+            <div class="hint">{{ self.t("ped.egress_countries_hint") }}</div>
+          </div>
+          <div class="field">
+            <label for="ped-egress-asns">{{ self.t("ped.egress_asns_label") }}</label>
+            <input type="text" name="ped_filter_egress_asns" id="ped-egress-asns" value="{{ builder.state.egress_asns }}"
+                   placeholder="{{ self.t("ped.asns_placeholder") }}" inputmode="numeric" autocomplete="off">
+            <div class="hint">{{ self.t("ped.egress_asns_hint") }}</div>
+          </div>
+        </div>
+        <div class="field">
+          <div class="hint">{{ self.t("ped.warp_label") }}</div>
+          {% for (state, selected) in builder.warp_states %}
+          <span class="check-row">
+            <input type="checkbox" name="ped_filter_warp" value="{{ state }}" id="ped-warp-{{ state }}" {% if selected %}checked{% endif %}>
+            <label for="ped-warp-{{ state }}">{{ state }}</label>
+          </span>
+          {% endfor %}
+          <div class="hint">{{ self.t("ped.warp_hint") }}</div>
+        </div>
         <div class="field">
           <span class="check-row">
             {# The hidden companion makes the checkbox tri-state: an
@@ -310,6 +362,40 @@
             <label for="ped-status-{{ status }}">{{ self.health_status_label(status) }}</label>
           </span>
           {% endfor %}
+        </div>
+      </div>
+
+      <div class="field" data-ped-section="speed">
+        <h3 class="ped-section-heading" id="ped-section-speed">{{ self.t("ped.section_speed") }}</h3>
+        <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-speed">
+          <span class="check-row">
+            <input type="radio" name="ped_speed" value="skip" id="ped-speed-skip" {% if !builder.state.speed_set && !builder.state.speed_defaults %}checked{% endif %}>
+            <label for="ped-speed-skip">{{ self.t("ped.mode_skip") }}</label>
+          </span>
+          <span class="check-row">
+            <input type="radio" name="ped_speed" value="defaults" id="ped-speed-defaults" {% if builder.state.speed_defaults %}checked{% endif %}>
+            <label for="ped-speed-defaults">{{ self.t("ped.mode_defaults") }}</label>
+          </span>
+          <span class="check-row">
+            <input type="radio" name="ped_speed" value="set" id="ped-speed-set" {% if builder.state.speed_set %}checked{% endif %}>
+            <label for="ped-speed-set">{{ self.t("ped.mode_set") }}</label>
+          </span>
+        </div>
+        <div class="ped-inner" data-ped-inner="speed"{% if !builder.speed_section_active() %} hidden{% endif %}>
+          <div class="ped-columns">
+            <div class="field">
+              <label for="ped-speed-min">{{ self.t("ped.speed_min_label") }}</label>
+              <input type="number" min="0" step="0.1" name="ped_speed_min_mbps" id="ped-speed-min" value="{{ builder.state.speed_min_mbps }}"
+                     aria-labelledby="ped-section-speed" autocomplete="off">
+              <div class="hint">{{ self.t("ped.speed_min_hint") }}</div>
+            </div>
+            <div class="field">
+              <label for="ped-speed-age">{{ self.t("ped.speed_age_label") }}</label>
+              <input type="number" min="1" step="1" name="ped_speed_max_age_secs" id="ped-speed-age" value="{{ builder.state.speed_max_age_secs }}"
+                     aria-labelledby="ped-section-speed" autocomplete="off">
+              <div class="hint">{{ self.t("ped.speed_age_hint") }}</div>
+            </div>
+          </div>
         </div>
       </div>
 

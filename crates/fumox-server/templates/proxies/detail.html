@@ -86,6 +86,58 @@
         {% endmatch %}
       </td></tr>
     </table>
+
+    {#- The egress facts: what the Cloudflare trace saw through the
+        tunnel during the T2 cycle. Written by the probe (`trace_url` via
+        the pinned listener); `egress_country`/`egress_asn` are filled by
+        the server's egress backfill from the mmdb files, so they can lag
+        behind the trace itself — the hint says which side wrote what. -#}
+    <h3>{{ self.t("px.egress_title") }}</h3>
+    <p class="hint">{{ self.t("px.egress_hint") }}</p>
+    <table class="kv">
+      <tr><th>{{ self.t("px.egress_ip") }}</th><td class="mono small">
+        {% match proxy.egress_ip %}
+          {% when Some with (ip) %}{{ ip }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("px.cf_colo") }}</th><td class="mono small">
+        {% match proxy.cf_colo %}
+          {% when Some with (colo) %}{{ colo }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("px.cf_loc") }}</th><td>
+        {% match proxy.cf_loc %}
+          {% when Some with (loc) %}{{ loc }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("px.cf_warp") }}</th><td class="mono small">
+        {% match proxy.cf_warp %}
+          {% when Some with (warp) %}{{ warp }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("px.egress_country") }}</th><td>{{ self.flag(proxy.egress_country) }}
+        {% match proxy.egress_country %}
+          {% when Some with (country) %}{{ country }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("px.egress_asn") }}</th><td class="mono small">
+        {% match proxy.egress_asn %}
+          {% when Some with (asn) %}{{ asn }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("px.egress_asn_org") }}</th><td>
+        {% match proxy.egress_asn_org %}
+          {% when Some with (org) %}{{ org }}
+          {% when None %}<span class="muted">–</span>
+        {% endmatch %}
+      </td></tr>
+    </table>
   </div>
 
   <div class="panel">
@@ -111,6 +163,13 @@
     {% if !unknown_params_display.is_empty() %}
       <h3>{{ self.t("px.unknown_params") }}</h3>
       <pre class="mono small">{{ unknown_params_display }}</pre>
+    {% endif %}
+    {#- The trace fields the row does not keep in dedicated columns
+        ([network].trace_fields beyond ip/colo/loc/warp). Same shape as the
+        params block: a JSON blob the operator reads, nothing to click. -#}
+    {% if !trace_json_display.is_empty() %}
+      <h3>{{ self.t("px.trace_json_title") }}</h3>
+      <pre class="mono small">{{ trace_json_display }}</pre>
     {% endif %}
   </div>
 

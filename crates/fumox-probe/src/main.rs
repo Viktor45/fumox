@@ -13,6 +13,7 @@
 
 mod clash;
 mod meow;
+mod speed;
 mod t1;
 
 use std::path::PathBuf;
@@ -24,9 +25,12 @@ use clap::Parser;
 use fumox_core::AppConfig;
 use fumox_core::db::DbPool;
 use fumox_core::models::{ProxyEntry, Scheme, now_ts};
-use fumox_core::repo::probe::{ProbeResultEntry, T2_KIND, T2_UNVERIFIED_KIND};
+use fumox_core::repo::probe::{
+    ProbeResultEntry, SPEED_KIND, T2_KIND, T2_UNVERIFIED_KIND, TRACE_KIND,
+};
 use fumox_core::repo::{meta_get, meta_set, probe as probe_repo, proxies, retention};
 use meow::{DelayOutcome, MeowClient};
+use speed::{Attempt, AttemptValue};
 use tokio::sync::Semaphore;
 
 /// In-batch `ServiceUnavailable` outcomes (each already survived the
@@ -1783,10 +1787,21 @@ async fn run_tunnel_reload(
     cycle: Arc<Cycle>,
     lane: TunnelLane,
 ) -> anyhow::Result<TunnelOutcome> {
-    let included = match prepare_engine_config(&ctx, &batch, pins) {
-        Ok(included) => included,
+    let generated = match prepare_engine_config(&ctx, &batch, pins, lane) {
+        Ok(generated) => generated,
         Err(error) => return Ok(fail_tunnel_batch_prepare(&ctx, batch, error).await),
     };
+    let included = generated.included;
+    // The lanes the speed plan rendered; a lane whose delay check fails
+    // simply goes unused this cycle
+    let speed_lanes: std::collections::HashMap<i64, u16> =
+        generated.speed_lanes.into_iter().collect();
+    if !speed_lanes.is_empty() {
+        tracing::debug!(
+            lanes = speed_lanes.len(),
+            "speed measurement listeners rendered into the batch config"
+        );
+    }
 
     if let Err(error) = ctx.meow.reload_config(&ctx.config.meow.config_path).await {
         return split_or_abort_reload(ctx, batch, pins, cycle, lane, error).await;
@@ -1805,6 +1820,9 @@ async fn run_tunnel_reload(
         // One test URL for the whole batch, so the verdicts are about the
         // same endpoint
         test_url: ctx.meow.batch_test_url().to_string(),
+        // The pinned-listener ports of the speed measurement;
+        // empty when speed is disabled or the lane is not T2
+        speed_lanes: Arc::new(speed_lanes),
     };
     tracing::debug!(test_url = %state.test_url, "tunnel batch test URL");
     let (tasks, skipped, skipped_ids) =
@@ -1855,6 +1873,11 @@ struct BatchState {
     verdicts: Arc<T2Verdicts>,
     engine_faults: Arc<AtomicUsize>,
     test_url: String,
+    /// The pinned-listener ports of the speed measurement, per proxy id.
+    /// The plan already caps the lanes at
+    /// `[network].speed_concurrency`, so the downloads need no semaphore of
+    /// their own.
+    speed_lanes: Arc<std::collections::HashMap<i64, u16>>,
 }
 
 /// The engine never sees the batch: the rows are journaled unverified (no
@@ -1980,6 +2003,13 @@ async fn spawn_tunnel_checks(
         let budget = cycle.budget.clone();
         let step = row.ladder_step;
         let id = row.id;
+        // The pinned listener of the row's speed lane, when the plan gave
+        // it one; the measurement only runs for a tunnel the delay check
+        // just verified
+        let measure = state
+            .speed_lanes
+            .get(&id)
+            .map(|port| (*port, budget.clone()));
         tasks.spawn(async move {
             // The semaphore lives in this scope until the join loop below
             // returns, so a close here is structurally impossible; counted
@@ -2007,6 +2037,7 @@ async fn spawn_tunnel_checks(
                 &verdicts,
                 &guard,
                 &engine_faults,
+                measure,
             )
             .await
         });
@@ -2083,7 +2114,13 @@ async fn classify_unavailable_outcomes(ctx: &Context, state: &BatchState) {
 /// quarantine revival check; see [`TunnelLane`]). `ladder_step` is the
 /// row's quarantine ladder step (`None` outside the revival lane); it
 /// only decides how a failure is charged, the check itself is the same.
-/// Returns the [`TunnelTask`] the join loop counts.
+/// `measure` carries the pinned-listener port and the cycle budget of the
+/// speed measurement that follows a verified tunnel (`None` =
+/// delay-only). Returns the [`TunnelTask`] the join loop counts.
+// The eight parameters are the shared runner's own context (the batch
+// guard, the verdicts, the engine-fault counter) plus the row's identity;
+// bundling them into a struct would move the same names one call down
+#[allow(clippy::too_many_arguments)]
 async fn perform_tunnel_check(
     ctx: &Context,
     id: i64,
@@ -2092,6 +2129,7 @@ async fn perform_tunnel_check(
     verdicts: &T2Verdicts,
     guard: &BatchGuard,
     engine_faults: &AtomicUsize,
+    measure: Option<(u16, CycleBudget)>,
 ) -> TunnelTask {
     let name = clash::proxy_name(id);
     let now = now_ts();
@@ -2136,6 +2174,11 @@ async fn perform_tunnel_check(
             if ladder_step.is_some() {
                 tracing::info!(id, "quarantined proxy revived via the T2 tunnel check");
             }
+            // The tunnel just verified itself: the measurement rides the
+            // same task while the listener is hot
+            if let Some((port, budget)) = measure {
+                measure_speed_and_trace(ctx, id, port, budget).await;
+            }
             TunnelTask::Judged(id)
         }
         DelayOutcome::ProxyFailed(message) => {
@@ -2175,6 +2218,135 @@ async fn perform_tunnel_check(
             guard.record_unavailable();
             verdicts.record_unavailable(id, error);
             TunnelTask::Ran
+        }
+    }
+}
+
+/// The measurement of one delay-verified tunnel: the trace fetch
+/// first, then the speed download, both through the row's pinned
+/// listener. Both are diagnostics (owner decision, 2026-11-21: the speed
+/// is a metric, never a verdict): a failed attempt journals its reason and
+/// leaves the previous facts, the status machine and the fail budget
+/// untouched. A failed trace skips the download for this cycle — a tunnel
+/// that cannot carry a few hundred bytes will not carry the payload
+/// either, and the row keeps its stale `speed_at` for the next batch.
+async fn measure_speed_and_trace(ctx: &Context, id: i64, port: u16, budget: CycleBudget) {
+    let meow_cfg = &ctx.config.meow;
+    let network_cfg = &ctx.config.network;
+    let Some(proxy_addr) = speed::listener_addr(&meow_cfg.api_addr, port) else {
+        tracing::warn!(
+            id,
+            api_addr = %meow_cfg.api_addr,
+            "cannot derive the pinned listener address from meow.api_addr, the measurement is skipped"
+        );
+        return;
+    };
+    let now = now_ts();
+
+    if !network_cfg.trace_fields.is_empty() {
+        match speed::fetch_trace(
+            &network_cfg.trace_url,
+            &network_cfg.trace_fields,
+            &proxy_addr,
+        )
+        .await
+        {
+            Attempt {
+                ok: true,
+                value: AttemptValue::Trace(facts),
+                ..
+            } => {
+                journal(
+                    ctx,
+                    ProbeResultEntry {
+                        proxy_id: id,
+                        checked_at: now,
+                        ok: true,
+                        latency_ms: None,
+                        error: None,
+                        probe_kind: TRACE_KIND,
+                    },
+                )
+                .await;
+                if let Err(error) = proxies::trace_succeeded(&ctx.pool, id, now, &facts).await {
+                    tracing::warn!(id, %error, "failed to stamp the trace facts");
+                }
+            }
+            Attempt { error, .. } => {
+                let error =
+                    sanitize_reason(&error.unwrap_or_else(|| "unknown trace failure".to_string()));
+                tracing::debug!(id, %error, "trace fetch through the pinned listener failed");
+                journal(
+                    ctx,
+                    ProbeResultEntry {
+                        proxy_id: id,
+                        checked_at: now,
+                        ok: false,
+                        latency_ms: None,
+                        error: Some(&error),
+                        probe_kind: TRACE_KIND,
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    // Out of budget while the trace ran: the measurement waits for the
+    // next cycle (the stale `speed_at` keeps the row due)
+    if budget.expired() {
+        tracing::debug!(id, "cycle budget spent before the speed download");
+        return;
+    }
+    let ceiling = Duration::from_secs(network_cfg.speed_time_ceiling_secs.max(1));
+    match speed::measure_speed(
+        &network_cfg.speed_url,
+        network_cfg.speed_bytes,
+        ceiling,
+        &proxy_addr,
+    )
+    .await
+    {
+        Attempt {
+            ok: true,
+            value: AttemptValue::Speed(mbps),
+            ..
+        } => {
+            journal(
+                ctx,
+                ProbeResultEntry {
+                    proxy_id: id,
+                    checked_at: now_ts(),
+                    ok: true,
+                    latency_ms: None,
+                    error: None,
+                    probe_kind: SPEED_KIND,
+                },
+            )
+            .await;
+            if let Err(error) = proxies::speed_succeeded(&ctx.pool, id, now_ts(), mbps).await {
+                tracing::warn!(id, %error, "failed to stamp the speed measurement");
+            } else {
+                tracing::debug!(id, mbps, "speed measured through the pinned listener");
+            }
+        }
+        Attempt { error, .. } => {
+            let error =
+                sanitize_reason(&error.unwrap_or_else(|| "unknown speed failure".to_string()));
+            tracing::debug!(id, %error, "speed download through the pinned listener failed");
+            journal(
+                ctx,
+                ProbeResultEntry {
+                    proxy_id: id,
+                    checked_at: now_ts(),
+                    ok: false,
+                    latency_ms: None,
+                    error: Some(&error),
+                    probe_kind: SPEED_KIND,
+                },
+            )
+            .await;
         }
     }
 }
@@ -2630,18 +2802,52 @@ fn engine_records(
 }
 
 /// Prepare the engine configuration of one batch: generate the Clash YAML
-/// and write it to `meow.config_path`. A failure here means the engine
-/// never sees the batch; the callers treat it like a failed reload (rows
+/// (with the pinned speed-measurement listeners of [`speed_plan`]) and
+/// write it to `meow.config_path`. A failure here means the engine never
+/// sees the batch; the callers treat it like a failed reload (rows
 /// journaled unverified, never charged, and the T2 lanes back off).
 fn prepare_engine_config(
     ctx: &Context,
     batch: &[proxies::ProxyRow],
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
-) -> anyhow::Result<Vec<i64>> {
-    let (yaml, included) = clash::generate(&engine_records(batch, pins), ctx.config.meow.ipv6)
-        .map_err(|error| anyhow::anyhow!("cannot generate the meow config: {error}"))?;
-    write_meow_config(&ctx.config.meow.config_path, &yaml)?;
-    Ok(included)
+    lane: TunnelLane,
+) -> anyhow::Result<clash::GeneratedBatch> {
+    let generated = clash::generate(
+        &engine_records(batch, pins),
+        ctx.config.meow.ipv6,
+        &speed_plan(ctx, batch, lane),
+    )
+    .map_err(|error| anyhow::anyhow!("cannot generate the meow config: {error}"))?;
+    write_meow_config(&ctx.config.meow.config_path, &generated.yaml)?;
+    Ok(generated)
+}
+
+/// The speed-measurement plan of one T2 batch: the rows whose
+/// last measurement is stale enough to re-measure, capped at
+/// `[network].speed_concurrency` lanes so the ports and the parallel
+/// downloads both stay inside their bounds. Only the regular T2 lane
+/// measures — a quarantine revival is about getting the row back into the
+/// rotation, not about measuring it (owner decision, 2026-11-21: measure
+/// the delay-passers of the T2 batch).
+fn speed_plan(ctx: &Context, batch: &[proxies::ProxyRow], lane: TunnelLane) -> clash::SpeedPlan {
+    if !ctx.config.network.speed_enabled || !matches!(lane, TunnelLane::T2 { .. }) {
+        return clash::SpeedPlan::empty();
+    }
+    let interval = ctx.config.network.speed_interval_secs as i64;
+    let now = now_ts();
+    let due: std::collections::HashSet<i64> = batch
+        .iter()
+        .filter(|row| {
+            row.speed_at
+                .is_none_or(|at| now.saturating_sub(at) >= interval)
+        })
+        .map(|row| row.id)
+        .collect();
+    clash::SpeedPlan {
+        due,
+        port_base: ctx.config.network.speed_listener_port_base,
+        max_lanes: ctx.config.network.speed_concurrency,
+    }
 }
 
 /// Generate a Clash batch, reload meow-rs, and delay-test every proxy

@@ -479,6 +479,63 @@
         <div class="hint">{{ self.t("set.meow_ipv6_hint") }}</div>
         {% match self.error_for("meow.ipv6") %}{% when Some with (msg) %}<div class="error-text" id="err-meow.ipv6" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
+      <div class="field">
+        <span class="check-row">
+          <input type="hidden" name="network.speed_enabled" value="off"{{ self.field_disabled("network.speed_enabled") }}>
+          <input type="checkbox" name="network.speed_enabled" value="on" id="network-speed-enabled" {% if self.bool_value("network.speed_enabled") %}checked{% endif %}{{ self.field_disabled("network.speed_enabled") }}{{ self.error_attrs("network.speed_enabled") | safe }}>
+          <label for="network-speed-enabled">{{ self.t("set.network_speed_enabled") }}</label>
+        </span>
+        <div class="hint">{{ self.t("set.network_speed_enabled_hint") }}</div>
+        {% match self.error_for("network.speed_enabled") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_enabled" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-speed-url">{{ self.t("set.network_speed_url") }}</label>
+        <input type="text" id="network-speed-url" name="network.speed_url" value="{{ self.raw_value("network.speed_url") }}"{{ self.field_disabled("network.speed_url") }}{{ self.error_attrs("network.speed_url") | safe }}>
+        <div class="hint">{{ self.t("set.network_speed_url_hint") }}</div>
+        {% match self.error_for("network.speed_url") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_url" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-speed-bytes">{{ self.t("set.network_speed_bytes") }}</label>
+        <input type="number" id="network-speed-bytes" name="network.speed_bytes" min="{{ self.range_min("network.speed_bytes") }}" max="{{ self.range_max("network.speed_bytes") }}" value="{{ self.raw_value("network.speed_bytes") }}"{{ self.field_disabled("network.speed_bytes") }}{{ self.error_attrs("network.speed_bytes") | safe }}>
+        {% match self.range_text("network.speed_bytes") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("network.speed_bytes") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_bytes" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-speed-ceiling">{{ self.t("set.network_speed_ceiling") }}</label>
+        <input type="number" id="network-speed-ceiling" name="network.speed_time_ceiling_secs" min="{{ self.range_min("network.speed_time_ceiling_secs") }}" max="{{ self.range_max("network.speed_time_ceiling_secs") }}" value="{{ self.raw_value("network.speed_time_ceiling_secs") }}"{{ self.field_disabled("network.speed_time_ceiling_secs") }}{{ self.error_attrs("network.speed_time_ceiling_secs") | safe }}>
+        {% match self.range_text("network.speed_time_ceiling_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("network.speed_time_ceiling_secs") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_time_ceiling_secs" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-speed-conc">{{ self.t("set.network_speed_concurrency") }}</label>
+        <input type="number" id="network-speed-conc" name="network.speed_concurrency" min="{{ self.range_min("network.speed_concurrency") }}" max="{{ self.range_max("network.speed_concurrency") }}" value="{{ self.raw_value("network.speed_concurrency") }}"{{ self.field_disabled("network.speed_concurrency") }}{{ self.error_attrs("network.speed_concurrency") | safe }}>
+        {% match self.range_text("network.speed_concurrency") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("network.speed_concurrency") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_concurrency" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-speed-interval">{{ self.t("set.network_speed_interval") }}</label>
+        <input type="number" id="network-speed-interval" name="network.speed_interval_secs" min="{{ self.range_min("network.speed_interval_secs") }}" max="{{ self.range_max("network.speed_interval_secs") }}" value="{{ self.raw_value("network.speed_interval_secs") }}"{{ self.field_disabled("network.speed_interval_secs") }}{{ self.error_attrs("network.speed_interval_secs") | safe }}>
+        {% match self.range_text("network.speed_interval_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("network.speed_interval_secs") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_interval_secs" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-speed-port">{{ self.t("set.network_speed_port_base") }}</label>
+        <input type="number" id="network-speed-port" name="network.speed_listener_port_base" min="{{ self.range_min("network.speed_listener_port_base") }}" max="{{ self.range_max("network.speed_listener_port_base") }}" value="{{ self.raw_value("network.speed_listener_port_base") }}"{{ self.field_disabled("network.speed_listener_port_base") }}{{ self.error_attrs("network.speed_listener_port_base") | safe }}>
+        {% match self.range_text("network.speed_listener_port_base") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("network.speed_listener_port_base") %}{% when Some with (msg) %}<div class="error-text" id="err-network.speed_listener_port_base" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-trace-url">{{ self.t("set.network_trace_url") }}</label>
+        <input type="text" id="network-trace-url" name="network.trace_url" value="{{ self.raw_value("network.trace_url") }}"{{ self.field_disabled("network.trace_url") }}{{ self.error_attrs("network.trace_url") | safe }}>
+        <div class="hint">{{ self.t("set.network_trace_url_hint") }}</div>
+        {% match self.error_for("network.trace_url") %}{% when Some with (msg) %}<div class="error-text" id="err-network.trace_url" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="network-trace-fields">{{ self.t("set.network_trace_fields") }}</label>
+        <textarea class="mono" id="network-trace-fields" name="network.trace_fields" rows="8"{{ self.field_disabled("network.trace_fields") }}{{ self.error_attrs("network.trace_fields") | safe }}>{{ self.raw_value("network.trace_fields") }}</textarea>
+        <div class="hint">{{ self.t("set.network_trace_fields_hint") }}</div>
+        {% match self.error_for("network.trace_fields") %}{% when Some with (msg) %}<div class="error-text" id="err-network.trace_fields" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
     </div>
 
     <div class="panel">

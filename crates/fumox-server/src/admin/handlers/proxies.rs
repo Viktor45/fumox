@@ -63,6 +63,10 @@ struct ProxiesListTemplate {
     f_sort: String,
     /// Active coverage bucket ("" = no filter).
     f_coverage: String,
+    /// Active speed-measurement bucket ("" = no filter).
+    f_speed: String,
+    /// Active egress-country filter ("" = no filter).
+    f_egress: String,
     /// The current view as a query string (empty when nothing narrows
     /// it). The bulk-action dialogs carry it as a hidden field, so the
     /// redirect after an action lands back on the same filtered page
@@ -71,6 +75,8 @@ struct ProxiesListTemplate {
     all_statuses: Vec<(String, bool)>,
     all_schemes: Vec<(String, bool)>,
     countries: Vec<String>,
+    /// Country codes the egress backfill derived; the egress dropdown.
+    egress_countries: Vec<String>,
     sources: Vec<(String, String, bool)>,
 }
 
@@ -106,6 +112,8 @@ impl ProxiesListTemplate {
             || !self.f_source.is_empty()
             || !self.f_q.is_empty()
             || !self.f_coverage.is_empty()
+            || !self.f_speed.is_empty()
+            || !self.f_egress.is_empty()
     }
 
     fn country_selected(&self, country: &str) -> bool {
@@ -114,6 +122,15 @@ impl ProxiesListTemplate {
 
     fn source_selected(&self, id: &str) -> bool {
         self.f_source == id
+    }
+
+    /// Whether a speed-bucket option of the filter dropdown is active.
+    fn speed_selected(&self, bucket: &str) -> bool {
+        self.f_speed == bucket
+    }
+
+    fn egress_country_selected(&self, country: &str) -> bool {
+        self.f_egress == country
     }
 
     /// Whether a coverage-bucket option of the filter dropdown is active.
@@ -227,6 +244,15 @@ fn list_query_suffix(filter: &ProxyListFilter, order: ProxyListOrder) -> String 
     if let Some(bucket) = filter.coverage {
         parts.push(format!("coverage={}", urlencoding(bucket.as_str())));
     }
+    if let Some(measured) = filter.speed_measured {
+        parts.push(format!(
+            "speed={}",
+            urlencoding(if measured { "measured" } else { "unmeasured" })
+        ));
+    }
+    if !filter.egress_country.is_empty() {
+        parts.push(format!("egress={}", urlencoding(&filter.egress_country)));
+    }
     if order != ProxyListOrder::Updated {
         parts.push(format!("sort={}", urlencoding(order.as_param())));
     }
@@ -238,8 +264,9 @@ fn list_query_suffix(filter: &ProxyListFilter, order: ProxyListOrder) -> String 
 }
 
 /// The filter keys the bulk-action dialogs may carry back to the list.
-const VIEW_KEYS: [&str; 9] = [
-    "status", "scheme", "country", "source", "q", "coverage", "sort", "per_page", "cur",
+const VIEW_KEYS: [&str; 11] = [
+    "status", "scheme", "country", "source", "q", "coverage", "speed", "egress", "sort",
+    "per_page", "cur",
 ];
 
 /// The redirect target of a bulk action: the list, back on the view the
@@ -305,6 +332,12 @@ struct ListViewQuery {
     coverage_label: String,
     /// The parsed bucket for the repo filter (`None` = no filter).
     coverage: Option<CheckCoverage>,
+    /// The speed bucket in its canonical spelling (`""` = no filter).
+    speed_label: String,
+    /// The parsed bucket for the repo filter (`None` = no filter).
+    speed_measured: Option<bool>,
+    /// The egress-country filter (`""` = no filter).
+    egress: String,
     per_page: i64,
 }
 
@@ -358,6 +391,19 @@ impl ListViewQuery {
         let coverage_label = coverage
             .map(|bucket| bucket.as_str().to_string())
             .unwrap_or_default();
+        // Speed bucket: same tolerance as the coverage one — a garbage
+        // value filters nothing, the two buckets live here and in the
+        // repo's `ProxyListFilter`
+        let speed_raw = params
+            .get("speed")
+            .cloned()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let (speed_label, speed_measured) = match speed_raw.as_str() {
+            "measured" => ("measured".to_string(), Some(true)),
+            "unmeasured" => ("unmeasured".to_string(), Some(false)),
+            _ => (String::new(), None),
+        };
         Self {
             statuses,
             scheme: params.get("scheme").cloned().unwrap_or_default(),
@@ -367,6 +413,9 @@ impl ListViewQuery {
             sort,
             coverage_label,
             coverage,
+            speed_label,
+            speed_measured,
+            egress: params.get("egress").cloned().unwrap_or_default(),
             per_page: clamp_limit(params.get("per_page").and_then(|v| v.parse().ok())),
         }
     }
@@ -382,13 +431,16 @@ impl ListViewQuery {
             source_id: self.source.clone(),
             query: self.q.clone(),
             coverage: self.coverage,
+            speed_measured: self.speed_measured,
+            egress_country: self.egress.clone(),
         }
     }
 }
 
-/// The four independent reads of the list screen — the filtered total
+/// The five independent reads of the list screen — the filtered total
 /// for the pagination line, the unfiltered `removed` and detached
-/// counters, and the page rows — run concurrently in one `try_join!`
+/// counters, the page rows, and the egress-country dropdown options —
+/// run concurrently in one `try_join!`
 /// (SQLite reads run concurrently in WAL mode) with one error site for
 /// their identical handlers.
 ///
@@ -403,12 +455,13 @@ async fn list_reads(
     order: ProxyListOrder,
     per_page: i64,
     page: Option<&ProxyListPage>,
-) -> fumox_core::Result<(i64, i64, i64, Vec<ProxyListRow>)> {
+) -> fumox_core::Result<(i64, i64, i64, Vec<ProxyListRow>, Vec<String>)> {
     tokio::try_join!(
         proxies::count_filtered(&state.pool, filter),
         proxies::count_removed(&state.pool),
         proxies::count_detached(&state.pool),
         proxies::list_filtered(&state.pool, filter, order, per_page + 1, page),
+        proxies::distinct_egress_countries(&state.pool),
     )
 }
 
@@ -476,7 +529,7 @@ pub async fn proxies_list(
         direction: *direction,
     });
 
-    let (total, removed_count, detached_count, mut rows) =
+    let (total, removed_count, detached_count, mut rows, egress_countries) =
         match list_reads(&state, &filter, order, query.per_page, page.as_ref()).await {
             Ok(reads) => reads,
             Err(err) => return server_error(&state, &headers, "proxies.list", &err),
@@ -547,8 +600,11 @@ pub async fn proxies_list(
             f_q: query.q,
             f_sort: query.sort,
             f_coverage: query.coverage_label,
+            f_speed: query.speed_label,
+            f_egress: query.egress,
             view_query,
             countries,
+            egress_countries,
             sources,
         },
         StatusCode::OK,
@@ -569,6 +625,9 @@ struct ProxyDetailTemplate {
     credential_display: String,
     params_display: String,
     unknown_params_display: String,
+    /// Pretty-printed `trace_json` column (the trace fields beyond the
+    /// four dedicated ones); empty when the row has none.
+    trace_json_display: String,
     /// The stored subscription line with its secrets masked.
     raw_line_display: Option<String>,
     lifecycle: Vec<(String, String)>,
@@ -655,6 +714,24 @@ fn pretty_params(column: &Option<String>) -> String {
         .unwrap_or_default()
 }
 
+/// Pretty-print the stored `trace_json` column. Unlike the params blob,
+/// nothing here is masked: the column holds only the configured trace
+/// fields the probe parsed (`http`, `tls`, `fl`, … — Cloudflare's own
+/// diagnostics), and the probe never writes credential-bearing values
+/// into it.
+fn pretty_trace(column: &Option<String>) -> String {
+    column
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                .unwrap_or_else(|| text.to_string())
+        })
+        .unwrap_or_default()
+}
+
 pub async fn proxy_detail(
     State(state): State<AdminState>,
     Path(id): Path<i64>,
@@ -726,6 +803,12 @@ pub async fn proxy_detail(
                 .map(|mbps| format!("{mbps:.1} {}", lang.t("px.speed_unit")))
                 .unwrap_or_else(|| NO_VALUE.into()),
         ),
+        // When the speed above was measured: a number without its moment
+        // cannot be told from a stale one
+        (
+            lang.t("px.speed_measured").into(),
+            fmt_opt_ts_element(proxy.speed_at),
+        ),
     ];
 
     let probes: Vec<probe_repo::ProbeHistoryRow> =
@@ -759,6 +842,7 @@ pub async fn proxy_detail(
             credential_display: mask_credential(&proxy.credential),
             params_display: pretty_params(&proxy.params),
             unknown_params_display: pretty_params(&proxy.unknown_params),
+            trace_json_display: pretty_trace(&proxy.trace_json),
             raw_line_display: proxy.raw_line.as_deref().map(mask_proxy_line),
             proxy,
             lifecycle,
@@ -1385,6 +1469,19 @@ mod tests {
         );
     }
 
+    /// The trace blob is rendered without masking (the probe writes only
+    /// Cloudflare's own diagnostics into it) and an empty or missing
+    /// column renders as nothing — the card hides the section wholesale.
+    #[test]
+    fn the_trace_blob_pretty_prints_without_masks() {
+        let column = serde_json::json!({"http": "h2", "fl": "419f41"}).to_string();
+        let pretty = pretty_trace(&Some(column));
+        assert!(pretty.contains("\"http\": \"h2\""), "{pretty}");
+        // Missing and empty columns both hide the section
+        assert_eq!(pretty_trace(&None), "");
+        assert_eq!(pretty_trace(&Some(String::new())), "");
+    }
+
     /// The cursor token is the whole contract between the browser and
     /// the database: the sort key of the row a page resumes from and the
     /// side of it the page takes.
@@ -1524,7 +1621,9 @@ mod tests {
                         f_country: &str,
                         f_source: &str,
                         f_q: &str,
-                        f_coverage: &str| {
+                        f_coverage: &str,
+                        f_speed: &str,
+                        f_egress: &str| {
             ProxiesListTemplate {
                 lang: lang.clone(),
                 langs: Vec::new(),
@@ -1545,21 +1644,26 @@ mod tests {
                 f_q: f_q.into(),
                 f_sort: "updated".into(),
                 f_coverage: f_coverage.into(),
+                f_speed: f_speed.into(),
+                f_egress: f_egress.into(),
                 view_query: String::new(),
                 all_statuses: Vec::new(),
                 all_schemes: Vec::new(),
                 countries: Vec::new(),
+                egress_countries: Vec::new(),
                 sources: Vec::new(),
             }
         };
 
-        assert!(!template(Vec::new(), "", "", "", "", "").filters_active());
-        assert!(template(vec!["alive".into()], "", "", "", "", "").filters_active());
-        assert!(template(Vec::new(), "vless", "", "", "", "").filters_active());
-        assert!(template(Vec::new(), "", "DE", "", "", "").filters_active());
-        assert!(template(Vec::new(), "", "", "src1", "", "").filters_active());
-        assert!(template(Vec::new(), "", "", "", "node", "").filters_active());
-        assert!(template(Vec::new(), "", "", "", "", "t1_only").filters_active());
+        assert!(!template(Vec::new(), "", "", "", "", "", "", "").filters_active());
+        assert!(template(vec!["alive".into()], "", "", "", "", "", "", "").filters_active());
+        assert!(template(Vec::new(), "vless", "", "", "", "", "", "").filters_active());
+        assert!(template(Vec::new(), "", "DE", "", "", "", "", "").filters_active());
+        assert!(template(Vec::new(), "", "", "src1", "", "", "", "").filters_active());
+        assert!(template(Vec::new(), "", "", "", "node", "", "", "").filters_active());
+        assert!(template(Vec::new(), "", "", "", "", "t1_only", "", "").filters_active());
+        assert!(template(Vec::new(), "", "", "", "", "", "measured", "").filters_active());
+        assert!(template(Vec::new(), "", "", "", "", "", "", "DE").filters_active());
     }
 
     /// The bulk actions redirect back to the view the dialog was opened
@@ -1603,6 +1707,8 @@ mod tests {
             source_id: String::new(),
             query: "node one".into(),
             coverage: Some(CheckCoverage::T1Only),
+            speed_measured: None,
+            egress_country: String::new(),
         };
         let suffix = list_query_suffix(&filter, ProxyListOrder::Latency);
         assert_eq!(

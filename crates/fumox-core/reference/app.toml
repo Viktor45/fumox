@@ -153,12 +153,12 @@ max_retries = 2
 # Exponential backoff base
 retry_base_backoff_ms = 500
 # Строка без диапазона: любой User-Agent, который не запрещён целевым сервером.
-# Встроенный дефолт генерируется из версии бинарника (сейчас fumox/0.1.0):
+# Встроенный дефолт генерируется из версии бинарника (сейчас fumox/0.2.0):
 # удалите строку, подставится актуальная версия при сборке. headers
 # конкретного источника важнее этого значения.
 # The built-in default is derived from the binary version: remove the line
 # to inherit it at compile time. Per-source headers win
-user_agent = "fumox/0.1.0"
+user_agent = "fumox/0.2.0"
 # Диапазон: any | ipv4 | ipv6, других значений парсер не принимает.
 # Семейство IP-протоколов по умолчанию для загрузки источников.
 # Источник без своего ip_family наследует это значение. any, dual-stack:
@@ -299,6 +299,80 @@ auto_download = true
 # a feed-supplied name before they may dial it; the bound lives here because
 # that resolve belongs to the address policy, not the geo enrichment
 dns_timeout_secs = 0
+# Диапазон: true | false. Замер скорости скачивания: прокси, прошедший
+# delay-проверку в T2-батче, скачивает через себя синтетический файл (без
+# записи на диск), результат — прокси-строка `speed_mbps`/`speed_at`. Провал
+# замера статус не меняет: машиной состояний владеет только проверка туннеля.
+# Range: true | false. The download-speed measurement: a proxy that
+# passed the delay check in the T2 batch downloads a synthetic payload through
+# itself (nothing is written to disk); the result lands on the proxy row as
+# `speed_mbps`/`speed_at`. A failed measurement never changes a status: the
+# state machine belongs to the tunnel check alone
+speed_enabled = true
+# Абсолютный http(s)-URL с подстановками {bytes} (обязательна — размер
+# скачиваемого файла в байтах) и {rand} (опциональна — свежее случайное число
+# на каждый запрос против кэшей). HTTPS: запрос идет через проверяемый прокси.
+# An absolute http(s) URL with the {bytes} placeholder (required: the payload
+# size in bytes) and {rand} (optional: a fresh random number per request, so
+# caches never serve the second measurement). HTTPS: the request goes through
+# the proxy under test
+speed_url = "https://speed.cloudflare.com/__down?measId={rand}&bytes={bytes}"
+# Диапазон: 1..=1073741824 байт (форма). Размер файла для {bytes}: 25 МиБ по
+# умолчанию; потолок времени делает меньший размер вопросом точности, не
+# зависания.
+# Range: 1..=1073741824 bytes (form). The payload size for {bytes}: 25 MiB by
+# default; the time ceiling turns a smaller size into a resolution question,
+# not a hang
+speed_bytes = 26214400
+# Диапазон: 1..=600 секунд (форма). Потолок одного скачивания: не успел
+# отдать весь файл — скорость считается по скачанному (честное число для
+# медленного туннеля).
+# Range: 1..=600 seconds (form). The time ceiling of one download: when the
+# payload did not arrive whole, the throughput is computed over what did —
+# the honest number for a slow tunnel
+speed_time_ceiling_secs = 15
+# Диапазон: 1..=16 (форма). Сколько скачиваний (и trace-запросов) идет
+# одновременно; под каждый рендерится отдельный pinned-listener meow-конфига
+# (type mixed) на порту speed_listener_port_base + i. Квоты meow-контейнера
+# (256 МБ / 0.75 CPU) рассчитаны на дефолт 4.
+# Range: 1..=16 (form). How many downloads (and trace fetches) run at once;
+# each gets its own pinned listener in the rendered meow config (type mixed)
+# on port speed_listener_port_base + i. The meow container quotas (256 MiB /
+# 0.75 CPU) are sized for the default of 4
+speed_concurrency = 4
+# Диапазон: 60..=604800 секунд (форма). Пересзамер не чаще этого интервала:
+# последний замер и есть значение для пайплайна, ежедневный пересзамер не
+# тратит трафик прокси на суточную стабильность чисел.
+# Range: 60..=604800 seconds (form). A fresh measurement happens no more
+# often than this: the last measurement is the value the pipeline sees, and
+# a daily re-measure does not spend the proxy's traffic on numbers that
+# rarely change overnight
+speed_interval_secs = 86400
+# Диапазон: 1024..=65000 (форма). Первый порт pinned-листенеров замера
+# (дорожка i получает base + i); при максимуме speed_concurrency порт
+# base+15 остается внутри u16.
+# Range: 1024..=65000 (form). First port of the pinned speed-test listeners
+# (lane i takes base + i); at the maximum speed_concurrency, base+15 still
+# fits the u16 port range
+speed_listener_port_base = 30000
+# Абсолютный http(s)-URL trace-эндпоинта, который probe опрашивает через
+# свежепроверенный прокси: ответ — plain text key=value с фактами исходящего
+# адреса (ip=, colo=, loc=, warp=...). HTTPS: запрос идет через проверяемый
+# прокси.
+# An absolute http(s) URL of the trace endpoint the probe fetches through a
+# freshly checked proxy: the answer is plain text key=value with the egress
+# facts (ip=, colo=, loc=, warp=...). HTTPS: the request goes through the
+# proxy under test
+trace_url = "https://www.cloudflare.com/cdn-cgi/trace"
+# Строка с запятыми или массив имен полей trace-ответа, которые сохраняются.
+# Первые четыре (ip, colo, loc, warp) попадают в собственные колонки
+# `proxies`; остальные — в `trace_json` одним объектом. Пусто = trace-шаг
+# выключен. Каждое имя — строчный идентификатор: ответ парсится как key=value.
+# A comma-separated string or an array of trace-answer field names to keep.
+# The first four (ip, colo, loc, warp) get their own `proxies` columns; the
+# rest is stored in `trace_json` as one object. Empty = the trace step is
+# off. Every name is a lowercase identifier: the answer parses as key=value
+trace_fields = ["ip", "colo", "loc", "warp", "http", "tls", "fl", "gateway"]
 
 [admin]
 # Диапазон: true | false.

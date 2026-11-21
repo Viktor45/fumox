@@ -680,6 +680,22 @@ fn spawn_geo_backfill_tick(slot: &mut SweepSlot, env: &IngestEnv) {
             .await;
     });
     watch_task(handle, "geo backfill");
+
+    // The egress geo walk rides the same tick and budget: the
+    // probe stamps egress_ip, the server derives the geo facts from it
+    let pool = env.pool.clone();
+    let geo = Arc::clone(&env.geo);
+    let guard = SweepGuard(slot.flag());
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        crate::egress_backfill::backfill_missing_egress_geo_within_budget(
+            pool,
+            geo,
+            GEO_BACKFILL_BUDGET,
+        )
+        .await;
+    });
+    watch_task(handle, "egress geo backfill");
 }
 
 /// Watch a detached task and report its panic: a background job that dies

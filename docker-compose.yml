@@ -40,7 +40,7 @@
 # Every container runs as a non-root user with no capabilities and a
 # read-only root filesystem; every path a binary writes to is a volume, a
 # bind mount or a tmpfs (/tmp for the SQLite scratch files, /run/meow for
-# the rendered kernel config)
+# the rendered kernel config and the kernel's controller-discovery file)
 #
 # GeoLite2 .mmdb files do NOT go into ./config: FUMOX_GEO__DB_DIR=/shared/geo
 # (the geo volume) outranks config/app.toml, so ./config is never scanned
@@ -214,8 +214,10 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      # The rendered kernel config (it carries the controller secret) and
-      # the kernel's own data directory live on RAM only
+      # The rendered kernel config (it carries the controller secret), the
+      # kernel's own data directory and the controller-discovery file it
+      # publishes for meow-cli (MEOW_RUNTIME_DIR, set in the image) live on
+      # RAM only
       - /run/meow:rw,noexec,nosuid,nodev,mode=1777,size=16m
     environment:
       # The kernel refuses to start without one: an unauthenticated

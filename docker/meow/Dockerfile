@@ -157,6 +157,18 @@ COPY --chmod=0755 entrypoint.sh /usr/local/bin/meow-entrypoint
 WORKDIR /etc/meow
 USER meow
 
+# meow-rs (v0.27+) publishes a controller-discovery file for meow-cli
+# (<pid>.json: the controller address, the API secret and the config path)
+# under $HOME/.cache/meow/controllers. This image's HOME (/etc/meow) sits on
+# the root filesystem, which every shipped layout mounts read-only, so the
+# default path fails with "Read-only file system" on every start. The file
+# carries the controller secret, so it belongs on the same tmpfs the
+# orchestrators already mount at /run/meow: RAM only. The kernel creates the
+# directory itself with mode 0700, so it stays private on the mode=1777
+# mount (meow-cli is not shipped here; the variable only keeps the kernel
+# quiet on a read-only root)
+ENV MEOW_RUNTIME_DIR=/run/meow/controllers
+
 # Clash external-controller REST API (fumox-probe only; not published)
 EXPOSE 9090
 

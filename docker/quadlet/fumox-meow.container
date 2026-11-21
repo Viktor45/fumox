@@ -32,8 +32,9 @@ Group=999
 NoNewPrivileges=true
 ReadOnly=true
 ReadOnlyTmpfs=false
-# The rendered config (it carries the controller secret) and the kernel's
-# data directory live on RAM only.
+# The rendered config (it carries the controller secret), the kernel's
+# data directory and the controller-discovery file it publishes for
+# meow-cli (MEOW_RUNTIME_DIR, set in the image) live on RAM only.
 Tmpfs=/run/meow:rw,noexec,nosuid,nodev,mode=1777,size=16m
 
 # The controller secret and the shared runtime variables.

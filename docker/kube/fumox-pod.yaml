@@ -215,8 +215,10 @@ spec:
       volumeMounts:
         - name: meow
           mountPath: /shared/meow
-        # The rendered config (it carries the controller secret) and the
-        # kernel's data directory live on RAM only
+        # The rendered config (it carries the controller secret), the
+        # kernel's data directory and the controller-discovery file it
+        # publishes for meow-cli (MEOW_RUNTIME_DIR, set in the image) live
+        # on RAM only
         - name: meow-run
           mountPath: /run/meow
       # Same quota as fumox-meow.container (the kernel only samples proxies

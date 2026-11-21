@@ -75,8 +75,8 @@ fn canonical_params(entry: &ProxyEntry) -> String {
 
 /// Feed text is attacker-controlled and the values reach the pre-image
 /// verbatim: a raw separator byte would move a field boundary (`path=/search`
-/// + `host=evil` and the single parameter `host=evil&path=/search` would
-/// produce the same pre-image). Only bytes outside printable ASCII and the
+/// plus `host=evil` would yield the same pre-image as the single parameter
+/// `host=evil&path=/search`). Only bytes outside printable ASCII and the
 /// separators (plus `%`, so escaping is reversible) are rewritten.
 fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());

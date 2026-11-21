@@ -7,6 +7,12 @@
       the row count is whatever the handler passed in, and the strip
       cannot drift from the catalog text. -#}
   <p class="muted small">{{ self.t_args("px.history_shown", &[probes.len().to_string()][..]) }}</p>
+  {#- The Time and Kind header tooltips exist only on hover, which a
+      touch device cannot open; both facts (the zone the server shows,
+      the legend of the check kinds) are duplicated as visible text
+      above the table, like the format hints of profiles/list.html. -#}
+  <p class="hint">{{ self.t("common.time_utc_hint") }}</p>
+  <p class="hint">{{ self.t("px.kind_legend") }}</p>
   <div class="table-scroll">
     <table class="data">
       <caption class="visually-hidden">{{ self.t("px.history_title") }}</caption>

@@ -50,7 +50,7 @@ pub fn skipped_count(format: OutputFormat, entries: &[ProxyEntry]) -> usize {
 /// The per-name counter never rewinds: restarting the probe at 1 for every
 /// entry made this O(k²) in the number of proxies sharing a name, and names
 /// come straight from an untrusted feed, 20 000 identical names cost 36 s
-/// of CPU inside a `/sub` render (security audit, 2026-09-05).
+/// of CPU inside a `/sub` render.
 pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut taken: HashSet<String> = HashSet::new();
     let mut next_suffix: HashMap<String, usize> = HashMap::new();
@@ -88,8 +88,7 @@ pub(crate) fn network_of(entry: &crate::models::ProxyEntry, uri_key: &str) -> Op
 /// u64, with a negative value read as 0: the Clash encoder parsed `i64` and
 /// emitted the negative number verbatim while the sing-box encoder read
 /// `u64` and silently zeroed the field, so the two outputs disagreed for one
-/// proxy. (An earlier `as u16` cast truncated 65536 to 0 on the sing-box
-/// side; the wide type keeps that from coming back.)
+/// proxy.
 pub(crate) fn alter_id(entry: &crate::models::ProxyEntry) -> u64 {
     param_value(entry, "aid")
         .or_else(|| param_value(entry, "alterId"))

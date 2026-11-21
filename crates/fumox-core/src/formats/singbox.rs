@@ -584,8 +584,7 @@ mod tests {
     }
 
     /// `alter_id` used to go through `as u16`, so 65536 silently became 0
-    /// while the Clash encoder emitted 65536 for the same proxy (security
-    /// audit, 2026-09-05).
+    /// while the Clash encoder emitted 65536 for the same proxy.
     #[test]
     fn alter_id_above_u16_is_not_truncated() {
         for aid in ["65536", "65537", "4294967296"] {

@@ -147,8 +147,8 @@ pub fn client_key(
 /// A left-to-right walk would take the left-most non-trusted entry, which
 /// is text the *client* chose whenever it sends its own XFF and the
 /// trusted proxy merely appends: every forged IP then got a fresh
-/// rate-limit window, voiding the login brute-force cap (security review
-/// f2). The walk also does not prove authorship: a single-element XFF
+/// rate-limit window, voiding the login brute-force cap. The walk also does
+/// not prove authorship: a single-element XFF
 /// reads the same whether the proxy appended it or the client authored
 /// it, so callers must establish that the trusted hop writes this header
 /// at all ([`client_key`], from the operator's declaration). A trust list
@@ -671,12 +671,9 @@ mod tests {
         assert_eq!(key_xff(&h), "1.1.1.1".parse::<IpAddr>().unwrap());
     }
 
-    /// The attack from security review f2: the client sends its own XFF
-    /// prefix and a trusted proxy appends the real client IP (nginx
-    /// `$proxy_add_x_forwarded_for`). The left-most entry is attacker text;
-    /// only the right-most non-trusted entry is what the trusted hop saw.
-    /// The old left-to-right walk returned 6.6.6.6, giving every forged IP
-    /// a fresh rate-limit window.
+    /// The client sends its own XFF prefix, a trusted proxy appends the real
+    /// client IP (nginx `$proxy_add_x_forwarded_for`); the left-most entry is
+    /// attacker text, only the right-most non-trusted entry keys the window.
     #[test]
     fn client_supplied_xff_prefix_cannot_pick_the_rate_limit_key() {
         let h = xff("6.6.6.6, 9.9.9.9");
@@ -940,9 +937,7 @@ mod tests {
     }
 
     /// RFC 7239 §4 does not pin parameter ordering: a non-`for=` parameter
-    /// before the `for=` must not abort the walk. The audit's reported
-    /// shape was `Forwarded: proto=https;for=1.2.3.4` and the pre-fix code
-    /// bailed at `proto=https`.
+    /// before the `for=` must not abort the walk.
     #[test]
     fn walk_forwarded_takes_first_for_param_regardless_of_position() {
         let h = fwd("proto=https;for=1.2.3.4");

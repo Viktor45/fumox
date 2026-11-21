@@ -827,7 +827,7 @@ where
     Ok(())
 }
 
-// ─── Egress GeoIP backfill ────────────────────────────────────────────────
+// Egress GeoIP backfill
 //
 // The probe stamps `egress_ip` from the Cloudflare trace but holds no mmdb,
 // so the server derives the egress geo facts from it with the same walk the

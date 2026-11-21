@@ -353,8 +353,8 @@ pub const MAX_PARAM_BYTES: usize = 8 * 1024;
 ///
 /// `raw_line` is persisted verbatim onto every stored row, so an oversized
 /// line is a storage bomb, not just a parse cost, a full 10 MiB fetch of a
-/// single line became ~20 MiB of SQLite data per row per refresh (security
-/// audit v2, 2026-09-09, F13). Legitimate proxy lines are well under 4 KiB.
+/// single line became ~20 MiB of SQLite data per row per refresh.
+/// Legitimate proxy lines are well under 4 KiB.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Parse a raw query string into ordered parameters.
@@ -380,7 +380,7 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
     }
     let mut params = Vec::with_capacity(count);
     for pair in query.split('&') {
-        // Size caps run before any allocation for the pair (F13)
+        // Size caps run before any allocation for the pair
         match pair.split_once('=') {
             Some((key, value)) => {
                 check_param_size(key, value)?;

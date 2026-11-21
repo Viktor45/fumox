@@ -337,9 +337,9 @@ pub(crate) fn port_from_string(s: &str, dialect: &str) -> Result<u16, String> {
 /// reference, so one anchor of `s` events plus `k` references yields
 /// ~`k×s` values from a payload of ~`k+s` events: quadratic memory
 /// amplification from a feed payload bounded only by the 10 MiB fetch cap
-/// (security review f4: 20 KiB → >1 GiB heap, allocation failure aborts the
-/// whole process). Feed content has no legitimate use for aliases, so the
-/// entire class is refused before parsing rather than budgeted.
+/// (20 KiB → >1 GiB heap, allocation failure aborts the whole process).
+/// Feed content has no legitimate use for aliases, so the entire class is
+/// refused before parsing rather than budgeted.
 ///
 /// The scan is a small YAML-token scanner, not a parser, biased toward false
 /// positives: a missed alias is a security hole, a wrongly rejected payload

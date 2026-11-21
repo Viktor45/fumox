@@ -456,11 +456,24 @@
     input.value = location.pathname + location.search;
   });
 
-  // A select that submits its own form (the dashboard's row count)
+  // A select that submits its own form (the dashboard's row count).
+  // The change event does not say what produced it: arrow keys on a
+  // closed <select> fire change in most browsers (Windows/Linux
+  // Chromium and Edge, Firefox everywhere), and a submit per keypress
+  // would reload the page mid-browse and throw the keyboard user's
+  // focus away before the far options were ever reachable. A keydown
+  // shortly before the change marks the event as keyboard-driven; such
+  // a choice is confirmed with the Apply button beside the select, the
+  // same path a no-JS browser already takes.
+  var lastKeydownAt = 0;
+  document.body.addEventListener('keydown', function () {
+    lastKeydownAt = Date.now();
+  });
   document.body.addEventListener('change', function (event) {
     var target = event.target;
     if (!(target instanceof HTMLSelectElement)) return;
     if (!target.hasAttribute('data-submit-form')) return;
+    if (Date.now() - lastKeydownAt < 100) return;
     if (target.form) target.form.submit();
   });
 

@@ -35,15 +35,21 @@
     alphanumeric (`normalize_asn` accepts `24940` and `AS24940`), so the
     placeholder shows both forms and no numeric keyboard is forced; the
     title carries the same hint (the op descriptions name the two forms
-    too, a visible note here would say it twice). -#}
+    too, a visible note here would say it twice). The input would
+    otherwise have no accessible name at all (no label, no aria-label),
+    so it announces itself with the ASN name; the op title beside it
+    says which operation the field belongs to. -#}
 {% macro asn_controls() %}
 <input type="text" name="asn" placeholder="24940 / AS24940" autocomplete="off"
+       aria-label="{{ self.t("ped.target_asn") }}"
        title="{{ self.t("px.asn_input_hint") }}">
 {% endmacro %}
 
-{#- The control the country-based operations take. -#}
+{#- The control the country-based operations take. The placeholder
+    option is not a control name, so the select carries the country
+    name as its accessible label. -#}
 {% macro country_controls() %}
-<select name="country">
+<select name="country" aria-label="{{ self.t("common.country") }}">
   <option value="">{{ self.t("common.choose") }}</option>
   {% for country in countries %}
     <option value="{{ country }}">{{ country }}</option>
@@ -299,6 +305,12 @@
         </tbody>
       </table>
     </div>
+    {#- The Egress and Speed header tooltips exist only on hover, which
+        a touch device cannot open (the pattern profiles/list.html
+        already fixed): both facts are duplicated as visible text under
+        the table. -#}
+    <p class="hint">{{ self.t("px.egress_hint") }}</p>
+    <p class="hint">{{ self.t("px.speed_filter_label") }}</p>
   {% endif %}
 
   {# Keyset navigation: the links carry the cursor of the page they

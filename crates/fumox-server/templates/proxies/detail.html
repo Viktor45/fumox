@@ -28,11 +28,17 @@
   {% endif %}
   <span class="spacer"></span>
   <div class="row-actions">
+    {#- The slot stands next to the form like the toggle-error slot of
+        the profile card: a network failure (htmx:sendError) never
+        reaches the server, so no toast comes back and the action would
+        stay silent without a slot of its own. -#}
     <form method="post" action="/admin/proxies/{{ proxy.id }}/reset"
-          hx-post="/admin/proxies/{{ proxy.id }}/reset" hx-target="#status-badge" hx-swap="outerHTML">
+          hx-post="/admin/proxies/{{ proxy.id }}/reset" hx-target="#status-badge" hx-swap="outerHTML"
+          data-error-target="reset-error">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{{ self.t("px.reset_status") }}</button>
     </form>
+    <span id="reset-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
   </div>
 </div>
 

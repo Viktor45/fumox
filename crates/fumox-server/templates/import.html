@@ -88,7 +88,12 @@
       <textarea class="mono" id="io-payload" name="payload" rows="12" placeholder='{ "version": 1, … }'{% if !errors.is_empty() %} aria-describedby="io-errors" aria-invalid="true"{% endif %}>{{ payload }}</textarea>
       <div class="hint">{{ self.t("io.payload_hint") }}</div>
     </div>
-    <div class="field">
+    {#- The field carries an id so the no-JS fallback in base.html can
+        hide it whole (label, input, hint): without scripting the form
+        posts urlencoded and the server reads only `payload`, so the
+        chosen file would arrive as a bare filename and its contents
+        would be lost. The paste path above is the no-JS way in. -#}
+    <div class="field" id="io-file-field">
       <label for="io-file">{{ self.t("io.file_label") }}</label>
       <input type="file" id="io-file" name="file" accept=".json,application/json"{% if !errors.is_empty() %} aria-describedby="io-errors"{% endif %}>
       <div class="hint">{{ self.t("io.file_hint") }}</div>

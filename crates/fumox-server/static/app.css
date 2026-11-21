@@ -161,8 +161,15 @@
 /* Clickable form controls and the labels wired to them, once in the
    base layer: a label or select that acts on click must promise it
    with the pointer cursor, not the default arrow (labels of the
-   settings checkboxes, the filters, the source and profile forms). */
-label[for], select, input[type="checkbox"] { cursor: pointer; }
+   settings checkboxes, the filters, the source and profile forms, the
+   pipeline tri-state radios). A disabled control cannot act: it keeps
+   the arrow with the not-allowed slash, a pointer would promise a
+   click the control can never deliver (a read-only deployment
+   disables the whole settings form through its fieldset). */
+label[for], select, input[type="checkbox"], input[type="radio"] { cursor: pointer; }
+select:disabled, input[type="checkbox"]:disabled, input[type="radio"]:disabled {
+  cursor: not-allowed;
+}
 
 body {
   margin: 0;
@@ -180,6 +187,10 @@ body {
 
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+/* Pressed feedback for every link, once here in the base layer: the
+   controls that light up on hover must also answer the click itself
+   (status-count and badge links carry their own :active on top). */
+a:active { opacity: 0.7; }
 
 /* layout */
 
@@ -278,7 +289,13 @@ a:hover { text-decoration: underline; }
 .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
 .grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
 @media (max-width: 900px) {
-  .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }
+  .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
+  /* The middle band of the width range: the four-column stat grids do
+     not jump straight from four columns to one. Two by two keeps the
+     cards at a readable width while the viewport is between the phone
+     breakpoint and the desktop grid; the phone breakpoint below stacks
+     them into a single column. */
+  .grid.cols-4 { grid-template-columns: 1fr 1fr; }
 }
 /* Long unbreakable content shrinks the panel, never the grid columns. */
 .grid > * { min-width: 0; }
@@ -734,7 +751,13 @@ input.tab-input {
   color: inherit;
   cursor: pointer;
   flex: 0 0 auto;
+  border-radius: 6px;
 }
+/* Hover and pressed feedback: the toast surface is the same dark navy
+   in both themes as the topbar, so the topbar's white-overlay tints are
+   the matching pair already in the palette, no new colour. */
+.toast-close:hover { background: var(--topbar-hover); }
+.toast-close:active { background: var(--topbar-active); }
 @keyframes toast-in {
   from { transform: translateY(8px); opacity: 0; }
   to { transform: none; opacity: 1; }
@@ -859,6 +882,10 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
    here, otherwise the children render as block boxes and the side-by-side
    design intent is lost. */
 div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* The visible name of the unit select in a rate-limit pair (settings
+   editor): the `.field label` rule above would bold it and drop it off
+   the row's centre with its 4px bottom margin. */
+.field .inline-controls > label { font-weight: 500; margin: 0; }
 /* A number paired with a unit select is one control, not two stacked
    full-width boxes. The `.field` rule above gives every input
    `width: 100%`, and inside a wrapping flex row that makes each half
@@ -876,6 +903,11 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
 .login-wrap {
   min-height: 100vh;
+  /* dvh follows the visible area on mobile browsers, where 100vh also
+     includes the address bar and grows the wrapper past what is on
+     screen, pushing the login box into a scroll. The plain vh line
+     stays first as the fallback for engines without the unit. */
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -965,12 +997,17 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 .stat-split-bar {
   flex: 1 1 120px;
   display: flex;
-  gap: 1px;
+  gap: 2px;
   height: 14px;
   border-radius: 4px;
   overflow: hidden;
   background: var(--badge-neutral-bg);
 }
+/* The 2px gaps show the track colour, which clears 3:1 against every
+   segment in both themes (4.72–6.11 measured). Neighbouring status
+   fills sit far below 3:1 against each other (alive vs ready is
+   1.07:1 in the light theme), so the boundary between two segments is
+   the track showing through, not a contrast step between the fills. */
 .stat-split-seg { height: 100%; width: var(--w, 0%); }
 .stat-split-seg.alive, .legend-dot.alive { background: var(--ok); }
 .stat-split-seg.ready, .legend-dot.ready { background: var(--ready); }
@@ -985,6 +1022,9 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   justify-content: flex-end;
 }
 .stat-split-counts a.badge:hover { text-decoration: none; filter: brightness(0.92); }
+/* Pressed: one step darker than hover, so the tap on a counter badge
+   registers even before the navigation lands. */
+.stat-split-counts a.badge:active { filter: brightness(0.85); }
 
 /* Pipeline builder widget. */
 .ped-columns {
@@ -1094,8 +1134,11 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
 /* Live preview in-flight cue: htmx flags the builder with
    .htmx-request while the preview request runs (the preview container
-   sits inside the builder, so the rule is a descendant selector). */
-#ped-builder.htmx-request #ped-preview { opacity: 0.55; }
+   sits inside the builder, so the rule is a descendant selector).
+   0.75, not lower: the dimmed text must still clear 4.5:1 against the
+   code background in both themes (6.49:1 light, 7.48:1 dark at 0.75;
+   0.55 failed the light theme at 3.54:1). */
+#ped-builder.htmx-request #ped-preview { opacity: 0.75; }
 
 /* topbar squeeze (phones) */
 
@@ -1169,6 +1212,10 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .container { padding: 16px 12px 48px; }
   .panel { padding: 14px; }
 
+  /* The 2x2 middle band of the stat grids ends here: one card per row
+     on a phone. */
+  .grid.cols-4 { grid-template-columns: 1fr; }
+
   /* iOS Safari zooms the page on focus for any input with font-size
      below 16px, keep form controls at 16px. The selectors mirror the
      base rules so specificity does not let `font: inherit` win.
@@ -1201,12 +1248,28 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .btn.small { padding: 8px 12px; min-height: 44px; }
   .check-row { min-height: 44px; }
   .check-row input { width: 18px; height: 18px; }
+  /* The row height alone is not the target: only the input and its
+     label react to a click, so the label stretches over the full row
+     and its text stays centred. */
+  .check-row label { align-self: stretch; display: flex; align-items: center; }
   .pagination a, .pagination span.page {
     padding: 8px 13px;
     display: inline-flex;
     align-items: center;
     min-height: 44px;
   }
+
+  /* Cell links (source names, endpoint URLs): 44px-tall targets. The
+     flex box grows the row; the truncated .cell-link keeps its
+     ellipsis (a flex container cannot render one) and takes the height
+     from vertical padding instead, which sits inside its own line box
+     and stays clickable. */
+  table.data td > a:not(.cell-link), .kv td a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  table.data td > a.cell-link { padding: 13px 0; }
 
   /* Narrower truncation caps: more columns fit before the scroll
      container kicks in. */
@@ -1293,8 +1356,10 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .ped-arrow { transform: rotate(90deg); align-self: flex-start; }
   /* The remove button keeps its own size: a full-width row of its own is
      an easy mis-tap on a destructive action, and it wasted a whole
-     screen row per rule. */
-  .ped-row > button { flex: 0 0 auto !important; width: auto; align-self: flex-end; }
+     screen row per rule. The ✕ glyph alone is ~37px wide even with the
+     small-button padding above, so the min-width lifts it to the 44px
+     target; the button text centres (the UA default). */
+  .ped-row > button { flex: 0 0 auto !important; width: auto; align-self: flex-end; min-width: 44px; }
   .ped-columns > div { min-width: 0; }
 
   /* Stat-bar chart: cap each column at a sane minimum so seven bars fit
@@ -1312,13 +1377,42 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 @media (pointer: coarse) {
   .btn, .btn.primary, .btn.danger { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
   .btn.small { padding: 8px 12px; min-height: 44px; }
+  /* The rule-remove ✕ is a glyph inside .btn.small: the padding above
+     lifts the height, the min-width lifts the ~37px width to the
+     target without stretching the button over the whole row. */
+  .ped-row > button { min-width: 44px; }
   .check-row { min-height: 44px; }
   .check-row input { width: 18px; height: 18px; }
+  /* The row height alone is not the target: only the input and its
+     label react to a click, so the label stretches over the full row
+     and its text stays centred. */
+  .check-row label { align-self: stretch; display: flex; align-items: center; }
   .pagination a, .pagination span.page {
     padding: 8px 13px;
     display: inline-flex;
     align-items: center;
     min-height: 44px;
+  }
+  /* Cell links (source names, endpoint URLs): same treatment as the
+     700px block above — the flex box grows the row, the truncated
+     .cell-link keeps its ellipsis and takes the height from vertical
+     padding inside its own line box. */
+  table.data td > a:not(.cell-link), .kv td a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  table.data td > a.cell-link { padding: 13px 0; }
+  /* The dismissal button of a toast: a 44x44 box centred on the glyph.
+     The negative margins spend the toast's own padding instead of
+     growing the toast (10px top/bottom, 8px of the 16px right). */
+  .toast-close {
+    min-width: 44px;
+    min-height: 44px;
+    margin: -10px -8px -10px auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
   .field input[type="text"], .field input[type="number"],
   .field input[type="password"], .field input[type="url"],
@@ -1339,7 +1433,18 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
     display: inline-flex;
     align-items: center;
   }
-  .lang-switch button { min-height: 44px; }
+  .topbar nav a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  /* Links and buttons alike: the login screen switchers are links, the
+     topbar ones are buttons, both are finger targets. */
+  .lang-switch a, .lang-switch button {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
 }
 
 /* Very narrow phones (iPhone SE 1st gen, older Android): a second

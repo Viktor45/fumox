@@ -7,9 +7,13 @@
     the four units cannot spell renders as its exact seconds (`90sec`);
     the select carries it as an extra option so the untouched pair
     round-trips instead of the browser falling back to the first
-    option. -#}
+    option. The select gets a visible label (R-39: an aria-label alone
+    is invisible to every sighted operator) wired through for/id; the
+    id is derived from the field name, which is unique per page and
+    already used verbatim in the error-slot ids (`err-<field>`). -#}
 {% macro unit_select(field) %}
-<select name="{{ field }}" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled(field) }}{{ self.error_attrs(field) | safe }}>
+<label for="unit-{{ field }}">{{ self.t("common.unit_label") }}</label>
+<select name="{{ field }}" id="unit-{{ field }}" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled(field) }}{{ self.error_attrs(field) | safe }}>
   {% if !self.unit_is_canonical(field) %}<option value="{{ self.raw_value(field) }}" selected>{{ self.raw_value(field) }}</option>{% endif %}
   <option value="sec" {% if self.raw_value(field) == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
   <option value="min" {% if self.raw_value(field) == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>

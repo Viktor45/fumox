@@ -131,7 +131,7 @@
   </div>
 </dialog>
 
-<form class="filters panel" method="get" action="/admin/proxies">
+<form class="filters filters-grid panel" method="get" action="/admin/proxies">
   <fieldset class="field">
     <legend>{{ self.t("common.status") }}</legend>
     {% for (status, checked) in all_statuses %}
@@ -147,74 +147,79 @@
       </span>
     {% endfor %}
   </fieldset>
-  <div class="field">
-    <label for="px-scheme">{{ self.t("common.protocol") }}</label>
-    <select id="px-scheme" name="scheme">
-      <option value="">{{ self.t("common.all") }}</option>
-      {% for (scheme, selected) in all_schemes %}
-        <option value="{{ scheme }}" {% if selected %}selected{% endif %}>{{ scheme }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="field">
-    <label for="px-country">{{ self.t("common.country") }}</label>
-    <select id="px-country" name="country">
-      <option value="">{{ self.t("common.all") }}</option>
-      {% for country in countries %}
-        <option value="{{ country }}" {% if self.country_selected(country) %}selected{% endif %}>{{ country }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="field">
-    <label for="px-source">{{ self.t("common.source") }}</label>
-    <select id="px-source" name="source">
-      <option value="">{{ self.t("common.all") }}</option>
-      {% for (id, name, _) in sources %}
-        <option value="{{ id }}" {% if self.source_selected(id) %}selected{% endif %}>{{ name }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="field">
-    <label for="px-coverage">{{ self.t("px.checks_label") }}</label>
-    <select id="px-coverage" name="coverage">
-      <option value="">{{ self.t("common.all") }}</option>
-      <option value="none" {% if self.coverage_selected("none") %}selected{% endif %}>{{ self.t("px.checks_none") }}</option>
-      <option value="t1_only" {% if self.coverage_selected("t1_only") %}selected{% endif %}>{{ self.t("px.checks_t1_only") }}</option>
-      <option value="t2_only" {% if self.coverage_selected("t2_only") %}selected{% endif %}>{{ self.t("px.checks_t2_only") }}</option>
-      <option value="both" {% if self.coverage_selected("both") %}selected{% endif %}>{{ self.t("px.checks_both") }}</option>
-    </select>
-  </div>
-  {# Speed-measurement bucket: the same tolerance as the coverage one —
-     an empty value filters nothing. The pipeline's freshness threshold
-     lives there, this is only "has a number at all". #}
-  <div class="field">
-    <label for="px-speed">{{ self.t("px.speed_filter_label") }}</label>
-    <select id="px-speed" name="speed">
-      <option value="">{{ self.t("common.all") }}</option>
-      <option value="measured" {% if self.speed_selected("measured") %}selected{% endif %}>{{ self.t("px.speed_measured_only") }}</option>
-      <option value="unmeasured" {% if self.speed_selected("unmeasured") %}selected{% endif %}>{{ self.t("px.speed_unmeasured") }}</option>
-    </select>
-  </div>
-  <div class="field">
-    <label for="px-egress">{{ self.t("px.egress_country") }}</label>
-    <select id="px-egress" name="egress">
-      <option value="">{{ self.t("common.all") }}</option>
-      {% for country in egress_countries %}
-        <option value="{{ country }}" {% if self.egress_country_selected(country) %}selected{% endif %}>{{ country }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="field">
-    <label for="px-q">{{ self.t("common.search") }}</label>
-    <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
-  </div>
-  <div class="field">
-    <label for="px-sort">{{ self.t("px.sort_label") }}</label>
-    <select id="px-sort" name="sort">
-      <option value="updated" {% if f_sort == "updated" %}selected{% endif %}>{{ self.t("px.sort_updated") }}</option>
-      <option value="latency" {% if f_sort == "latency" %}selected{% endif %}>{{ self.t("px.sort_latency") }}</option>
-      <option value="name" {% if f_sort == "name" %}selected{% endif %}>{{ self.t("px.sort_name") }}</option>
-    </select>
+  {# The pickers line up two rows beside the status column (see the
+     .filters-grid rules in app.css): a flat flex row of nine controls
+     wraps into ragged orphans. #}
+  <div class="filter-grid">
+    <div class="field">
+      <label for="px-scheme">{{ self.t("common.protocol") }}</label>
+      <select id="px-scheme" name="scheme">
+        <option value="">{{ self.t("common.all") }}</option>
+        {% for (scheme, selected) in all_schemes %}
+          <option value="{{ scheme }}" {% if selected %}selected{% endif %}>{{ scheme }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="px-country">{{ self.t("common.country") }}</label>
+      <select id="px-country" name="country">
+        <option value="">{{ self.t("common.all") }}</option>
+        {% for country in countries %}
+          <option value="{{ country }}" {% if self.country_selected(country) %}selected{% endif %}>{{ country }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="px-source">{{ self.t("common.source") }}</label>
+      <select id="px-source" name="source">
+        <option value="">{{ self.t("common.all") }}</option>
+        {% for (id, name, _) in sources %}
+          <option value="{{ id }}" {% if self.source_selected(id) %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="px-coverage">{{ self.t("px.checks_label") }}</label>
+      <select id="px-coverage" name="coverage">
+        <option value="">{{ self.t("common.all") }}</option>
+        <option value="none" {% if self.coverage_selected("none") %}selected{% endif %}>{{ self.t("px.checks_none") }}</option>
+        <option value="t1_only" {% if self.coverage_selected("t1_only") %}selected{% endif %}>{{ self.t("px.checks_t1_only") }}</option>
+        <option value="t2_only" {% if self.coverage_selected("t2_only") %}selected{% endif %}>{{ self.t("px.checks_t2_only") }}</option>
+        <option value="both" {% if self.coverage_selected("both") %}selected{% endif %}>{{ self.t("px.checks_both") }}</option>
+      </select>
+    </div>
+    {# Speed-measurement bucket: the same tolerance as the coverage one —
+       an empty value filters nothing. The pipeline's freshness threshold
+       lives there, this is only "has a number at all". #}
+    <div class="field">
+      <label for="px-speed">{{ self.t("px.speed_filter_label") }}</label>
+      <select id="px-speed" name="speed">
+        <option value="">{{ self.t("common.all") }}</option>
+        <option value="measured" {% if self.speed_selected("measured") %}selected{% endif %}>{{ self.t("px.speed_measured_only") }}</option>
+        <option value="unmeasured" {% if self.speed_selected("unmeasured") %}selected{% endif %}>{{ self.t("px.speed_unmeasured") }}</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="px-egress">{{ self.t("px.egress_country") }}</label>
+      <select id="px-egress" name="egress">
+        <option value="">{{ self.t("common.all") }}</option>
+        {% for country in egress_countries %}
+          <option value="{{ country }}" {% if self.egress_country_selected(country) %}selected{% endif %}>{{ country }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="px-q">{{ self.t("common.search") }}</label>
+      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
+    </div>
+    <div class="field">
+      <label for="px-sort">{{ self.t("px.sort_label") }}</label>
+      <select id="px-sort" name="sort">
+        <option value="updated" {% if f_sort == "updated" %}selected{% endif %}>{{ self.t("px.sort_updated") }}</option>
+        <option value="latency" {% if f_sort == "latency" %}selected{% endif %}>{{ self.t("px.sort_latency") }}</option>
+        <option value="name" {% if f_sort == "name" %}selected{% endif %}>{{ self.t("px.sort_name") }}</option>
+      </select>
+    </div>
   </div>
   <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
   {#- One click back to the unfiltered list: the empty-state link below

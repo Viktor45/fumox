@@ -842,6 +842,19 @@ pre.mono { white-space: pre-wrap; }
 .filters .field label { font-size: 12px; }
 .filters .field input, .filters .field select { padding: 6px 8px; font-size: 13.5px; }
 
+/* The proxies filter bar (proxies/list.html): nine controls in one flat
+   flex row wrapped into ragged orphans once the speed and egress pickers
+   joined. The status checkboxes keep their column, the seven pickers and
+   the search box line up two rows beside them (a 4-column grid, the
+   button closes the line at the right edge). */
+.filters-grid .filter-grid {
+  flex: 1 1 560px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  gap: 10px;
+}
+.filters-grid .filter-grid .field { min-width: 0; }
+
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .row-actions form { margin: 0; }
 
@@ -1242,6 +1255,10 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
      to read, and a full-width stack is the taller but clearer trade. */
   .field .inline-controls input[type="number"] { width: 100%; }
   .field .inline-controls select { width: 100%; }
+
+  /* The proxies filter grid drops to two columns: four 130px+ columns
+     do not fit a phone, and the grid would overflow before it wraps. */
+  .filters-grid .filter-grid { grid-template-columns: repeat(2, 1fr); }
 
   /* Comfortable touch targets (44px) for small controls. */
   .btn, .btn.primary, .btn.danger { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }

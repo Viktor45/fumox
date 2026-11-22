@@ -133,6 +133,15 @@
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.network_dns_timeout") }}</th><td>{{ state.network_dns_timeout() }} {{ self.t("common.sec") }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_enabled") }}</th><td>{{ self.bool_label(&state.network.speed_enabled) }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_url") }}</th><td class="mono small">{{ state.network.speed_url }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_bytes") }}</th><td>{{ self.fmt_bytes(&state.network.speed_bytes) }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_ceiling") }}</th><td>{{ state.network.speed_time_ceiling_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_concurrency") }}</th><td>{{ state.network.speed_concurrency }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_interval") }}</th><td>{{ self.speed_interval() }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_port_base") }}</th><td>{{ state.network.speed_listener_port_base }}</td></tr>
+        <tr><th>{{ self.t("set.network_trace_url") }}</th><td class="mono small">{{ state.network.trace_url }}</td></tr>
+        <tr><th>{{ self.t("set.network_trace_fields") }}</th><td>{{ self.trace_fields() }}</td></tr>
       </tbody>
     </table>
   </div>

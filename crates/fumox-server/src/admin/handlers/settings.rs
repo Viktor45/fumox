@@ -141,6 +141,22 @@ impl SettingsTemplate {
         }
     }
 
+    /// The re-measure interval through the same delay formatter the
+    /// quarantine ladder uses: `86400` reads as `24 h`, not a raw number.
+    fn speed_interval(&self) -> String {
+        self.fmt_delay(i64::try_from(self.state.network.speed_interval_secs).unwrap_or(i64::MAX))
+    }
+
+    /// The trace field list as one comma-joined line; an empty list reads
+    /// as the trace step being off (that is what the probe does with it).
+    fn trace_fields(&self) -> String {
+        if self.state.network.trace_fields.is_empty() {
+            self.lang.t("common.off").to_string()
+        } else {
+            self.state.network.trace_fields.join(", ")
+        }
+    }
+
     fn rate_limit(&self, rl: &RateLimit) -> String {
         let unit = match rl.window.as_secs() {
             60 => "min".to_string(),

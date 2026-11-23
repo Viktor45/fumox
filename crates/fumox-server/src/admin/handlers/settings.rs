@@ -987,13 +987,6 @@ static SETTINGS: &[Setting] = &[
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
     Setting {
-        key: "network.speed_listener_port_base",
-        render: |c, key, raw| {
-            raw.insert(key.into(), c.network.speed_listener_port_base.to_string());
-        },
-        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
-    },
-    Setting {
         key: "network.trace_url",
         render: |c, key, raw| {
             raw.insert(key.into(), c.network.trace_url.clone());

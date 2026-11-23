@@ -27,11 +27,13 @@ are stamped when the batch is published.
   without writing to disk: the full `[network].speed_bytes` (25 MiB) or the
   `[network].speed_time_ceiling_secs` (15 s) ceiling, whichever comes first —
   an interrupted download yields an honest number over the bytes actually
-  read. The measurement runs through per-row pinned listeners (`type:
-  mixed` with `proxy: fumox-{id}`), so no request bypasses the tunnel;
-  only the first `[network].speed_concurrency` rows of a T2 batch get
-  listeners (ports from `[network].speed_listener_port_base`), and re-measuring
-  happens no more often than `[network].speed_interval_secs` (24 h). A failed
+  read. The measurement runs through listeners the kernel declares at
+  startup, pinned to the proxy under test with a hot-reloadable
+  `IN-PORT,<port>,fumox-{id}` rule, so no request bypasses the tunnel (see
+  the Fixed entry on meow-rs's startup-snapshot listeners); only the first
+  `[network].speed_concurrency` rows of a T2 batch get a lane, and
+  re-measuring happens no more often than `[network].speed_interval_secs`
+  (24 h). A failed
   measurement journals its reason and never touches the status machine —
   the speed is a metric only (owner decision, 2026-11-21); a failed trace
   skips that cycle's download.
@@ -55,10 +57,10 @@ are stamped when the batch is published.
   filters and Egress/Speed columns; the **Probe** screen summarizes the
   measurements (how many proxies carry one, how many went stale, how many
   speed/trace attempts failed over 24 h).
-- Nine `[network]` settings for all of the above in `config/app.toml` and on
+- Eight `[network]` settings for all of the above in `config/app.toml` and on
   the settings edit page: `speed_enabled`, `speed_url`, `speed_bytes`,
   `speed_time_ceiling_secs`, `speed_concurrency`, `speed_interval_secs`,
-  `speed_listener_port_base`, `trace_url`, `trace_fields`.
+  `trace_url`, `trace_fields`.
 - `[database].allow_checksum_repair` (default `false`): the opt-in that
   lets the boot re-stamp an applied migration whose file changed since it
   was applied. Off by default, and the refusal is explicit: a mismatch
@@ -163,6 +165,35 @@ are stamped when the batch is published.
   `removed` stays reversible until the operator presses the button.
   The deleted count shows on `/admin/probe`.
 
+### Fixed
+
+- Trace requests (and speed measurements) through ready proxies no longer
+  fail with `trace request failed: error sending request`. meow-rs v0.29.0
+  treats `listeners:` as a startup snapshot that `PUT /configs` cannot
+  change, and has no per-listener `proxy:` override, so the per-row listeners
+  the probe rendered into each batch config were never actually bound —
+  the probe dialed a port with nothing listening on it. The measurement
+  listeners are now declared once at kernel startup on ephemeral ports; the
+  probe discovers their resolved ports through `GET /listeners` and pins
+  each lane to the proxy under test with a hot-reloadable
+  `IN-PORT,<port>,fumox-{id}` rule (verified against a live Cloudflare trace
+  returning real egress `ip`/`colo`/`loc`). `[network].speed_concurrency`
+  still bounds parallel lanes. The obsolete
+  `[network].speed_listener_port_base` has been removed entirely.
+- Speed results are actually stamped: the probe's SQLite write guard denied
+  the `speed_mbps` column, so every successful download failed with
+  `database error: (code: 23) not authorized` and left `speed_mbps`/`speed_at`
+  empty. The column is probe-written like `speed_at` (the server only
+  derives the egress GeoIP columns); the guard now allows it.
+- Obsolete config shims are gone: the inert `[geo].db` selector and the
+  one-release `[probe].refresh_check_limit` alias (moved to
+  `[ingest].refresh_check_limit` in the 2026-10-28 wave) are no longer
+  accepted. A config still carrying either key is now refused at load with
+  the offending key named, so remove them before upgrading. The dead
+  `set.geo_db`, `set.legacy` and `set.legacy_disabled` locale keys went with
+  them; the shipped `app.toml` no longer documents an exception to
+  `deny_unknown_fields`.
+
 ### Changed
 
 - The image is Alpine-based now: the builder and the runtime move from
@@ -250,9 +281,9 @@ are stamped when the batch is published.
   `two_rows_that_describe_the_same_node_are_merged`.
 - `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`
   (the priority queue belongs to the scheduler). The old key and the
-  `FUMOX_PROBE__REFRESH_CHECK_LIMIT` variable are still accepted for one
-  release: the value is carried over and a warning names the key to
-  rename.
+  `FUMOX_PROBE__REFRESH_CHECK_LIMIT` variable were accepted for one release:
+  the value was carried over and a warning named the key to rename. That
+  window has now closed — see the removal in Unreleased.
 - The T2 test URL is drawn once per probe cycle instead of once per
   check, so a proxy no longer gets opposite verdicts in two consecutive
   cycles. A batch in which every tunnel failed is read as a suspect

@@ -89,6 +89,7 @@ const RULES: &[TableRule] = &[
             // (`egress_country`/`egress_asn`/`egress_asn_org`) are NOT here:
             // like the `geo_*` columns, only the server holds the mmdb
             // files, so they stay server-written
+            "speed_mbps",
             "speed_at",
             "egress_ip",
             "cf_colo",
@@ -291,7 +292,6 @@ mod tests {
             "geo_city",
             "geo_asn",
             "resolved_ip",
-            "speed_mbps",
             "egress_country",
             "egress_asn",
             "egress_asn_org",
@@ -319,6 +319,7 @@ mod tests {
             "last_t2_failed_at",
             "last_t2_checked_at",
             "updated_at",
+            "speed_mbps",
             "speed_at",
             "egress_ip",
             "cf_colo",

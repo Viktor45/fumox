@@ -124,6 +124,13 @@ impl ProxiesListTemplate {
         self.f_source == id
     }
 
+    /// The speed cell: one decimal place, like the probe overview panel.
+    /// Stored values are full-precision floats; the table shows a rate,
+    /// where sub-tenth differences are noise.
+    fn speed_cell(&self, mbps: &f64) -> String {
+        format!("{mbps:.1}")
+    }
+
     /// Whether a speed-bucket option of the filter dropdown is active.
     fn speed_selected(&self, bucket: &str) -> bool {
         self.f_speed == bucket
@@ -179,6 +186,8 @@ fn encode_list_cursor(cursor: &ProxyListCursor, direction: ProxyListDirection) -
             latency_ms.map(|ms| ms.to_string()).unwrap_or_default(),
         ),
         ProxyListCursor::Name { name, id } => ('n', *id, name.clone()),
+        ProxyListCursor::Speed { speed_mbps, id } => ('s', *id, speed_mbps.to_string()),
+        ProxyListCursor::SpeedUnmeasured { id } => ('s', *id, String::new()),
     };
     URL_SAFE_NO_PAD.encode(format!("{side}|{tag}|{id}|{value}"))
 }
@@ -216,6 +225,16 @@ fn decode_list_cursor(token: &str) -> Option<(ProxyListCursor, ProxyListDirectio
             name: value.to_string(),
             id,
         },
+        "s" => {
+            if value.is_empty() {
+                ProxyListCursor::SpeedUnmeasured { id }
+            } else {
+                ProxyListCursor::Speed {
+                    speed_mbps: value.parse().ok()?,
+                    id,
+                }
+            }
+        }
         _ => return None,
     };
     Some((cursor, direction))
@@ -1501,6 +1520,12 @@ mod tests {
                 latency_ms: None,
                 id: 7,
             },
+            ProxyListCursor::Speed {
+                speed_mbps: 48.5,
+                id: 7,
+            },
+            // An unmeasured speed row carries no float to parse
+            ProxyListCursor::SpeedUnmeasured { id: 7 },
             // A name may hold anything, including the separator of the
             // token's own payload
             ProxyListCursor::Name {
@@ -1552,7 +1577,57 @@ mod tests {
         };
         assert!(ProxyListOrder::Updated.accepts_cursor(&updated));
         assert!(!ProxyListOrder::Latency.accepts_cursor(&updated));
+        assert!(!ProxyListOrder::Speed.accepts_cursor(&updated));
         assert!(!ProxyListOrder::Name.accepts_cursor(&updated));
+
+        // Both speed cursor variants are positions in the speed order:
+        // the unmeasured one is the tail of the order, and a cursor the
+        // order refused would silently restart the list at page one
+        // instead of paging from it
+        assert!(
+            ProxyListOrder::Speed.accepts_cursor(&ProxyListCursor::Speed {
+                speed_mbps: 9.9,
+                id: 14,
+            })
+        );
+        assert!(ProxyListOrder::Speed.accepts_cursor(&ProxyListCursor::SpeedUnmeasured { id: 14 }));
+    }
+
+    #[test]
+    fn proxy_speed_renders_with_one_decimal() {
+        let lang = test_lang();
+        let template = ProxiesListTemplate {
+            lang: lang.clone(),
+            langs: Vec::new(),
+            theme: theme::from_headers(&HeaderMap::new()),
+            active: "proxies",
+            csrf: String::new(),
+            rows: Vec::new(),
+            total: 0,
+            removed_count: 0,
+            detached_count: 0,
+            nav_first: None,
+            nav_prev: None,
+            nav_next: None,
+            f_statuses: Vec::new(),
+            f_scheme: String::new(),
+            f_country: String::new(),
+            f_source: String::new(),
+            f_q: String::new(),
+            f_sort: "updated".into(),
+            f_coverage: String::new(),
+            f_speed: String::new(),
+            f_egress: String::new(),
+            view_query: String::new(),
+            all_statuses: Vec::new(),
+            all_schemes: Vec::new(),
+            countries: Vec::new(),
+            egress_countries: Vec::new(),
+            sources: Vec::new(),
+        };
+        assert_eq!(template.speed_cell(&48.0), "48.0");
+        assert_eq!(template.speed_cell(&18.63), "18.6");
+        assert_eq!(template.speed_cell(&0.04), "0.0");
     }
 
     fn test_lang() -> Lang {

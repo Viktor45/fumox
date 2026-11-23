@@ -867,7 +867,6 @@ fn test_config(fail_limit: u32, meow_addr: &str, meow_config: PathBuf) -> AppCon
             queue_stale_days: 7,
             retention_interval_secs: 86400,
             backlog_target_drain_minutes: 60,
-            refresh_check_limit: None,
         },
         meow: fumox_core::config::MeowConfig {
             api_addr: meow_addr.into(),

@@ -147,33 +147,6 @@ pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigP
 }
 
 impl AppConfig {
-    /// Carry a key that moved to another section over to its new home.
-    ///
-    /// `[probe].refresh_check_limit` became `[ingest].refresh_check_limit`
-    /// when the priority queue became the scheduler's. A config file from
-    /// the previous release still carries the old name, and a struct with
-    /// `deny_unknown_fields` refuses it, so an upgrade would turn into a
-    /// refusal to start. The old name is accepted for one release: its value
-    /// is carried over when the new key still holds its default, and a
-    /// warning names the key to rename. The new key wins when it was set
-    /// explicitly, even to the default value: an operator who set both meant
-    /// the new one.
-    fn apply_moved_keys(&mut self) {
-        let Some(old) = self.probe.refresh_check_limit.take() else {
-            return;
-        };
-        let carried = self.ingest.refresh_check_limit == defaults::refresh_check_limit();
-        if carried {
-            self.ingest.refresh_check_limit = old;
-        }
-        tracing::warn!(
-            old_value = old,
-            new_value = self.ingest.refresh_check_limit,
-            "probe.refresh_check_limit moved to ingest.refresh_check_limit: \
-             rename the key in your config file"
-        );
-    }
-
     /// The DNS timeout of the SSRF pipeline: the dedicated
     /// `[network].dns_timeout_secs` when it is set, `[geo].dns_timeout_secs`
     /// otherwise, never below one second. Both consumers of the address
@@ -403,10 +376,6 @@ impl AppConfig {
                 self.network.speed_interval_secs,
             ),
             (
-                "network.speed_listener_port_base",
-                u64::from(self.network.speed_listener_port_base),
-            ),
-            (
                 "admin.session_ttl_hours",
                 u64::from(self.admin.session_ttl_hours),
             ),
@@ -578,26 +547,19 @@ pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
     // configuration actually has, so a variable that names no key cannot
     // shadow something else; `check_env_vars` turns such a name into an
     // error instead
-    let mut paths = config_paths()?;
-    paths.extend(DEPRECATED_PATHS.iter().map(|p| (*p).to_string()));
+    let paths = config_paths()?;
     let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     figment = figment.merge(Env::prefixed(ENV_PREFIX).split("__").only(&path_refs));
 
     check_env_vars(&paths)?;
 
-    let mut config: AppConfig = figment.extract()?;
-    config.apply_moved_keys();
+    let config: AppConfig = figment.extract()?;
     config.validate()?;
     Ok(LoadedConfig {
         config,
         path: resolved,
     })
 }
-
-/// Config paths that exist only for backward compatibility: the key moved to
-/// another section, and the old name is still read so a config file from the
-/// previous release keeps loading.
-const DEPRECATED_PATHS: &[&str] = &["probe.refresh_check_limit"];
 
 /// The dotted paths the configuration has (`server.bind`, `admin.token`),
 /// lower-cased: the env layer's whitelist (`FUMOX_SERVER__BIND` maps to
@@ -784,10 +746,9 @@ pub fn dump(config: &AppConfig) -> crate::Result<String> {
 /// shadow a broken value in the file for as long as the variable is set, but
 /// the file is what the next start without those variables reads.
 pub fn parse_document(text: &str) -> crate::Result<AppConfig> {
-    let mut config: AppConfig = Figment::from(Serialized::defaults(AppConfig::default()))
+    let config: AppConfig = Figment::from(Serialized::defaults(AppConfig::default()))
         .merge(Toml::string(text))
         .extract()?;
-    config.apply_moved_keys();
     config.validate()?;
     Ok(config)
 }
@@ -1044,15 +1005,6 @@ pub struct GeoConfig {
     /// Master switch for geo enrichment.
     #[serde(default = "defaults::geo_enabled")]
     pub enabled: bool,
-    /// Legacy selector from the one-database era, no longer read by any code
-    /// (every database in `db_dir` is merged); the key is still accepted so
-    /// existing config files keep parsing, and it no longer round-trips into
-    /// saved config. `doc(hidden)`: the field is public only so struct
-    /// literals with `..Default::default()` compile outside this crate,
-    /// there is nothing to do with a value of type `()`.
-    #[doc(hidden)]
-    #[serde(default, skip_serializing, deserialize_with = "de_ignore_legacy")]
-    pub db: (),
     /// Directory containing the `.mmdb` files (never committed).
     #[serde(default = "defaults::geo_db_dir")]
     pub db_dir: PathBuf,
@@ -1094,38 +1046,10 @@ pub struct GeoConfig {
     pub sha256: BTreeMap<String, String>,
 }
 
-/// Serde landing place for config keys the code no longer reads (the legacy
-/// `[geo].db`): any value is accepted and discarded, so old config files
-/// keep parsing and a saved file never carries the key. An empty value is
-/// the historical "unset" spelling and passes without a word; a non-empty
-/// one is a setting the operator wrote, and a silently ignored setting is
-/// one that never takes effect, so it gets a warning naming where the geo
-/// data really comes from now.
-fn de_ignore_legacy<'de, D>(deserializer: D) -> Result<(), D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let empty = match &value {
-        serde_json::Value::Null => true,
-        serde_json::Value::String(text) => text.is_empty(),
-        _ => false,
-    };
-    if !empty {
-        tracing::warn!(
-            key = "geo.db",
-            value = %value,
-            "legacy [geo].db key is ignored; geo facts come from every .mmdb in [geo].db_dir"
-        );
-    }
-    Ok(())
-}
-
 impl Default for GeoConfig {
     fn default() -> Self {
         Self {
             enabled: defaults::geo_enabled(),
-            db: (),
             db_dir: defaults::geo_db_dir(),
             cache_max_entries: defaults::geo_cache_max_entries(),
             cache_ttl_secs: defaults::geo_cache_ttl_secs(),
@@ -1209,10 +1133,10 @@ pub struct NetworkConfig {
     /// 25 MiB in a reasonable time.
     #[serde(default = "defaults::network_speed_time_ceiling_secs")]
     pub speed_time_ceiling_secs: u64,
-    /// How many speed downloads (and trace fetches) run at once. Each holds
-    /// one pinned meow-rs listener, so the kernel's config renders this
-    /// many extra `mixed` listeners on consecutive ports from
-    /// [`speed_listener_port_base`][NetworkConfig::speed_listener_port_base].
+    /// How many speed downloads (and trace fetches) run at once. Each uses
+    /// one of the `mixed` listeners the kernel declares at startup; the
+    /// probe discovers their ports through `GET /listeners` because
+    /// meow-rs v0.29.0 treats `listeners:` as a startup snapshot.
     #[serde(default = "defaults::network_speed_concurrency")]
     pub speed_concurrency: usize,
     /// A fresh measurement happens no more often than this. The last
@@ -1221,12 +1145,6 @@ pub struct NetworkConfig {
     /// rarely change overnight.
     #[serde(default = "defaults::network_speed_interval_secs")]
     pub speed_interval_secs: u64,
-    /// First port of the pinned speed-test listeners; lane `i` takes
-    /// `base + i`. Bound so that `base + speed_concurrency - 1` stays
-    /// inside the u16 port range at the maximum concurrency the range table
-    /// allows.
-    #[serde(default = "defaults::network_speed_listener_port_base")]
-    pub speed_listener_port_base: u16,
     /// The trace endpoint the probe fetches *through* each freshly checked
     /// proxy: the plain-text `key=value` answer carries the egress facts
     /// (`ip=`, `colo=`, `loc=`, `warp=`, …) the pipeline filters on. Must
@@ -1255,7 +1173,6 @@ impl Default for NetworkConfig {
             speed_time_ceiling_secs: defaults::network_speed_time_ceiling_secs(),
             speed_concurrency: defaults::network_speed_concurrency(),
             speed_interval_secs: defaults::network_speed_interval_secs(),
-            speed_listener_port_base: defaults::network_speed_listener_port_base(),
             trace_url: defaults::network_trace_url(),
             trace_fields: defaults::network_trace_fields(),
         }
@@ -1482,14 +1399,6 @@ pub struct ProbeConfig {
     /// (5 min..=24 h). Default 60.
     #[serde(default = "defaults::backlog_target_drain_minutes")]
     pub backlog_target_drain_minutes: u64,
-    /// The key moved to `[ingest].refresh_check_limit`: the queue is the
-    /// scheduler's, the probe only drains it. The old name is accepted for
-    /// one release so an upgrade does not turn into a refusal to start, see
-    /// [`AppConfig::apply_moved_keys`]. `skip_serializing` keeps the dead
-    /// knob out of a written config.
-    #[doc(hidden)]
-    #[serde(default, skip_serializing)]
-    pub refresh_check_limit: Option<u32>,
 }
 
 impl Default for ProbeConfig {
@@ -1509,7 +1418,6 @@ impl Default for ProbeConfig {
             queue_stale_days: defaults::queue_stale_days(),
             retention_interval_secs: defaults::retention_interval_secs(),
             backlog_target_drain_minutes: defaults::backlog_target_drain_minutes(),
-            refresh_check_limit: None,
         }
     }
 }
@@ -2049,7 +1957,6 @@ pub mod bounds {
         ("network.speed_time_ceiling_secs", Range::new(1, 600)),
         ("network.speed_concurrency", Range::new(1, 16)),
         ("network.speed_interval_secs", Range::new(60, 7 * 24 * 3600)),
-        ("network.speed_listener_port_base", Range::new(1024, 65_000)),
         ("admin.session_ttl_hours", Range::new(1, 24 * 365)),
         ("admin.rate_limit.limit", Range::new(1, 1_000_000)),
         ("admin.login_rate_limit.limit", Range::new(1, 1_000_000)),
@@ -2363,13 +2270,6 @@ mod defaults {
     pub const fn network_speed_interval_secs() -> u64 {
         24 * 3600
     }
-    /// Dynamic/private port range, comfortably clear of both the
-    /// well-known ports and the ephemeral range most stacks start at
-    /// (32768): a listener binding inside the ephemeral range could
-    /// collide with an outgoing connection of the same process
-    pub const fn network_speed_listener_port_base() -> u16 {
-        30000
-    }
     /// The www host, not the bare `cloudflare.com`: the bare host answers
     /// with a redirect the trace parser would have to follow. Plain text,
     /// fetched through the proxy under test, so HTTPS again
@@ -2502,15 +2402,9 @@ mod tests {
         assert!(cfg.ingest.drop_gate);
         assert_eq!(cfg.ingest.refresh_check_limit, 10);
 
-        // The keys moved house: `drop_gate` has no old spelling left, so the
-        // old section still refuses it. `refresh_check_limit` keeps its old
-        // name for one release, the value is carried over instead of the
-        // file being refused
+        // `drop_gate` moved to `[ingest]`; the old section still refuses it
         std::fs::write(&file, "[server]\ndrop_gate = true\n").unwrap();
         assert!(load_config_isolated(Some(&file)).is_err());
-        std::fs::write(&file, "[probe]\nrefresh_check_limit = 10\n").unwrap();
-        let cfg = load_config_isolated(Some(&file)).expect("the old spelling must still load");
-        assert_eq!(cfg.ingest.refresh_check_limit, 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2898,10 +2792,9 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Keys the reference file deliberately does not declare. Empty since
-    /// the inert one-database-era `[geo].db` selector was dropped from the
-    /// struct: old files still parse (accepted and ignored), but the shipped
-    /// file that promises "every available key" must not declare it either.
+    /// Keys the reference file deliberately does not declare. Empty: the
+    /// shipped file promises every available key, so it must declare all of
+    /// them at their default values.
     const REFERENCE_FILE_OMISSIONS: &[&str] = &[];
 
     /// The bounds table is a lookup, so a duplicate key is not a compile
@@ -3347,101 +3240,6 @@ probe_results_days = 7
         assert!(!text.contains(REDACTED_ADMIN_TOKEN), "{text}");
     }
 
-    /// The legacy `[geo].db` selector no longer exists as a config field:
-    /// old files that still carry the key must keep loading (any value), a
-    /// serialized config must not re-emit the dead knob, and a non-empty
-    /// value draws a warning instead of a silent ignore.
-    #[test]
-    fn legacy_geo_db_key_is_accepted_and_ignored() {
-        let dir = std::env::temp_dir().join(format!("fumox-cfg-geodb-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("app.toml");
-        // A value the old `GeoDbKind` would still have accepted…
-        std::fs::write(&file, "[geo]\ndb = \"city\"\n").unwrap();
-        assert!(load_config_isolated(Some(&file)).is_ok());
-        // …and one it would not: the key is ignored wholesale now
-        std::fs::write(&file, "[geo]\ndb = 42\n").unwrap();
-        assert!(load_config_isolated(Some(&file)).is_ok());
-        // The empty spelling counts as unset and stays warning-free
-        std::fs::write(&file, "[geo]\ndb = \"\"\n").unwrap();
-        assert!(load_config_isolated(Some(&file)).is_ok());
-        std::fs::remove_dir_all(&dir).ok();
-
-        // The key must not round-trip back into written config
-        let json = serde_json::to_value(GeoConfig::default()).unwrap();
-        assert!(
-            json.get("db").is_none(),
-            "the dead [geo].db knob must not serialize: {json}"
-        );
-    }
-
-    /// `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`
-    /// when the priority queue became the scheduler's. An upgrade that
-    /// refuses to start is the worst possible outcome of a rename, so a
-    /// config file from the release that still carries the old key keeps
-    /// loading, and the value comes along.
-    #[test]
-    fn the_moved_refresh_check_limit_key_is_accepted_and_carried_over() {
-        let dir = std::env::temp_dir().join(format!("fumox-cfg-moved-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("app.toml");
-
-        std::fs::write(&file, "[probe]\nrefresh_check_limit = 7\n").unwrap();
-        let loaded = load_config_isolated(Some(&file)).expect("the old key must still load");
-        assert_eq!(loaded.ingest.refresh_check_limit, 7);
-
-        // The new key wins when the operator set both: the old name is
-        // the leftover, the new one is the intent
-        std::fs::write(
-            &file,
-            "[probe]\nrefresh_check_limit = 7\n[ingest]\nrefresh_check_limit = 3\n",
-        )
-        .unwrap();
-        let loaded = load_config_isolated(Some(&file)).expect("both keys must load");
-        assert_eq!(loaded.ingest.refresh_check_limit, 3);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The old name must not come back: a config written from the model
-    /// carries the key in its new home only, so the warning stops once
-    /// the operator renamed it.
-    #[test]
-    fn the_moved_key_does_not_round_trip_into_a_written_config() {
-        let json = serde_json::to_value(ProbeConfig::default()).unwrap();
-        assert!(
-            json.get("refresh_check_limit").is_none(),
-            "the moved [probe].refresh_check_limit knob must not serialize: {json}"
-        );
-    }
-
-    /// The environment variable of the old name is accepted too: an
-    /// operator who set `FUMOX_PROBE__REFRESH_CHECK_LIMIT` would
-    /// otherwise hit the "names no configuration key" refusal.
-    #[test]
-    fn the_old_environment_variable_is_still_accepted() {
-        let _guard = env_mutex().lock();
-        let dir = std::env::temp_dir().join(format!("fumox-cfg-moved-env-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("app.toml");
-        std::fs::write(&file, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
-
-        // SAFETY: every touch of FUMOX_* across the test suite is
-        // serialized by `env_mutex`; other threads read the variable only
-        // through the same lock
-        unsafe { std::env::set_var("FUMOX_PROBE__REFRESH_CHECK_LIMIT", "9") };
-        let loaded = load_config(Some(&file)).expect("the old variable must still be accepted");
-        assert_eq!(loaded.ingest.refresh_check_limit, 9);
-        // SAFETY: see above
-        unsafe { std::env::remove_var("FUMOX_PROBE__REFRESH_CHECK_LIMIT") };
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The startup budget is operator-tunable, not a constant baked into the
-    /// server binary: a mirror that needs longer than the default must be
-    /// able to say so in `app.toml` or via
-    /// `FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`.
     #[test]
     fn geo_startup_download_budget_is_configurable() {
         let _guard = env_mutex().lock();

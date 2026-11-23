@@ -1011,7 +1011,6 @@ and the first is the one to prefer:
 | Key                 | Default     | Meaning                                                    |
 | ------------------- | ----------- | ---------------------------------------------------------- |
 | `enabled`           | `true`      | Master switch                                              |
-| `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution; all databases in `db_dir` are merged |
 | `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared/geo` (the `fumox-geo` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases: put them in the `fumox-geo` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
 | `cache_max_entries` | `16384`     | Host→geo cache size; entries also expire after 6 hours, so a host whose DNS was down is retried without a restart |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
@@ -1029,9 +1028,8 @@ and the first is the one to prefer:
 | `speed_url`                | `https://speed.cloudflare.com/__down?measId={rand}&bytes={bytes}` | The payload URL: `{bytes}` is required (the payload size in bytes), `{rand}` expands to a fresh random number per request; unknown `{…}` placeholders are rejected at config load                                                                                     |
 | `speed_bytes`              | `26214400` (25 MiB)                                               | The payload size of one measurement                                                                                                                                                                                                                                   |
 | `speed_time_ceiling_secs`  | `15`                                                              | The time ceiling of one download: an interrupted download yields an honest number over the bytes actually read, not a failure                                                                                                                                         |
-| `speed_concurrency`        | `4`                                                               | Parallel measurements (this many pinned listeners are rendered per T2 batch, at most 16)                                                                                                                                                                              |
+| `speed_concurrency`        | `4`                                                               | Parallel measurements (this many mixed listeners are used per T2 batch, at most 16); the listeners are declared in the kernel's startup config and their ports discovered via `GET /listeners`                                                                          |
 | `speed_interval_secs`      | `86400`                                                           | The minimum re-measure interval per proxy (24 h): each T2 batch measures only the rows whose `speed_at` has gone stale                                                                                                                                                |
-| `speed_listener_port_base` | `30000`                                                           | The base port of the pinned measurement listeners (`30000..30000+concurrency-1`); the ports live inside the stack network and are never published                                                                                                                     |
 | `trace_url`                | `https://www.cloudflare.com/cdn-cgi/trace`                        | The trace request URL through the proxy: ip/colo/loc/warp are parsed from the `key=value` answer                                                                                                                                                                      |
 | `trace_fields`             | `["ip", "colo", "loc", "warp", "http", "tls", "fl", "gateway"]`   | Which trace fields to keep: the first four land in the dedicated `proxies` columns, the rest in `trace_json`; an empty list turns the trace request off (and the speed measurement with it)                                                                           |
 
@@ -1268,12 +1266,15 @@ Exclude them with `filter.protocols` if you don't want them in a profile.
 
 Right after a successful delay verdict, every row of a T2 batch passes the
 diagnostic measurements (the switch is `[network].speed_enabled`, on by
-default). The measurement runs through a **pinned listener**: the engine's
-batch config renders a dedicated mixed listener of the row under test whose
-whole traffic is hard-bound to that proxy (`proxy: fumox-{id}`) — no
-measurement request ever bypasses the tunnel or follows the kernel's rules.
-Listeners are rendered only for the first `[network].speed_concurrency` rows of
-a batch (at most 16); the ports starting at `[network].speed_listener_port_base`
+default). The measurement runs through a **pinned listener**: the kernel
+declares a fixed set of mixed listeners at startup (meow-rs v0.29.0 treats
+`listeners:` as a startup snapshot that `PUT /configs` cannot change, and has
+no per-listener `proxy:` override). Each batch's generated config pins one
+listener to the proxy under test with a hot-reloadable
+`IN-PORT,<port>,fumox-{id}` rule — no measurement request ever bypasses the
+tunnel or follows the kernel's other rules. The listeners bind ephemeral
+ports at startup; the probe reads the actual ports via `GET /listeners` and
+uses the first `[network].speed_concurrency` of them (at most 16). The ports
 live inside the stack network and are never published.
 
 1. **Trace** (`[network].trace_url`, default
@@ -1469,8 +1470,6 @@ The editor is intentionally narrow on safety:
   keeps the current token (used by the encrypted digest over the
   session cookie) so the panel never silently disables itself.
   Changing the token invalidates every active session the next request.
-- The legacy `[geo].db` field is rendered disabled with a hint; it is
-  kept for parse compatibility and can no longer affect resolution.
 
 If the config file cannot be read at all (a broken TOML, a section the
 loader does not know), the editor says so in a banner and renders the

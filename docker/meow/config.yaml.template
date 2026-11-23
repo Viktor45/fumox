@@ -5,15 +5,22 @@
 # the controller secret, which is why it never touches a disk
 # meow-rs runs headless here: fumox-probe generates the real proxy list,
 # writes it to the shared exchange volume and hot-reloads it via
-# `PUT /configs`. This file only brings up the external-controller REST API
-# the probe talks to; no inbound listener is required for delay tests (the
-# probe measures the tunnels through the controller), and the
-# external-controller is not hot-swappable on reload, so it stays up across
-# every probe-driven config reload
-# The probe replaces this whole file on its first reload with a config
-# carrying the proxies and the rules, and none of the keys below: that is
-# why the controller keeps answering with the secret configured here, and
-# why the keys below only have to survive until the first reload
+# `PUT /configs`. The external-controller is NOT hot-swappable on reload,
+# so the API (and its secret) stay up across every probe-driven reload.
+#
+# `listeners:` is a STARTUP SNAPSHOT in meow-rs v0.29.0: a `PUT /configs`
+# cannot add, remove or retarget one, and there is no per-listener `proxy:`
+# override in this release. The measurement lanes are therefore declared
+# once here, at startup, and never touched by the probe's reload payload.
+# Each is a plain mixed listener bound to an ephemeral port (`port: 0`);
+# the probe reads the resolved ports from `GET /listeners` before every T2
+# batch and pins a lane to the proxy under test with a hot-reloadable
+# `IN-PORT,<port>,fumox-{id}` rule in the generated config. No fixed ports
+# to keep in sync with app.toml, no port collisions between restarts.
+#
+# 16 is the maximum `[network].speed_concurrency` the config validator
+# allows, so the probe always has enough lanes. Unused listeners cost one
+# idle socket each and no memory per connection.
 
 allow-lan: false
 mode: rule
@@ -40,3 +47,72 @@ logbook: {enable: false}
 
 proxies: []
 rules: []
+
+# Measurement lanes. `port: 0` asks meow-rs for a free port at startup; the
+# probe discovers the actual ports through `GET /listeners`. The names are
+# stable so the probe can tell the lanes apart from any other listener.
+listeners:
+- name: fumox-measure-0
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-1
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-2
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-3
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-4
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-5
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-6
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-7
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-8
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-9
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-10
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-11
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-12
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-13
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-14
+  type: mixed
+  listen: 0.0.0.0
+  port: 0
+- name: fumox-measure-15
+  type: mixed
+  listen: 0.0.0.0
+  port: 0

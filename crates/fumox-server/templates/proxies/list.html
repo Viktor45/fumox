@@ -209,16 +209,17 @@
       </select>
     </div>
     <div class="field">
-      <label for="px-q">{{ self.t("common.search") }}</label>
-      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
-    </div>
-    <div class="field">
       <label for="px-sort">{{ self.t("px.sort_label") }}</label>
       <select id="px-sort" name="sort">
         <option value="updated" {% if f_sort == "updated" %}selected{% endif %}>{{ self.t("px.sort_updated") }}</option>
         <option value="latency" {% if f_sort == "latency" %}selected{% endif %}>{{ self.t("px.sort_latency") }}</option>
+        <option value="speed" {% if f_sort == "speed" %}selected{% endif %}>{{ self.t("px.sort_speed") }}</option>
         <option value="name" {% if f_sort == "name" %}selected{% endif %}>{{ self.t("px.sort_name") }}</option>
       </select>
+    </div>
+    <div class="field">
+      <label for="px-q">{{ self.t("common.search") }}</label>
+      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
     </div>
   </div>
   <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
@@ -300,7 +301,7 @@
             </td>
             <td class="num small">
               {% match row.speed_mbps %}
-                {% when Some with (mbps) %}{{ mbps }} {{ self.t("px.speed_unit") }}
+                {% when Some with (mbps) %}{{ self.speed_cell(mbps) }} {{ self.t("px.speed_unit") }}
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
@@ -310,12 +311,6 @@
         </tbody>
       </table>
     </div>
-    {#- The Egress and Speed header tooltips exist only on hover, which
-        a touch device cannot open (the pattern profiles/list.html
-        already fixed): both facts are duplicated as visible text under
-        the table. -#}
-    <p class="hint">{{ self.t("px.egress_hint") }}</p>
-    <p class="hint">{{ self.t("px.speed_filter_label") }}</p>
   {% endif %}
 
   {# Keyset navigation: the links carry the cursor of the page they

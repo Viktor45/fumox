@@ -1787,7 +1787,7 @@ async fn run_tunnel_reload(
     cycle: Arc<Cycle>,
     lane: TunnelLane,
 ) -> anyhow::Result<TunnelOutcome> {
-    let generated = match prepare_engine_config(&ctx, &batch, pins, lane) {
+    let generated = match prepare_engine_config(&ctx, &batch, pins, lane).await {
         Ok(generated) => generated,
         Err(error) => return Ok(fail_tunnel_batch_prepare(&ctx, batch, error).await),
     };
@@ -2802,34 +2802,40 @@ fn engine_records(
 }
 
 /// Prepare the engine configuration of one batch: generate the Clash YAML
-/// (with the pinned speed-measurement listeners of [`speed_plan`]) and
-/// write it to `meow.config_path`. A failure here means the engine never
-/// sees the batch; the callers treat it like a failed reload (rows
-/// journaled unverified, never charged, and the T2 lanes back off).
-fn prepare_engine_config(
+/// (with the `IN-PORT` pins of [`speed_plan`]) and write it to
+/// `meow.config_path`. A failure here means the engine never sees the
+/// batch; the callers treat it like a failed reload (rows journaled
+/// unverified, never charged, and the T2 lanes back off).
+async fn prepare_engine_config(
     ctx: &Context,
     batch: &[proxies::ProxyRow],
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
     lane: TunnelLane,
 ) -> anyhow::Result<clash::GeneratedBatch> {
-    let generated = clash::generate(
-        &engine_records(batch, pins),
-        ctx.config.meow.ipv6,
-        &speed_plan(ctx, batch, lane),
-    )
-    .map_err(|error| anyhow::anyhow!("cannot generate the meow config: {error}"))?;
+    let plan = speed_plan(ctx, batch, lane).await;
+    let generated = clash::generate(&engine_records(batch, pins), ctx.config.meow.ipv6, &plan)
+        .map_err(|error| anyhow::anyhow!("cannot generate the meow config: {error}"))?;
     write_meow_config(&ctx.config.meow.config_path, &generated.yaml)?;
     Ok(generated)
 }
 
 /// The speed-measurement plan of one T2 batch: the rows whose
 /// last measurement is stale enough to re-measure, capped at
-/// `[network].speed_concurrency` lanes so the ports and the parallel
-/// downloads both stay inside their bounds. Only the regular T2 lane
-/// measures — a quarantine revival is about getting the row back into the
-/// rotation, not about measuring it (owner decision, 2026-11-21: measure
-/// the delay-passers of the T2 batch).
-fn speed_plan(ctx: &Context, batch: &[proxies::ProxyRow], lane: TunnelLane) -> clash::SpeedPlan {
+/// `[network].speed_concurrency` lanes. Only the regular T2 lane measures —
+/// a quarantine revival is about getting the row back into the rotation,
+/// not about measuring it (owner decision, 2026-11-21: measure the
+/// delay-passers of the T2 batch).
+///
+/// The ports are not derived from config: the kernel's measurement
+/// listeners bind `port: 0` at startup, so the probe reads the resolved
+/// ports from `GET /listeners` before each batch. If discovery fails, the
+/// batch degrades to delay-only (measurements are metrics, never verdicts)
+/// instead of refusing the tunnel checks.
+async fn speed_plan(
+    ctx: &Context,
+    batch: &[proxies::ProxyRow],
+    lane: TunnelLane,
+) -> clash::SpeedPlan {
     if !ctx.config.network.speed_enabled || !matches!(lane, TunnelLane::T2 { .. }) {
         return clash::SpeedPlan::empty();
     }
@@ -2843,11 +2849,24 @@ fn speed_plan(ctx: &Context, batch: &[proxies::ProxyRow], lane: TunnelLane) -> c
         })
         .map(|row| row.id)
         .collect();
-    clash::SpeedPlan {
-        due,
-        port_base: ctx.config.network.speed_listener_port_base,
-        max_lanes: ctx.config.network.speed_concurrency,
+    if due.is_empty() {
+        return clash::SpeedPlan::empty();
     }
+    let listeners = match ctx.meow.listeners().await {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            tracing::warn!(%error, "cannot discover the engine's measurement listeners, the batch is delay-only");
+            return clash::SpeedPlan::empty();
+        }
+    };
+    let ports = match clash::measurement_ports(&listeners, ctx.config.network.speed_concurrency) {
+        Ok(ports) => ports,
+        Err(error) => {
+            tracing::warn!(%error, "the engine has no usable measurement listeners, the batch is delay-only");
+            return clash::SpeedPlan::empty();
+        }
+    };
+    clash::SpeedPlan { due, ports }
 }
 
 /// Generate a Clash batch, reload meow-rs, and delay-test every proxy

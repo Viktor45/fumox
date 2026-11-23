@@ -48,6 +48,15 @@ pub struct MeowMemory {
     pub os_limit_bytes: u64,
 }
 
+/// A measurement listener reported by `GET /listeners`. The kernel binds
+/// these at startup with `port: 0`, so the probe has to read the resolved
+/// ports from the API before rendering the batch's `IN-PORT` rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeowListener {
+    pub name: String,
+    pub port: u16,
+}
+
 /// Outcome of one delay measurement.
 #[derive(Debug)]
 pub enum DelayOutcome {
@@ -487,6 +496,45 @@ impl MeowClient {
             .await
             .unwrap_or_else(|error| error);
         Err(format!("PUT /configs returned {status}: {body}"))
+    }
+
+    /// `GET /listeners`, the kernel's startup listeners with their resolved
+    /// ports. The caller filters by the names the bootstrap config uses;
+    /// an unparseable reply is an error, not an empty list (silently
+    /// skipping measurements would hide a broken kernel).
+    pub async fn listeners(&self) -> Result<Vec<MeowListener>, String> {
+        let response = self
+            .auth(self.http.get(format!("{}/listeners", self.base_url)))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("meow-rs unreachable: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("GET /listeners returned {}", response.status()));
+        }
+        let body = read_body_capped(response, "GET /listeners").await?;
+        let raw: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("bad /listeners payload: {e}"))?;
+        let items = raw
+            .as_array()
+            .ok_or_else(|| "bad /listeners payload: not an array".to_string())?;
+        let mut listeners = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                return Err("bad /listeners payload: entry without a name".to_string());
+            };
+            let Some(port) = item.get("port").and_then(|v| v.as_u64()) else {
+                return Err(format!("bad /listeners payload: no port for '{name}'"));
+            };
+            let Ok(port) = u16::try_from(port) else {
+                return Err(format!("bad /listeners payload: port {port} for '{name}'"));
+            };
+            listeners.push(MeowListener {
+                name: name.to_string(),
+                port,
+            });
+        }
+        Ok(listeners)
     }
 
     /// `GET /proxies/{name}/delay`, run one real tunnel check.

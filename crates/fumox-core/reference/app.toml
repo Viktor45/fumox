@@ -1,7 +1,7 @@
 # Fumox, конфигурация приложения.
-# Файл перечисляет каждый ключ, который принимает приложение, кроме
-# неактивного наследного селектора [geo].db. Значения здесь: это
-# поставляемые дефолты этого проекта, а не встроенные значения из кода:
+# Файл перечисляет каждый ключ, который принимает приложение.
+# Значения здесь: это поставляемые дефолты этого проекта, не встроенные
+# значения из кода:
 # встроенные смотрите в config.rs::defaults. Правьте только то, что нужно
 # изменить. Каждый ключ имеет дефолт: файл можно урезать до нужных секций
 # или вовсе не создавать, сервис работает на встроенных дефолтах.
@@ -10,13 +10,12 @@
 #
 # Диапазоны ниже: это то, что принимает админка (/admin/settings, «Правка»):
 # границы формы, а не произвольные числа. Ключи, которых в форме нет, помечены
-# отдельно. Любой другой ключ, которого здесь нет, будет отвергнут при загрузке
-# (единственное исключение: неактивный [geo].db из эпохи одной базы): секции
-# объявлены с deny_unknown_fields, опечатка дает ошибку, а не тихий игнор.
+# отдельно. Любой другой ключ, которого здесь нет, будет отвергнут при загрузке:
+# секции объявлены с deny_unknown_fields, опечатка дает ошибку, а не тихий игнор.
 #
-# Fumox application config. Lists every accepted key except the inert legacy
-# [geo].db selector. Values are this project's shipped defaults, not the
-# built-in fallbacks (see config.rs::defaults). Every key has a default, so
+# Fumox application config. Lists every accepted key. Values are this
+# project's shipped defaults, not the built-in fallbacks (see
+# config.rs::defaults). Every key has a default, so
 # the file may be trimmed to the needed sections or omitted entirely.
 # Env overrides: FUMOX_SECTION__KEY (double underscore separates the section),
 # e.g. FUMOX_ADMIN__TOKEN=secret
@@ -24,8 +23,7 @@
 # Ranges below are the bounds the admin panel (/admin/settings) accepts: the
 # form's own bounds, not round numbers. Keys the form does not edit are marked
 # as such. Any key not listed is rejected at load time (sections declare
-# deny_unknown_fields, so a typo is an error, not a silent no-op; the one
-# exception is the inert legacy [geo].db).
+# deny_unknown_fields, so a typo is an error, not a silent no-op).
 
 [server]
 # Сокет в виде host:port, без диапазона: любой адрес и порт, который можно
@@ -332,13 +330,15 @@ speed_bytes = 26214400
 # the honest number for a slow tunnel
 speed_time_ceiling_secs = 15
 # Диапазон: 1..=16 (форма). Сколько скачиваний (и trace-запросов) идет
-# одновременно; под каждый рендерится отдельный pinned-listener meow-конфига
-# (type mixed) на порту speed_listener_port_base + i. Квоты meow-контейнера
-# (256 МБ / 0.75 CPU) рассчитаны на дефолт 4.
+# одновременно; используются первые N слушателей, объявленных в стартап-
+# конфиге meow (тип mixed, порт выбирается ядром при старте и узнается
+# через GET /listeners). Квоты meow-контейнера (256 МБ / 0.75 CPU)
+# рассчитаны на дефолт 4.
 # Range: 1..=16 (form). How many downloads (and trace fetches) run at once;
-# each gets its own pinned listener in the rendered meow config (type mixed)
-# on port speed_listener_port_base + i. The meow container quotas (256 MiB /
-# 0.75 CPU) are sized for the default of 4
+# the first N listeners declared in the meow bootstrap config are used
+# (type mixed, ports chosen by the kernel at startup and discovered via
+# GET /listeners). The meow container quotas (256 MiB / 0.75 CPU) are sized
+# for the default of 4
 speed_concurrency = 4
 # Диапазон: 60..=604800 секунд (форма). Пересзамер не чаще этого интервала:
 # последний замер и есть значение для пайплайна, ежедневный пересзамер не
@@ -348,13 +348,6 @@ speed_concurrency = 4
 # a daily re-measure does not spend the proxy's traffic on numbers that
 # rarely change overnight
 speed_interval_secs = 86400
-# Диапазон: 1024..=65000 (форма). Первый порт pinned-листенеров замера
-# (дорожка i получает base + i); при максимуме speed_concurrency порт
-# base+15 остается внутри u16.
-# Range: 1024..=65000 (form). First port of the pinned speed-test listeners
-# (lane i takes base + i); at the maximum speed_concurrency, base+15 still
-# fits the u16 port range
-speed_listener_port_base = 30000
 # Абсолютный http(s)-URL trace-эндпоинта, который probe опрашивает через
 # свежепроверенный прокси: ответ — plain text key=value с фактами исходящего
 # адреса (ip=, colo=, loc=, warp=...). HTTPS: запрос идет через проверяемый

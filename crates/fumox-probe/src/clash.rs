@@ -24,46 +24,48 @@ pub struct BatchRow {
     pub vetted: Option<std::net::IpAddr>,
 }
 
-/// The speed-measurement plan of one batch: which rows are due
-/// for a (re)measurement and on which ports the pinned listeners are
-/// rendered. Empty = no listeners at all, the batch is delay-only.
+/// The speed-measurement plan of one batch: which rows are due for a
+/// (re)measurement, and on which of the engine's pre-started listeners
+/// they run. Empty = no lanes, the batch is delay-only.
+///
+/// meow-rs v0.29.0 treats `listeners:` as a startup snapshot: `PUT /configs`
+/// cannot add, remove or retarget one, and there is no per-listener
+/// `proxy:` override in this release. The mixed listeners are declared
+/// once in the kernel's bootstrap config; each batch only renders the
+/// hot-reloadable `IN-PORT,<port>,fumox-{id}` rule that pins a lane's flows
+/// to the proxy under test. The ports come from `GET /listeners` (they are
+/// `port: 0` at startup, so meow picks free ones).
 pub struct SpeedPlan {
     /// The ids due for a measurement. `due` is the *input* (the caller
     /// decides from `speed_at` staleness); the lanes rendered from it are
-    /// capped at [`max_lanes`][SpeedPlan::max_lanes] and reported back in
+    /// capped at [`ports.len()`][SpeedPlan::ports] and reported back in
     /// the generated batch, because a row the config skipped (its entry
     /// cannot be serialized) must not get a lane.
     pub due: std::collections::HashSet<i64>,
-    /// First port of the listener lanes; lane `i` takes `port_base + i`.
-    pub port_base: u16,
-    /// How many lanes the batch may render (=
-    /// `[network].speed_concurrency`): the downloads run speed_concurrency
-    /// at a time, so more listeners would be idle ports, and the port
-    /// range check (`port_base + lanes - 1 <= 65535`) would need more
-    /// headroom than the config bounds promise.
-    pub max_lanes: usize,
+    /// The engine's measurement-listener ports, in lane order. The probe
+    /// reads them from `GET /listeners` before the batch (ephemeral, so
+    /// they are only known at runtime).
+    pub ports: Vec<u16>,
 }
 
 impl SpeedPlan {
     pub fn empty() -> Self {
         Self {
             due: std::collections::HashSet::new(),
-            port_base: 0,
-            max_lanes: 0,
+            ports: Vec::new(),
         }
     }
 }
 
 /// The generated batch config plus what the caller needs to drive it:
 /// the ids actually carried by the YAML (a record the core mapping cannot
-/// express is skipped) and the pinned-listener lanes of the speed plan.
+/// express is skipped) and the pinned lanes of the speed plan.
 pub struct GeneratedBatch {
     pub yaml: String,
     pub included: Vec<i64>,
     /// `(proxy id, listener port)` in lane order: lane `i` is the
-    /// `i`-th *included* row that was due, listening on `port_base + i`,
-    /// and every flow it accepts is forced through that proxy's tunnel
-    /// (the `proxy:` route override, upstream RawListener).
+    /// `i`-th *included* row that was due, pinned by an
+    /// `IN-PORT,<port>,fumox-{id}` rule to that proxy's tunnel.
     pub speed_lanes: Vec<(i64, u16)>,
 }
 
@@ -118,26 +120,16 @@ pub fn generate(
     let mut speed_lanes = Vec::new();
     for row in rows {
         if let Some(value) = proxy_to_value(row) {
-            // A lane is rendered only for a row that made it into the
-            // config: a skipped row would leave the plan pointing at a
-            // listener whose flows fail closed ("missing target"), and a
-            // measurement would need a tunnel that is not there
-            if speed.max_lanes > 0
-                && speed.due.contains(&row.id)
-                && speed_lanes.len() < speed.max_lanes
-            {
-                let port = speed
-                    .port_base
-                    .checked_add(speed_lanes.len() as u16)
-                    .ok_or_else(|| {
-                        <serde_norway::Error as serde::de::Error>::custom(format!(
-                            "speed listener port {} + lane {} overflows the port range",
-                            speed.port_base,
-                            speed_lanes.len()
-                        ))
-                    })?;
-                speed_lanes.push((row.id, port));
+            // A lane is only pinned for a row that made it into the
+            // config: a skipped row has no proxy for an IN-PORT rule to
+            // target, and a measurement would have nothing to tunnel through
+            if !speed.due.contains(&row.id) || speed_lanes.len() >= speed.ports.len() {
+                included.push(row.id);
+                proxies.push(value);
+                continue;
             }
+            let port = speed.ports[speed_lanes.len()];
+            speed_lanes.push((row.id, port));
             included.push(row.id);
             proxies.push(value);
         }
@@ -160,39 +152,17 @@ pub fn generate(
     // behavioural choice (IPv4-only) that `[meow].ipv6` should own
     root.insert(Value::String("ipv6".into()), Value::Bool(ipv6));
     root.insert(Value::String("proxies".into()), Value::Sequence(proxies));
-    if !speed_lanes.is_empty() {
-        // One pinned listener per measurement lane: `proxy:` forces every
-        // flow of the listener through that proxy's tunnel, bypassing
-        // rules and mode dispatch, so the probe's download through port
-        // `base + i` is measured on exactly the proxy it names. `listen`
-        // as `host:port` overrides the global bind-address; `0.0.0.0`
-        // because the probe reaches the kernel over the container network
-        // (or the pod loopback), never through a shared filesystem
-        let listeners: Vec<Value> = speed_lanes
-            .iter()
-            .map(|(id, port)| {
-                let mut listener = serde_norway::Mapping::new();
-                listener.insert(
-                    Value::String("name".into()),
-                    Value::String(speed_listener_name(*port)),
-                );
-                listener.insert(Value::String("type".into()), Value::String("mixed".into()));
-                listener.insert(
-                    Value::String("listen".into()),
-                    Value::String(format!("0.0.0.0:{port}")),
-                );
-                listener.insert(
-                    Value::String("proxy".into()),
-                    Value::String(proxy_name(*id)),
-                );
-                Value::Mapping(listener)
-            })
-            .collect();
-        root.insert(
-            Value::String("listeners".into()),
-            Value::Sequence(listeners),
-        );
-    }
+    // IN-PORT rules are hot-reloadable, unlike `listeners:` (a startup
+    // snapshot in meow-rs v0.29.0). Each pre-started measurement lane is
+    // pinned to the proxy under test by its inbound port; the final
+    // MATCH,DIRECT keeps every other flow out of the tunnels. A missing
+    // target fails closed, so a lane is only rendered for an included row.
+    let mut rules: Vec<Value> = speed_lanes
+        .iter()
+        .map(|(id, port)| Value::String(format!("IN-PORT,{port},{}", proxy_name(*id))))
+        .collect();
+    rules.push(Value::String("MATCH,DIRECT".into()));
+    root.insert(Value::String("rules".into()), Value::Sequence(rules));
     Ok(GeneratedBatch {
         yaml: serde_norway::to_string(&Value::Mapping(root))?,
         included,
@@ -200,11 +170,37 @@ pub fn generate(
     })
 }
 
-/// Deterministic name of the pinned listener bound to `port` (the lane's
-/// address is what the probe connects to; the name is only for the
-/// kernel's own logging).
-pub fn speed_listener_name(port: u16) -> String {
-    format!("fumox-sp-{port}")
+/// Prefix of the measurement listeners declared in the kernel's bootstrap
+/// config. The probe matches `GET /listeners` entries against it and uses
+/// the reported port of each for one speed lane.
+pub const MEASURE_LISTENER_PREFIX: &str = "fumox-measure-";
+
+/// Extract the measurement-listener ports from the kernel's `GET /listeners`
+/// reply, sorted numerically and capped at `max`. The kernel binds them
+/// with `port: 0` at startup, so these ports are only known at runtime.
+///
+/// Returns `Err` when the kernel reports fewer than `max` lanes: a missing
+/// lane would silently leave a due proxy unmeasured. The caller decides
+/// whether that degrades to delay-only or fails the batch.
+pub fn measurement_ports(
+    listeners: &[crate::meow::MeowListener],
+    max: usize,
+) -> Result<Vec<u16>, String> {
+    let mut ports: Vec<u16> = listeners
+        .iter()
+        .filter(|listener| listener.name.starts_with(MEASURE_LISTENER_PREFIX))
+        .map(|listener| listener.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.len() < max {
+        return Err(format!(
+            "the engine reported {} measurement listener(s) but {max} are needed",
+            ports.len()
+        ));
+    }
+    ports.truncate(max);
+    Ok(ports)
 }
 
 /// Map one batch record onto a Clash proxy definition; returns `None` for
@@ -893,11 +889,48 @@ mod tests {
         assert_eq!(on["ipv6"].as_bool(), Some(true));
     }
 
-    /// The speed plan renders one pinned listener per due row, in lane
-    /// order, capped at `max_lanes`; a row the core mapping skipped gets
-    /// no lane, and a non-due row gets none either.
+    /// The engine reports its measurement listeners with ephemeral ports;
+    /// only the `fumox-measure-*` names are lanes, sorted by port and
+    /// capped at the cap the batch needs.
     #[test]
-    fn speed_plan_renders_pinned_listeners_for_due_rows() {
+    fn measurement_ports_filters_sorts_and_caps() {
+        use crate::meow::MeowListener;
+        let listeners = vec![
+            MeowListener {
+                name: "other".into(),
+                port: 9090,
+            },
+            MeowListener {
+                name: "fumox-measure-3".into(),
+                port: 41003,
+            },
+            MeowListener {
+                name: "fumox-measure-0".into(),
+                port: 41000,
+            },
+            MeowListener {
+                name: "fumox-measure-1".into(),
+                port: 41001,
+            },
+        ];
+        assert_eq!(
+            measurement_ports(&listeners, 2).unwrap(),
+            vec![41000, 41001]
+        );
+        assert_eq!(
+            measurement_ports(&listeners, 3).unwrap(),
+            vec![41000, 41001, 41003]
+        );
+        // Asking for more lanes than the engine declared is an error, not
+        // an empty plan that would silently skip measurements
+        assert!(measurement_ports(&listeners, 4).is_err());
+    }
+
+    /// The speed plan renders one `IN-PORT` rule per due row, in lane
+    /// order, capped at the number of discovered listeners; a row the core
+    /// mapping skipped gets no lane, and a non-due row gets none either.
+    #[test]
+    fn speed_plan_pins_due_rows_with_in_port_rules() {
         let rows = vec![
             record(1, entry(Scheme::Vless, "uuid-1", &[])),
             record(2, entry(Scheme::Trojan, "pw-2", &[])),
@@ -911,36 +944,34 @@ mod tests {
         due.insert(4);
         let plan = SpeedPlan {
             due,
-            port_base: 30000,
-            max_lanes: 2,
+            ports: vec![41001, 41002],
         };
 
         let generated = generate(&rows, false, &plan).unwrap();
         // Lane order follows the batch order of the included rows: 1 and 2
         // fit under the cap, 3 stays due but lane-less, 4 is not even in
         // the config
-        assert_eq!(generated.speed_lanes, vec![(1, 30000), (2, 30001)]);
+        assert_eq!(generated.speed_lanes, vec![(1, 41001), (2, 41002)]);
         assert_eq!(generated.included, vec![1, 2, 3]);
 
         let parsed: serde_norway::Value = serde_norway::from_str(&generated.yaml).unwrap();
-        let listeners = parsed["listeners"].as_sequence().unwrap();
-        assert_eq!(listeners.len(), 2);
-        assert_eq!(listeners[0]["name"].as_str(), Some("fumox-sp-30000"));
-        assert_eq!(listeners[0]["type"].as_str(), Some("mixed"));
-        assert_eq!(listeners[0]["listen"].as_str(), Some("0.0.0.0:30000"));
-        assert_eq!(listeners[0]["proxy"].as_str(), Some("fumox-1"));
-        assert_eq!(listeners[1]["listen"].as_str(), Some("0.0.0.0:30001"));
-        assert_eq!(listeners[1]["proxy"].as_str(), Some("fumox-2"));
+        // No listeners are rendered: they are a startup snapshot in meow-rs
+        assert!(parsed.get("listeners").is_none());
+        let rules = parsed["rules"].as_sequence().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].as_str(), Some("IN-PORT,41001,fumox-1"));
+        assert_eq!(rules[1].as_str(), Some("IN-PORT,41002,fumox-2"));
+        assert_eq!(rules[2].as_str(), Some("MATCH,DIRECT"));
     }
 
-    /// No due rows (speed disabled or everything fresh): no `listeners`
-    /// key at all, the config stays exactly the delay-only shape.
+    /// No due rows (speed disabled or everything fresh): no `IN-PORT`
+    /// rules at all, the config stays exactly the delay-only shape.
     #[test]
-    fn an_empty_speed_plan_renders_no_listeners_key() {
+    fn an_empty_speed_plan_renders_no_pin_rules() {
         let rows = vec![record(1, entry(Scheme::Vless, "uuid-1", &[]))];
         let generated = generate(&rows, false, &SpeedPlan::empty()).unwrap();
         assert!(generated.speed_lanes.is_empty());
         let parsed: serde_norway::Value = serde_norway::from_str(&generated.yaml).unwrap();
-        assert!(parsed.get("listeners").is_none(), "{}", generated.yaml);
+        assert_eq!(parsed["rules"][0].as_str(), Some("MATCH,DIRECT"));
     }
 }

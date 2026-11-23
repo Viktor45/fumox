@@ -1318,6 +1318,9 @@ pub enum ProxyListOrder {
     Updated,
     /// Measured latency ascending, unmeasured rows last.
     Latency,
+    /// Measured download speed descending (fastest first), unmeasured
+    /// rows last.
+    Speed,
     /// Case-insensitive display name ascending.
     Name,
 }
@@ -1328,6 +1331,7 @@ impl ProxyListOrder {
     pub fn from_param(value: &str) -> Self {
         match value {
             "latency" => Self::Latency,
+            "speed" => Self::Speed,
             "name" => Self::Name,
             _ => Self::Updated,
         }
@@ -1337,6 +1341,7 @@ impl ProxyListOrder {
         match self {
             Self::Updated => "updated",
             Self::Latency => "latency",
+            Self::Speed => "speed",
             Self::Name => "name",
         }
     }
@@ -1345,6 +1350,7 @@ impl ProxyListOrder {
         match self {
             Self::Updated => "p.updated_at DESC, p.id DESC",
             Self::Latency => "p.latency_ms IS NULL ASC, p.latency_ms ASC, p.id DESC",
+            Self::Speed => "p.speed_mbps IS NULL ASC, p.speed_mbps DESC, p.id DESC",
             Self::Name => "p.name COLLATE NOCASE ASC, p.id DESC",
         }
     }
@@ -1355,6 +1361,7 @@ impl ProxyListOrder {
         match self {
             Self::Updated => "p.updated_at ASC, p.id ASC",
             Self::Latency => "p.latency_ms IS NULL DESC, p.latency_ms DESC, p.id ASC",
+            Self::Speed => "p.speed_mbps IS NULL DESC, p.speed_mbps ASC, p.id ASC",
             Self::Name => "p.name COLLATE NOCASE DESC, p.id ASC",
         }
     }
@@ -1367,6 +1374,8 @@ impl ProxyListOrder {
             (self, cursor),
             (Self::Updated, ProxyListCursor::Updated { .. })
                 | (Self::Latency, ProxyListCursor::Latency { .. })
+                | (Self::Speed, ProxyListCursor::Speed { .. })
+                | (Self::Speed, ProxyListCursor::SpeedUnmeasured { .. })
                 | (Self::Name, ProxyListCursor::Name { .. })
         )
     }
@@ -1464,6 +1473,43 @@ impl ProxyListOrder {
                     ],
                 ))
             }
+            (Self::Speed, ProxyListCursor::Speed { speed_mbps, id }) => {
+                // Fastest first, unmeasured rows last: the same tier logic
+                // as latency, with the comparison reversed because a
+                // larger speed sorts before a smaller one
+                let (clause, values) = if forward {
+                    (
+                        "(p.speed_mbps IS NULL) OR (p.speed_mbps IS NOT NULL AND \
+                         (p.speed_mbps < ? OR (p.speed_mbps = ? AND p.id < ?)))"
+                            .to_string(),
+                        vec![
+                            KeysetValue::Float(*speed_mbps),
+                            KeysetValue::Float(*speed_mbps),
+                            KeysetValue::Int(*id),
+                        ],
+                    )
+                } else {
+                    (
+                        "(p.speed_mbps IS NOT NULL AND \
+                         (p.speed_mbps > ? OR (p.speed_mbps = ? AND p.id > ?)))"
+                            .to_string(),
+                        vec![
+                            KeysetValue::Float(*speed_mbps),
+                            KeysetValue::Float(*speed_mbps),
+                            KeysetValue::Int(*id),
+                        ],
+                    )
+                };
+                Some((clause, values))
+            }
+            (Self::Speed, ProxyListCursor::SpeedUnmeasured { id }) => {
+                let clause = if forward {
+                    "(p.speed_mbps IS NULL AND p.id < ?)"
+                } else {
+                    "(p.speed_mbps IS NOT NULL OR (p.speed_mbps IS NULL AND p.id > ?))"
+                };
+                Some((clause.to_string(), vec![KeysetValue::Int(*id)]))
+            }
             _ => None,
         }
     }
@@ -1475,21 +1521,40 @@ impl ProxyListOrder {
 #[derive(Debug, Clone)]
 enum KeysetValue {
     Int(i64),
+    Float(f64),
     Text(String),
 }
 
 /// The sort key of one row of the admin proxy browser: the next keyset
 /// page starts after the key of the last row of the current one, so a
 /// page costs one index seek instead of a walk over everything it skips.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProxyListCursor {
     /// `(updated_at, id)` of the default order.
-    Updated { updated_at: i64, id: i64 },
+    Updated {
+        updated_at: i64,
+        id: i64,
+    },
     /// `(latency_ms, id)`; `None` is an unmeasured row, which the order
     /// puts last.
-    Latency { latency_ms: Option<i64>, id: i64 },
+    Latency {
+        latency_ms: Option<i64>,
+        id: i64,
+    },
+    /// `(speed_mbps, id)`; the order is descending, and an unmeasured
+    /// row comes last (its own cursor variant).
+    Speed {
+        speed_mbps: f64,
+        id: i64,
+    },
+    SpeedUnmeasured {
+        id: i64,
+    },
     /// `(name, id)`; the name compares case-insensitively.
-    Name { name: String, id: i64 },
+    Name {
+        name: String,
+        id: i64,
+    },
 }
 
 /// Which side of the cursor a keyset page takes.
@@ -1632,6 +1697,13 @@ impl ProxyListRow {
                 latency_ms: self.latency_ms,
                 id: self.id,
             },
+            ProxyListOrder::Speed => match self.speed_mbps {
+                Some(speed_mbps) => ProxyListCursor::Speed {
+                    speed_mbps,
+                    id: self.id,
+                },
+                None => ProxyListCursor::SpeedUnmeasured { id: self.id },
+            },
             ProxyListOrder::Name => ProxyListCursor::Name {
                 name: self.name.clone(),
                 id: self.id,
@@ -1706,6 +1778,7 @@ pub async fn list_filtered(
     for value in &keyset_values {
         query = match value {
             KeysetValue::Int(value) => query.bind(*value),
+            KeysetValue::Float(value) => query.bind(*value),
             KeysetValue::Text(value) => query.bind(value.as_str()),
         };
     }

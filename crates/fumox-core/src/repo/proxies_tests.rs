@@ -5501,6 +5501,22 @@ async fn admin_list_orders_and_pages() {
             .await
             .unwrap();
     }
+    // Measured speeds: fastest first, `c` unmeasured and last. Ties break
+    // by id DESC, so page boundaries must not split a tied pair.
+    let speed = [
+        ("a", Some(18.6)),
+        ("b", Some(63.0)),
+        ("c", None),
+        ("d", Some(63.0)),
+    ];
+    for (letter, mbps) in speed {
+        sqlx::query("UPDATE proxies SET speed_mbps = ? WHERE id = ?")
+            .bind(mbps)
+            .bind(id_of(letter))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     // Mixed-case names, so the name order has to fold the case
     for (letter, name) in [
         ("a", "Alpha"),
@@ -5554,6 +5570,49 @@ async fn admin_list_orders_and_pages() {
     assert_eq!(
         rows.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![id_of("a"), id_of("b"), id_of("d"), id_of("c")]
+    );
+
+    // The speed order: fastest first, unmeasured last, ties by id DESC.
+    // `d` and `b` share 63.0; `d` has the higher id.
+    let rows = list_filtered(
+        &pool,
+        &ProxyListFilter::default(),
+        ProxyListOrder::Speed,
+        50,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![id_of("d"), id_of("b"), id_of("a"), id_of("c")]
+    );
+
+    // Keyset pagination resumes across the unmeasured tier boundary.
+    let first_page = list_page(&pool, ProxyListOrder::Speed, 3, None).await;
+    let second_page = list_page(
+        &pool,
+        ProxyListOrder::Speed,
+        3,
+        Some(&first_page[2].cursor(ProxyListOrder::Speed)),
+    )
+    .await;
+    let first_ids: Vec<i64> = first_page.iter().map(|r| r.id).collect();
+    let second_ids: Vec<i64> = second_page.iter().map(|r| r.id).collect();
+    assert_eq!(first_ids, vec![id_of("d"), id_of("b"), id_of("a")]);
+    assert_eq!(second_ids, vec![id_of("c")]);
+
+    // The last measured page ends on the unmeasured row `c` (the tail of
+    // the speed order): its cursor must be accepted, so paging from it
+    // yields the rows behind it — an empty last page, not the first page
+    // again (an unaccepted cursor falls back to the start of the list)
+    let full = list_page(&pool, ProxyListOrder::Speed, 4, None).await;
+    let tail = full[3].cursor(ProxyListOrder::Speed);
+    assert!(ProxyListOrder::Speed.accepts_cursor(&tail));
+    let after = list_page(&pool, ProxyListOrder::Speed, 3, Some(&tail)).await;
+    assert!(
+        after.is_empty(),
+        "the tail cursor must page past the last row, not fall back to page one"
     );
 
     // Keyset pagination: the second page resumes after the last row of
@@ -5661,6 +5720,7 @@ fn admin_list_param_parsing_refuses_garbage() {
         ProxyListOrder::from_param("latency"),
         ProxyListOrder::Latency
     );
+    assert_eq!(ProxyListOrder::from_param("speed"), ProxyListOrder::Speed);
     assert_eq!(ProxyListOrder::from_param("name"), ProxyListOrder::Name);
     assert_eq!(
         ProxyListOrder::from_param("updated"),

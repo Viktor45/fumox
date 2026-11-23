@@ -2,17 +2,21 @@
 //! meow-rs listener.
 //!
 //! Both fetches ride the same path a client subscription would: the probe
-//! opens an HTTP session against the listener the batch config rendered
-//! for the proxy under test (`listeners[].proxy` forces every flow of it
-//! through that proxy's tunnel), so the numbers describe the tunnel, not
-//! the host. Nothing is written to disk: the speed payload is counted
-//! chunk by chunk and dropped.
+//! opens an HTTP session against one of the kernel's pre-started mixed
+//! listeners. Each batch's generated config pins one lane to the proxy
+//! under test with a hot-reloadable `IN-PORT,<port>,fumox-{id}` rule, so the
+//! numbers describe the tunnel, not the host. Nothing is written to disk:
+//! the speed payload is counted chunk by chunk and dropped.
+//!
+//! meow-rs v0.29.0 treats `listeners:` as a startup snapshot and has no
+//! per-listener `proxy:` override — that is why the listeners live in the
+//! kernel's bootstrap config and only the routing rules are per batch.
 //!
 //! The listener address is derived from `[meow].api_addr` — the controller
 //! host the client already vets every cycle (a public controller address
-//! is refused outright) — with the lane port from
-//! `[network].speed_listener_port_base`, so the fetch target inherits the
-//! vetting the controller went through.
+//! is refused outright) — with the lane port discovered from the kernel's
+//! `GET /listeners` reply, so the fetch target inherits the vetting the
+//! controller went through.
 
 use std::time::{Duration, Instant};
 

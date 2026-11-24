@@ -466,6 +466,9 @@ table.data td.egress { white-space: nowrap; }
 /* Status and error-class badges never break across lines, a wrapped
    "http_server" would change the row height and shift the table. */
 table.data .badge { white-space: nowrap; }
+/* Compact status column: the emoji carries the colour, the badge keeps
+   the same palette; the accessible name lives in title/aria-label. */
+table.data .status-icon { font-size: 15px; line-height: 1; padding: 3px 5px; }
 
 /* Local-time timestamps (base.html rewrites <time class="ts"> into the
    user's timezone): keep date and time on one line, never mid-cell wrap. */
@@ -541,6 +544,9 @@ form.stack { max-width: 760px; }
 .check-row { display: flex; align-items: center; gap: 8px; }
 .check-row input { width: auto; }
 .check-row label { margin: 0; font-weight: 500; }
+/* Status filter options use the same colour vocabulary as the list
+   badges; the class comes from the status value, never from user text. */
+.check-row label.filter-status { font-size: 11.5px; padding: 2px 8px; cursor: pointer; }
 
 fieldset {
   border: 1px solid var(--border);

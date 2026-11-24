@@ -71,6 +71,8 @@ struct DashboardTemplate {
     /// [`Self::recent_errors_unavailable`].
     sources_unavailable: bool,
     top_alive: Vec<TopAliveRow>,
+    /// The fastest measured `ready` proxies, speed_mbps descending.
+    top_fastest: Vec<TopFastestRow>,
     schemes: Vec<SchemeSplitRow>,
     countries: Vec<CountrySplitRow>,
     /// `(min, avg, median)` latency of alive proxies with a measurement.
@@ -139,6 +141,20 @@ struct TopAliveRow {
     source_names: String,
 }
 
+/// One row of the "fastest ready proxies" top.
+#[derive(Debug, sqlx::FromRow)]
+struct TopFastestRow {
+    id: i64,
+    name: String,
+    scheme: String,
+    host: String,
+    port: i64,
+    speed_mbps: f64,
+    latency_ms: Option<i64>,
+    geo_country: Option<String>,
+    source_names: String,
+}
+
 /// One row of the protocol distribution (`scheme` is NOT NULL).
 #[derive(Debug, sqlx::FromRow)]
 struct SchemeSplitRow {
@@ -197,6 +213,11 @@ impl DashboardTemplate {
     /// bucket of its group); 1 is the floor so non-zero counts stay visible.
     fn bar_width(&self, count: &i64, max: &i64) -> i64 {
         bar_width_of(*count, *max)
+    }
+    /// Speed cell of the fastest-proxies table: one decimal place, like the
+    /// proxy browser and the probe overview.
+    fn speed_cell(&self, mbps: &f64) -> String {
+        format!("{mbps:.1}")
     }
     /// Truncate long display names (the full name is on the proxy card).
     fn short_name(&self, name: &str) -> String {
@@ -281,7 +302,7 @@ async fn dashboard_inner(
     let (latency_min, latency_avg) = (aggregates.latency_min, aggregates.latency_avg);
     let ((recent_errors, recent_errors_unavailable), (sources, sources_unavailable)) =
         dashboard_triage_widgets(&mut tx, top_n.as_i64()).await;
-    let (top_alive, schemes, countries) =
+    let (top_alive, top_fastest, schemes, countries) =
         dashboard_splits(state, headers, &mut tx, top_n.as_i64()).await?;
     let (latency_median, (probes_total_24h, probes_ok_24h), top_failures) =
         dashboard_probe_stats(state, headers, &mut tx, day_ago, top_n.as_i64()).await?;
@@ -314,6 +335,7 @@ async fn dashboard_inner(
         sources,
         sources_unavailable,
         top_alive,
+        top_fastest,
         schemes,
         countries,
         latency_min,
@@ -429,7 +451,15 @@ async fn dashboard_splits(
     headers: &HeaderMap,
     conn: &mut sqlx::SqliteConnection,
     limit: i64,
-) -> Result<(Vec<TopAliveRow>, Vec<SchemeSplitRow>, Vec<CountrySplitRow>), Response> {
+) -> Result<
+    (
+        Vec<TopAliveRow>,
+        Vec<TopFastestRow>,
+        Vec<SchemeSplitRow>,
+        Vec<CountrySplitRow>,
+    ),
+    Response,
+> {
     // `ready` is the tunnel-verified tier (strict subset of `alive`, set
     // only by a successful T2), so the oldest-`created_at` top surfaces
     // the proxies that have stayed end-to-end working the longest. The
@@ -456,6 +486,31 @@ async fn dashboard_splits(
     .await
     .map_err(|err| server_error(state, headers, "dashboard.top_alive", &err))?;
 
+    // Same CTE shape as top_alive: pick the ready rows with a speed
+    // measurement first (fastest first, ties broken deterministically),
+    // then join the source names. Only measured rows can appear — an
+    // unmeasured proxy is not "fast".
+    let top_fastest: Vec<TopFastestRow> = sqlx::query_as(
+        "WITH picked AS (
+             SELECT id FROM proxies WHERE status = ? AND speed_mbps IS NOT NULL
+             ORDER BY speed_mbps DESC, id ASC LIMIT ?
+         )
+         SELECT p.id, p.name, p.scheme, p.host, p.port, p.speed_mbps, p.latency_ms,
+                p.geo_country,
+                COALESCE(GROUP_CONCAT(s.name, ', '), '') AS source_names
+         FROM picked
+         JOIN proxies p ON p.id = picked.id
+         JOIN proxy_source_links l ON l.proxy_id = p.id
+         JOIN sources s ON s.id = l.source_id
+         GROUP BY p.id
+         ORDER BY p.speed_mbps DESC, p.id ASC",
+    )
+    .bind(ProxyStatus::Ready.as_str())
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| server_error(state, headers, "dashboard.top_fastest", &err))?;
+
     let schemes = scheme_split(&mut *conn)
         .await
         .map_err(|err| server_error(state, headers, "dashboard.scheme_split", &err))?;
@@ -463,7 +518,7 @@ async fn dashboard_splits(
         .await
         .map_err(|err| server_error(state, headers, "dashboard.country_split", &err))?;
 
-    Ok((top_alive, schemes, countries))
+    Ok((top_alive, top_fastest, schemes, countries))
 }
 
 #[allow(clippy::result_large_err)] // the Err is a finished Response, by design
@@ -1920,6 +1975,60 @@ mod tests {
                 status.as_str()
             );
         }
+    }
+
+    /// The fastest-proxies top includes only ready rows that have a speed
+    /// measurement, fastest first; an unmeasured ready row and a fast
+    /// non-ready row must not appear.
+    #[tokio::test]
+    async fn the_dashboard_fastest_top_uses_measured_ready_rows_only() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig::default(),
+            Default::default(),
+        )
+        .await;
+        let pool = state.pool.clone();
+        sqlx::query(
+            "INSERT INTO sources (id, name, url, enabled, created_at, updated_at)
+             VALUES ('src-fast', 'fast', 'https://fast.example/list', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (fp, status, speed) in [
+            ("fp-slow", "ready", Some(2.5)),
+            ("fp-fast", "ready", Some(88.8)),
+            ("fp-no-speed", "ready", None),
+            ("fp-alive-fast", "alive", Some(99.9)),
+        ] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, speed_mbps, created_at, updated_at)
+                 VALUES (?, 'vless', ?, 'h.example.com', 443, 'c', ?, ?, 1, 1)",
+            )
+            .bind(fp)
+            .bind(fp)
+            .bind(status)
+            .bind(speed)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+                 VALUES ((SELECT id FROM proxies WHERE fingerprint = ?), 'src-fast', 1)",
+            )
+            .bind(fp)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let headers = HeaderMap::new();
+        let mut conn = pool.acquire().await.unwrap();
+        let (_, fastest, _, _) = dashboard_splits(&state, &headers, &mut conn, 10)
+            .await
+            .unwrap();
+        let names: Vec<&str> = fastest.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["fp-fast", "fp-slow"]);
     }
 
     /// The dashboard's SQL carries no status string literals: every

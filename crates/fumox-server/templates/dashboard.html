@@ -292,6 +292,56 @@
   {% endif %}
 </div>
 
+{# Top-N fastest measured ready proxies. #}
+<div class="panel">
+  <h2>{{ self.t("stats.top_fastest") }}</h2>
+  {% if top_fastest.is_empty() %}
+    <p class="muted">{{ self.t("stats.no_fastest") }}</p>
+    <p class="muted small">{{ self.t("stats.no_fastest_hint") }}</p>
+  {% else %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>{{ self.t("common.protocol") }}</th>
+            <th>{{ self.t("px.address") }}</th>
+            <th>{{ self.t("common.country") }}</th>
+            <th>{{ self.t("common.name") }}</th>
+            <th title="{{ self.t("px.speed_filter_label") }}">{{ self.t("px.speed") }}</th>
+            <th>{{ self.t("common.latency") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in top_fastest %}
+          <tr>
+            <td class="muted rank">{{ loop.index }}</td>
+            <td class="mono small">{{ row.scheme }}</td>
+            <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
+            <td class="small"><span aria-hidden="true">{{ self.flag(row.geo_country) }}</span>
+              {% match row.geo_country %}
+                {% when Some with (country) %}{{ country }}
+                {% when None %}<span class="muted">–</span>
+              {% endmatch %}
+            </td>
+            <td class="small truncate" title="{{ row.source_names }}">
+              <a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
+            </td>
+            <td class="num small">{{ self.speed_cell(row.speed_mbps) }} {{ self.t("px.speed_unit") }}</td>
+            <td class="num small">
+              {% match row.latency_ms %}
+                {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+                {% when None %}<span class="muted">–</span>
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
 <div class="grid cols-2">
   {# Protocol distribution with health split per scheme. #}
   <div class="panel">

@@ -3,11 +3,11 @@
 {% block title %}{{ self.t("nav.proxies") }}{% endblock %}
 
 {#- One bulk operation of the cleanup/revive dialogs: the CSRF'd POST
-    form, the title/description pair and the apply button. An operation
-    that takes a control (the ASN input, the country select) passes it
-    as the `call` block, with `has_controls` switching between the
-    inline-controls row and a lone button; operations without controls
-    pass an empty block. -#}
+form, the title/description pair and the apply button. An operation
+that takes a control (the ASN input, the country select) passes it
+as the `call` block, with `has_controls` switching between the
+inline-controls row and a lone button; operations without controls
+pass an empty block. -#}
 {% macro op(action, apply_class, apply_label, apply_aria, title, desc, has_controls) %}
 <li>
   <form method="post" action="{{ action }}">
@@ -32,27 +32,26 @@
 {% endmacro %}
 
 {#- The control the ASN-based operations take. The value is
-    alphanumeric (`normalize_asn` accepts `24940` and `AS24940`), so the
-    placeholder shows both forms and no numeric keyboard is forced; the
-    title carries the same hint (the op descriptions name the two forms
-    too, a visible note here would say it twice). The input would
-    otherwise have no accessible name at all (no label, no aria-label),
-    so it announces itself with the ASN name; the op title beside it
-    says which operation the field belongs to. -#}
+alphanumeric (`normalize_asn` accepts `24940` and `AS24940`), so the
+placeholder shows both forms and no numeric keyboard is forced; the
+title carries the same hint (the op descriptions name the two forms
+too, a visible note here would say it twice). The input would
+otherwise have no accessible name at all (no label, no aria-label),
+so it announces itself with the ASN name; the op title beside it
+says which operation the field belongs to. -#}
 {% macro asn_controls() %}
-<input type="text" name="asn" placeholder="24940 / AS24940" autocomplete="off"
-       aria-label="{{ self.t("ped.target_asn") }}"
-       title="{{ self.t("px.asn_input_hint") }}">
+<input type="text" name="asn" placeholder="24940 / AS24940" autocomplete="off" aria-label="{{ self.t(" ped.target_asn")
+  }}" title="{{ self.t(" px.asn_input_hint") }}">
 {% endmacro %}
 
 {#- The control the country-based operations take. The placeholder
-    option is not a control name, so the select carries the country
-    name as its accessible label. -#}
+option is not a control name, so the select carries the country
+name as its accessible label. -#}
 {% macro country_controls() %}
-<select name="country" aria-label="{{ self.t("common.country") }}">
+<select name="country" aria-label="{{ self.t(" common.country") }}">
   <option value="">{{ self.t("common.choose") }}</option>
   {% for country in countries %}
-    <option value="{{ country }}">{{ country }}</option>
+  <option value="{{ country }}">{{ country }}</option>
   {% endfor %}
 </select>
 {% endmacro %}
@@ -62,32 +61,47 @@
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
   <div class="row-actions">
     {% if detached_count > 0 %}
-      <span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}: {{ detached_count }}</span>
+    <span class="badge neutral" title="{{ self.t(" px.detached_title") }}">{{ self.t("px.detached_label") }}: {{
+      detached_count }}</span>
     {% endif %}
-    <button class="btn" type="button" data-dialog-open="revive-dialog" aria-haspopup="dialog" aria-controls="revive-dialog">{{ self.t("px.revive_button") }}</button>
-    <button class="btn danger" type="button" data-dialog-open="cleanup-dialog" aria-haspopup="dialog" aria-controls="cleanup-dialog">{{ self.t("px.cleanup_button") }}</button>
-    <button class="btn danger" type="button" data-dialog-open="purge-dialog" aria-haspopup="dialog" aria-controls="purge-dialog">{{ self.t("px.purge_button") }}</button>
+    <button class="btn" type="button" data-dialog-open="revive-dialog" aria-haspopup="dialog"
+      aria-controls="revive-dialog">{{ self.t("px.revive_button") }}</button>
+    <button class="btn danger" type="button" data-dialog-open="cleanup-dialog" aria-haspopup="dialog"
+      aria-controls="cleanup-dialog">{{ self.t("px.cleanup_button") }}</button>
+    <button class="btn danger" type="button" data-dialog-open="purge-dialog" aria-haspopup="dialog"
+      aria-controls="purge-dialog">{{ self.t("px.purge_button") }}</button>
   </div>
 </div>
 
 {# Bulk cleanup: five separate plain POST forms in one dialog. Every
-   action here transitions rows into `removed` (a soft state); the
-   actual delete from the database stays the "purge removed" button
-   above. Keeping the two buttons apart makes a mistake reversible. #}
+action here transitions rows into `removed` (a soft state); the
+actual delete from the database stays the "purge removed" button
+above. Keeping the two buttons apart makes a mistake reversible. #}
 <dialog id="cleanup-dialog" aria-labelledby="cleanup-dialog-title">
   <h2 id="cleanup-dialog-title" tabindex="-1">{{ self.t("px.cleanup_title") }}</h2>
   <p class="muted small">{{ self.t("px.cleanup_note") }}</p>
   <ul class="cleanup-ops">
-    {% call op("/admin/proxies/quarantine-to-removed", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_quarantine_aria"), self.t("px.cleanup_quarantine_title"), self.t("px.cleanup_quarantine_desc"), false) %}{% endcall %}
-    {% call op("/admin/proxies/remove-alive-no-country", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_no_country_aria"), self.t("px.cleanup_no_country_title"), self.t("px.cleanup_no_country_desc"), false) %}{% endcall %}
-    {% call op("/admin/proxies/remove-alive-by-asn", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_asn_aria"), self.t("px.cleanup_asn_title"), self.t("px.cleanup_asn_desc"), true) %}
-      {{ asn_controls() }}
+    {% call op("/admin/proxies/quarantine-to-removed", "btn danger small", self.t("px.cleanup_apply"),
+    self.t("px.cleanup_apply_quarantine_aria"), self.t("px.cleanup_quarantine_title"),
+    self.t("px.cleanup_quarantine_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-alive-no-country", "btn danger small", self.t("px.cleanup_apply"),
+    self.t("px.cleanup_apply_no_country_aria"), self.t("px.cleanup_no_country_title"),
+    self.t("px.cleanup_no_country_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-alive-by-asn", "btn danger small", self.t("px.cleanup_apply"),
+    self.t("px.cleanup_apply_asn_aria"), self.t("px.cleanup_asn_title"), self.t("px.cleanup_asn_desc"), true) %}
+    {{ asn_controls() }}
     {% endcall %}
-    {% call op("/admin/proxies/remove-alive-by-country", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_country_aria"), self.t("px.cleanup_country_title"), self.t("px.cleanup_country_desc"), true) %}
-      {{ country_controls() }}
+    {% call op("/admin/proxies/remove-alive-by-country", "btn danger small", self.t("px.cleanup_apply"),
+    self.t("px.cleanup_apply_country_aria"), self.t("px.cleanup_country_title"), self.t("px.cleanup_country_desc"),
+    true) %}
+    {{ country_controls() }}
     {% endcall %}
-    {% call op("/admin/proxies/remove-detached", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_detached_aria"), self.t("px.cleanup_detached_title"), self.t_named("px.cleanup_detached_desc", &[("count", detached_count.to_string())][..]), false) %}{% endcall %}
-    {% call op("/admin/proxies/remove-unprobeable", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_unprobeable_aria"), self.t("px.cleanup_unprobeable_title"), self.t("px.cleanup_unprobeable_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-detached", "btn danger small", self.t("px.cleanup_apply"),
+    self.t("px.cleanup_apply_detached_aria"), self.t("px.cleanup_detached_title"),
+    self.t_named("px.cleanup_detached_desc", &[("count", detached_count.to_string())][..]), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-unprobeable", "btn danger small", self.t("px.cleanup_apply"),
+    self.t("px.cleanup_apply_unprobeable_aria"), self.t("px.cleanup_unprobeable_title"),
+    self.t("px.cleanup_unprobeable_desc"), false) %}{% endcall %}
   </ul>
   <div class="form-actions">
     <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
@@ -110,21 +124,28 @@
 </dialog>
 
 {# Bulk revival: inverse of cleanup, every action here moves rows
-   back to `unknown`, not to `removed`. Revived ids are enqueued for
-   priority probing so the daemon picks them up on its next cycle
-   instead of waiting for the random sample. #}
+back to `unknown`, not to `removed`. Revived ids are enqueued for
+priority probing so the daemon picks them up on its next cycle
+instead of waiting for the random sample. #}
 <dialog id="revive-dialog" aria-labelledby="revive-dialog-title">
   <h2 id="revive-dialog-title" tabindex="-1">{{ self.t("px.revive_title") }}</h2>
   <p class="muted small">{{ self.t("px.revive_note") }}</p>
   <ul class="cleanup-ops">
-    {% call op("/admin/proxies/revive-removed-by-country", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_country_aria"), self.t("px.revive_country_title"), self.t("px.revive_country_desc"), true) %}
-      {{ country_controls() }}
+    {% call op("/admin/proxies/revive-removed-by-country", "btn small", self.t("px.revive_apply"),
+    self.t("px.revive_apply_country_aria"), self.t("px.revive_country_title"), self.t("px.revive_country_desc"), true)
+    %}
+    {{ country_controls() }}
     {% endcall %}
-    {% call op("/admin/proxies/revive-removed-by-asn", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_asn_aria"), self.t("px.revive_asn_title"), self.t("px.revive_asn_desc"), true) %}
-      {{ asn_controls() }}
+    {% call op("/admin/proxies/revive-removed-by-asn", "btn small", self.t("px.revive_apply"),
+    self.t("px.revive_apply_asn_aria"), self.t("px.revive_asn_title"), self.t("px.revive_asn_desc"), true) %}
+    {{ asn_controls() }}
     {% endcall %}
-    {% call op("/admin/proxies/revive-removed-never-checked", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_no_history_aria"), self.t("px.revive_never_checked_title"), self.t("px.revive_never_checked_desc"), false) %}{% endcall %}
-    {% call op("/admin/proxies/revive-quarantine", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_quarantine_aria"), self.t("px.revive_quarantine_title"), self.t("px.revive_quarantine_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/revive-removed-never-checked", "btn small", self.t("px.revive_apply"),
+    self.t("px.revive_apply_no_history_aria"), self.t("px.revive_never_checked_title"),
+    self.t("px.revive_never_checked_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/revive-quarantine", "btn small", self.t("px.revive_apply"),
+    self.t("px.revive_apply_quarantine_aria"), self.t("px.revive_quarantine_title"),
+    self.t("px.revive_quarantine_desc"), false) %}{% endcall %}
   </ul>
   <div class="form-actions">
     <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
@@ -135,28 +156,28 @@
   <fieldset class="field">
     <legend>{{ self.t("common.status") }}</legend>
     {% for (status, checked) in all_statuses %}
-      <span class="check-row">
-        <input type="checkbox" name="status" value="{{ status }}" id="st-{{ status }}" {% if checked %}checked{% endif %}>
-        <label for="st-{{ status }}">
-          {% if status.as_str() == "alive" %}{{ self.t("common.status_alive") }}
-          {% else if status.as_str() == "ready" %}{{ self.t("common.status_ready") }}
-          {% else if status.as_str() == "quarantine" %}{{ self.t("common.status_quarantine") }}
-          {% else if status.as_str() == "removed" %}{{ self.t("common.status_removed") }}
-          {% else %}{{ self.t("common.status_unknown") }}{% endif %}
-        </label>
-      </span>
+    <span class="check-row">
+      <input type="checkbox" name="status" value="{{ status }}" id="st-{{ status }}" {% if checked %}checked{% endif %}>
+      <label for="st-{{ status }}" class="badge filter-status {{ status.as_str() }}">
+        {% if status.as_str() == "alive" %}{{ self.t("common.status_alive") }}
+        {% else if status.as_str() == "ready" %}{{ self.t("common.status_ready") }}
+        {% else if status.as_str() == "quarantine" %}{{ self.t("common.status_quarantine") }}
+        {% else if status.as_str() == "removed" %}{{ self.t("common.status_removed") }}
+        {% else %}{{ self.t("common.status_unknown") }}{% endif %}
+      </label>
+    </span>
     {% endfor %}
   </fieldset>
   {# The pickers line up two rows beside the status column (see the
-     .filters-grid rules in app.css): a flat flex row of nine controls
-     wraps into ragged orphans. #}
+  .filters-grid rules in app.css): a flat flex row of nine controls
+  wraps into ragged orphans. #}
   <div class="filter-grid">
     <div class="field">
       <label for="px-scheme">{{ self.t("common.protocol") }}</label>
       <select id="px-scheme" name="scheme">
         <option value="">{{ self.t("common.all") }}</option>
         {% for (scheme, selected) in all_schemes %}
-          <option value="{{ scheme }}" {% if selected %}selected{% endif %}>{{ scheme }}</option>
+        <option value="{{ scheme }}" {% if selected %}selected{% endif %}>{{ scheme }}</option>
         {% endfor %}
       </select>
     </div>
@@ -165,7 +186,7 @@
       <select id="px-country" name="country">
         <option value="">{{ self.t("common.all") }}</option>
         {% for country in countries %}
-          <option value="{{ country }}" {% if self.country_selected(country) %}selected{% endif %}>{{ country }}</option>
+        <option value="{{ country }}" {% if self.country_selected(country) %}selected{% endif %}>{{ country }}</option>
         {% endfor %}
       </select>
     </div>
@@ -174,7 +195,7 @@
       <select id="px-source" name="source">
         <option value="">{{ self.t("common.all") }}</option>
         {% for (id, name, _) in sources %}
-          <option value="{{ id }}" {% if self.source_selected(id) %}selected{% endif %}>{{ name }}</option>
+        <option value="{{ id }}" {% if self.source_selected(id) %}selected{% endif %}>{{ name }}</option>
         {% endfor %}
       </select>
     </div>
@@ -182,21 +203,27 @@
       <label for="px-coverage">{{ self.t("px.checks_label") }}</label>
       <select id="px-coverage" name="coverage">
         <option value="">{{ self.t("common.all") }}</option>
-        <option value="none" {% if self.coverage_selected("none") %}selected{% endif %}>{{ self.t("px.checks_none") }}</option>
-        <option value="t1_only" {% if self.coverage_selected("t1_only") %}selected{% endif %}>{{ self.t("px.checks_t1_only") }}</option>
-        <option value="t2_only" {% if self.coverage_selected("t2_only") %}selected{% endif %}>{{ self.t("px.checks_t2_only") }}</option>
-        <option value="both" {% if self.coverage_selected("both") %}selected{% endif %}>{{ self.t("px.checks_both") }}</option>
+        <option value="none" {% if self.coverage_selected("none") %}selected{% endif %}>{{ self.t("px.checks_none") }}
+        </option>
+        <option value="t1_only" {% if self.coverage_selected("t1_only") %}selected{% endif %}>{{
+          self.t("px.checks_t1_only") }}</option>
+        <option value="t2_only" {% if self.coverage_selected("t2_only") %}selected{% endif %}>{{
+          self.t("px.checks_t2_only") }}</option>
+        <option value="both" {% if self.coverage_selected("both") %}selected{% endif %}>{{ self.t("px.checks_both") }}
+        </option>
       </select>
     </div>
     {# Speed-measurement bucket: the same tolerance as the coverage one —
-       an empty value filters nothing. The pipeline's freshness threshold
-       lives there, this is only "has a number at all". #}
+    an empty value filters nothing. The pipeline's freshness threshold
+    lives there, this is only "has a number at all". #}
     <div class="field">
       <label for="px-speed">{{ self.t("px.speed_filter_label") }}</label>
       <select id="px-speed" name="speed">
         <option value="">{{ self.t("common.all") }}</option>
-        <option value="measured" {% if self.speed_selected("measured") %}selected{% endif %}>{{ self.t("px.speed_measured_only") }}</option>
-        <option value="unmeasured" {% if self.speed_selected("unmeasured") %}selected{% endif %}>{{ self.t("px.speed_unmeasured") }}</option>
+        <option value="measured" {% if self.speed_selected("measured") %}selected{% endif %}>{{
+          self.t("px.speed_measured_only") }}</option>
+        <option value="unmeasured" {% if self.speed_selected("unmeasured") %}selected{% endif %}>{{
+          self.t("px.speed_unmeasured") }}</option>
       </select>
     </div>
     <div class="field">
@@ -204,123 +231,134 @@
       <select id="px-egress" name="egress">
         <option value="">{{ self.t("common.all") }}</option>
         {% for country in egress_countries %}
-          <option value="{{ country }}" {% if self.egress_country_selected(country) %}selected{% endif %}>{{ country }}</option>
+        <option value="{{ country }}" {% if self.egress_country_selected(country) %}selected{% endif %}>{{ country }}
+        </option>
         {% endfor %}
       </select>
     </div>
     <div class="field">
       <label for="px-sort">{{ self.t("px.sort_label") }}</label>
       <select id="px-sort" name="sort">
-        <option value="updated" {% if f_sort == "updated" %}selected{% endif %}>{{ self.t("px.sort_updated") }}</option>
-        <option value="latency" {% if f_sort == "latency" %}selected{% endif %}>{{ self.t("px.sort_latency") }}</option>
-        <option value="speed" {% if f_sort == "speed" %}selected{% endif %}>{{ self.t("px.sort_speed") }}</option>
-        <option value="name" {% if f_sort == "name" %}selected{% endif %}>{{ self.t("px.sort_name") }}</option>
+        <option value="updated" {% if f_sort=="updated" %}selected{% endif %}>{{ self.t("px.sort_updated") }}</option>
+        <option value="latency" {% if f_sort=="latency" %}selected{% endif %}>{{ self.t("px.sort_latency") }}</option>
+        <option value="speed" {% if f_sort=="speed" %}selected{% endif %}>{{ self.t("px.sort_speed") }}</option>
+        <option value="name" {% if f_sort=="name" %}selected{% endif %}>{{ self.t("px.sort_name") }}</option>
       </select>
     </div>
     <div class="field">
       <label for="px-q">{{ self.t("common.search") }}</label>
-      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
+      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t(" px.search_placeholder") }}">
     </div>
   </div>
   <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
   {#- One click back to the unfiltered list: the empty-state link below
-      only helps when nothing matched, this one works while rows are
-      still on the page. -#}
+  only helps when nothing matched, this one works while rows are
+  still on the page. -#}
   {% if self.filters_active() %}<a class="btn" href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>{% endif %}
 </form>
 
 <div class="panel">
   {% if rows.is_empty() %}
-    <p class="muted">
-      {{ self.t("px.nothing_found") }}
-      {% if self.filters_active() %} <a href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>
-      {% else %}{{ self.t("px.empty_base_hint") }} <a href="/admin/sources/new">{{ self.t("src.add") }}</a>{% endif %}
-    </p>
+  <p class="muted">
+    {{ self.t("px.nothing_found") }}
+    {% if self.filters_active() %} <a href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>
+    {% else %}{{ self.t("px.empty_base_hint") }} <a href="/admin/sources/new">{{ self.t("src.add") }}</a>{% endif %}
+  </p>
   {% else %}
-    <div class="table-scroll">
-      <table class="data">
-        <thead>
-          <tr>
-            <th>{{ self.t("common.status") }}</th>
-            <th>{{ self.t("common.protocol") }}</th>
-            <th>{{ self.t("px.address") }}</th>
-            <th>{{ self.t("common.country") }}</th>
-            <th title="{{ self.t("px.egress_hint") }}">{{ self.t("px.egress_label") }}</th>
-            <th>{{ self.t("common.name") }}</th>
-            <th>{{ self.t("common.latency") }}</th>
-            <th title="{{ self.t("px.speed_filter_label") }}">{{ self.t("px.speed") }}</th>
-            <th>{{ self.t("px.checks_label") }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in rows %}
-          <tr>
-            <td>
-              {% if row.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
-              {% else if row.status == "ready" %}<span class="badge ready">{{ self.t("common.status_ready") }}</span>
-              {% else if row.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
-              {% else if row.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
-              {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}
-            </td>
-            <td class="mono small">
-              {{ row.scheme }}
-              {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">{{ self.t("px.unprobeable") }}</span>{% endif %}
-            </td>
-            <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
-            <td class="small">{{ self.flag(row.geo_country) }}
-              {% match row.geo_country %}
-                {% when Some with (country) %}{{ country }}
-                {% when None %}<span class="muted">–</span>
-              {% endmatch %}
-            </td>
-            {#- Egress facts: the derived egress country with
-                the Cloudflare datacenter; `–` until the first trace and
-                the server backfill both wrote their facts. -#}
-            <td class="small egress">
-              {% if row.egress_country.is_some() || row.cf_colo.is_some() %}
-                {{ self.flag(row.egress_country) }}
-                {% match row.egress_country %}
-                  {% when Some with (country) %}{{ country }}
-                  {% when None %}<span class="muted">–</span>
-                {% endmatch %}
-                {% if let Some(colo) = row.cf_colo %}
-                  <span class="muted mono" title="{{ self.t("px.cf_colo") }}">· {{ colo }}</span>
-                {% endif %}
-              {% else %}
-                <span class="muted">–</span>
-              {% endif %}
-            </td>
-            <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
-              {% if row.detached %}<span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}</span>{% endif %}
-            </td>
-            <td class="num small">
-              {% match row.latency_ms %}
-                {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-                {% when None %}<span class="muted">–</span>
-              {% endmatch %}
-            </td>
-            <td class="num small">
-              {% match row.speed_mbps %}
-                {% when Some with (mbps) %}{{ self.speed_cell(mbps) }} {{ self.t("px.speed_unit") }}
-                {% when None %}<span class="muted">–</span>
-              {% endmatch %}
-            </td>
-            <td class="small mono">{{ self.checks_cell(row) }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
+  <div class="table-scroll">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("common.status") }}</th>
+          <th>{{ self.t("common.protocol") }}</th>
+          <th>{{ self.t("px.address") }}</th>
+          <th>{{ self.t("common.country") }}</th>
+          <th title="{{ self.t(" px.egress_hint") }}">{{ self.t("px.egress_label") }}</th>
+          <th>{{ self.t("common.name") }}</th>
+          <th>{{ self.t("common.latency") }}</th>
+          <th title="{{ self.t(" px.speed_filter_label") }}">{{ self.t("px.speed") }}</th>
+          <th>{{ self.t("px.checks_label") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>
+            {% if row.status == "alive" %}<span class="badge alive status-icon" title="{{ self.t(" common.status_alive")
+              }}" aria-label="{{ self.t(" common.status_alive") }}">🟢</span>
+            {% else if row.status == "ready" %}<span class="badge ready status-icon" title="{{ self.t("
+              common.status_ready") }}" aria-label="{{ self.t(" common.status_ready") }}">🟣</span>
+            {% else if row.status == "quarantine" %}<span class="badge quarantine status-icon" title="{{ self.t("
+              common.status_quarantine") }}" aria-label="{{ self.t(" common.status_quarantine") }}">🟠</span>
+            {% else if row.status == "removed" %}<span class="badge removed status-icon" title="{{ self.t("
+              common.status_removed") }}" aria-label="{{ self.t(" common.status_removed") }}">🔴</span>
+            {% else %}<span class="badge unknown status-icon" title="{{ self.t(" common.status_unknown") }}"
+              aria-label="{{ self.t(" common.status_unknown") }}">⚪</span>{% endif %}
+          </td>
+          <td class="mono small">
+            {{ row.scheme }}
+            {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t(" px.unprobeable_title")
+              }}">{{ self.t("px.unprobeable") }}</span>{% endif %}
+          </td>
+          <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
+          <td class="small">{{ self.flag(row.geo_country) }}
+            {% match row.geo_country %}
+            {% when Some with (country) %}{{ country }}
+            {% when None %}<span class="muted">–</span>
+            {% endmatch %}
+          </td>
+          {#- Egress facts: the derived egress country with
+          the Cloudflare datacenter; `–` until the first trace and
+          the server backfill both wrote their facts. -#}
+          <td class="small egress">
+            {% if row.egress_country.is_some() || row.cf_colo.is_some() %}
+            {{ self.flag(row.egress_country) }}
+            {% match row.egress_country %}
+            {% when Some with (country) %}{{ country }}
+            {% when None %}<span class="muted">–</span>
+            {% endmatch %}
+            {% if let Some(colo) = row.cf_colo %}
+            <span class="muted mono" title="{{ self.t(" px.cf_colo") }}">· {{ colo }}</span>
+            {% endif %}
+            {% else %}
+            <span class="muted">–</span>
+            {% endif %}
+          </td>
+          <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{
+              self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
+            {% if row.detached %}<span class="badge neutral" title="{{ self.t(" px.detached_title") }}">{{
+              self.t("px.detached_label") }}</span>{% endif %}
+          </td>
+          <td class="num small">
+            {% match row.latency_ms %}
+            {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+            {% when None %}<span class="muted">–</span>
+            {% endmatch %}
+          </td>
+          <td class="num small">
+            {% match row.speed_mbps %}
+            {% when Some with (mbps) %}{{ self.speed_cell(mbps) }} {{ self.t("px.speed_unit") }}
+            {% when None %}<span class="muted">–</span>
+            {% endmatch %}
+          </td>
+          <td class="small mono">{{ self.checks_cell(row) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
   {% endif %}
 
   {# Keyset navigation: the links carry the cursor of the page they
-     lead to, so the browser seeks straight to it. #}
+  lead to, so the browser seeks straight to it. #}
   {% if nav_first.is_some() || nav_prev.is_some() || nav_next.is_some() %}
-    <nav class="pagination" aria-label="{{ self.t("px.pagination_label") }}">
-      {% if let Some(link) = nav_first %}<a class="page" href="{{ link }}">{{ self.t("px.page_first") }}</a>{% endif %}
-      {% if let Some(link) = nav_prev %}<a class="page" href="{{ link }}" rel="prev">{{ self.t("px.page_prev") }}</a>{% endif %}
-      {% if let Some(link) = nav_next %}<a class="page" href="{{ link }}" rel="next">{{ self.t("px.page_next") }}</a>{% endif %}
-    </nav>
+  <nav class="pagination" aria-label="{{ self.t(" px.pagination_label") }}">
+    {% if let Some(link) = nav_first %}<a class="page" href="{{ link }}">{{ self.t("px.page_first") }}</a>{% endif %}
+    {% if let Some(link) = nav_prev %}<a class="page" href="{{ link }}" rel="prev">{{ self.t("px.page_prev") }}</a>{%
+    endif %}
+    {% if let Some(link) = nav_next %}<a class="page" href="{{ link }}" rel="next">{{ self.t("px.page_next") }}</a>{%
+    endif %}
+  </nav>
   {% endif %}
 </div>
 {% endblock %}

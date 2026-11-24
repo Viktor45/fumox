@@ -328,6 +328,15 @@ speed_enabled = true
 # caches never serve the second measurement). HTTPS: the request goes through
 # the proxy under test
 speed_url = "https://speed.cloudflare.com/__down?measId={rand}&bytes={bytes}"
+# Абсолютный http(s)-URL резервного файла с обязательной подстановкой
+# {bytes}. Если основной запрос вернул HTTP-ошибку (включая 429) или провалился
+# на connect/TLS/чтении, probe повторяет замер через этот адрес. Пустая строка
+# выключает резерв. HTTPS: запрос идет через проверяемый прокси.
+# An absolute http(s) backup URL with the required {bytes} placeholder. If the
+# primary request returns an HTTP error (including 429) or fails on
+# connect/TLS/read, the probe retries through this URL. An empty string disables
+# the backup. HTTPS: the request goes through the proxy under test
+speed_backup_url = "https://speed.edgecompute.app/down?bytes={bytes}"
 # Диапазон: 1..=1073741824 байт (форма). Размер файла для {bytes}: 25 МиБ по
 # умолчанию; потолок времени делает меньший размер вопросом точности, не
 # зависания.

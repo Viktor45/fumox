@@ -162,11 +162,12 @@ async fn fetch_trace_inner(
 /// yields the honest partial number. Nothing is written to disk.
 pub async fn measure_speed(
     speed_url: &str,
+    backup_speed_url: &str,
     bytes: u64,
     ceiling: Duration,
     proxy_addr: &str,
 ) -> Attempt {
-    match measure_speed_inner(speed_url, bytes, ceiling, proxy_addr).await {
+    match measure_speed_inner(speed_url, backup_speed_url, bytes, ceiling, proxy_addr).await {
         Ok(mbps) => Attempt {
             ok: true,
             value: AttemptValue::Speed(mbps),
@@ -182,6 +183,7 @@ pub async fn measure_speed(
 
 async fn measure_speed_inner(
     speed_url: &str,
+    backup_speed_url: &str,
     bytes: u64,
     ceiling: Duration,
     proxy_addr: &str,
@@ -189,10 +191,27 @@ async fn measure_speed_inner(
     if bytes == 0 {
         return Err("speed payload size is 0".to_string());
     }
-    let url = expand_speed_url(speed_url, bytes);
-    // The outer timeout covers connect + TLS + response head; the
-    // per-chunk deadline below covers the body
     let client = build_client(ceiling + CONNECT_GRACE, proxy_addr)?;
+    match measure_speed_once(&client, speed_url, bytes, ceiling).await {
+        Ok(mbps) => Ok(mbps),
+        Err(error) if !backup_speed_url.is_empty() => {
+            measure_speed_once(&client, backup_speed_url, bytes, ceiling)
+                .await
+                .map_err(|backup_error| {
+                    format!("{error}; backup speed request failed: {backup_error}")
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn measure_speed_once(
+    client: &reqwest::Client,
+    speed_url: &str,
+    bytes: u64,
+    ceiling: Duration,
+) -> Result<f64, String> {
+    let url = expand_speed_url(speed_url, bytes);
     let started = Instant::now();
     let response = client
         .get(&url)
@@ -243,6 +262,7 @@ async fn measure_speed_inner(
 /// the mixed listener as HTTP CONNECT, which only `all` routes through
 /// the proxy.
 fn build_client(timeout: Duration, proxy_addr: &str) -> Result<reqwest::Client, String> {
+    fumox_core::tls::install_crypto_provider();
     let proxy = reqwest::Proxy::all(format!("http://{proxy_addr}"))
         .map_err(|error| format!("speed listener address is invalid: {error}"))?;
     reqwest::Client::builder()
@@ -257,6 +277,8 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::routing::get;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A mock mixed listener is just an HTTP server in these tests: the
     /// real listener adds SOCKS5 next to HTTP CONNECT, but the probe only
@@ -359,6 +381,7 @@ mod tests {
         let addr = spawn_mock(app).await;
         let attempt = measure_speed(
             &format!("http://{addr}/__down?measId={{rand}}&bytes={{bytes}}"),
+            "",
             PAYLOAD as u64,
             Duration::from_secs(10),
             &addr,
@@ -395,6 +418,7 @@ mod tests {
         let addr = spawn_mock(app).await;
         let attempt = measure_speed(
             &format!("http://{addr}/__down?bytes={{bytes}}"),
+            "",
             1024 * 1024,
             Duration::from_millis(500),
             &addr,
@@ -421,6 +445,7 @@ mod tests {
         let addr = spawn_mock(app).await;
         let attempt = measure_speed(
             &format!("http://{addr}/__down?bytes={{bytes}}"),
+            "",
             1024,
             Duration::from_secs(5),
             &addr,
@@ -428,6 +453,185 @@ mod tests {
         .await;
         assert!(!attempt.ok);
         assert!(attempt.error.unwrap().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_primary_uses_the_backup_endpoint() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let primary_calls = Arc::clone(&calls);
+        let app = Router::new()
+            .route(
+                "/__down",
+                get(move || {
+                    let calls = Arc::clone(&primary_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    }
+                }),
+            )
+            .route(
+                "/down",
+                get(|| async { axum::body::Body::from(vec![0u8; 4096]) }),
+            );
+        let addr = spawn_mock(app).await;
+        let attempt = measure_speed(
+            &format!("http://{addr}/__down?bytes={{bytes}}"),
+            &format!("http://{addr}/down?bytes={{bytes}}"),
+            4096,
+            Duration::from_secs(5),
+            &addr,
+        )
+        .await;
+
+        assert!(attempt.ok, "{:?}", attempt.error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let AttemptValue::Speed(mbps) = attempt.value else {
+            panic!("expected a speed value");
+        };
+        assert!(mbps > 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_failure_uses_the_backup_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let app = Router::new().route(
+            "/down",
+            get(|| async { axum::body::Body::from(vec![0u8; 4096]) }),
+        );
+        let addr = spawn_mock(app).await;
+        let attempt = measure_speed(
+            &format!("http://{unavailable}/__down?bytes={{bytes}}"),
+            &format!("http://{addr}/down?bytes={{bytes}}"),
+            4096,
+            Duration::from_secs(5),
+            &addr,
+        )
+        .await;
+
+        assert!(attempt.ok, "{:?}", attempt.error);
+        let AttemptValue::Speed(mbps) = attempt.value else {
+            panic!("expected a speed value");
+        };
+        assert!(mbps > 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_broken_primary_download_uses_the_backup_endpoint() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&primary_calls);
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup = Arc::clone(&backup_calls);
+        let app = Router::new()
+            .route(
+                "/__down",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let stream = futures_util::stream::iter([
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0u8; 1024])),
+                            Err(std::io::Error::other("primary stream broke")),
+                        ]);
+                        axum::body::Body::from_stream(stream)
+                    }
+                }),
+            )
+            .route(
+                "/down",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&backup);
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::body::Body::from(vec![0u8; 4096])
+                    }
+                }),
+            );
+        let addr = spawn_mock(app).await;
+        let attempt = measure_speed(
+            &format!("http://{addr}/__down?bytes={{bytes}}"),
+            &format!("http://{addr}/down?bytes={{bytes}}"),
+            4096,
+            Duration::from_secs(5),
+            &addr,
+        )
+        .await;
+
+        assert!(attempt.ok, "{:?}", attempt.error);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+        let AttemptValue::Speed(mbps) = attempt.value else {
+            panic!("expected a speed value");
+        };
+        assert!(mbps > 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_partial_primary_result_does_not_use_the_backup_endpoint() {
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup = Arc::clone(&backup_calls);
+        let app = Router::new()
+            .route(
+                "/__down",
+                get(|| async {
+                    let chunk = futures_util::stream::once(async {
+                        Ok::<axum::body::Bytes, std::convert::Infallible>(axum::body::Bytes::from(
+                            vec![0u8; 32 * 1024],
+                        ))
+                    })
+                    .chain(futures_util::stream::pending());
+                    axum::body::Body::from_stream(chunk)
+                }),
+            )
+            .route(
+                "/down",
+                get(move || {
+                    let calls = Arc::clone(&backup);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    }
+                }),
+            );
+        let addr = spawn_mock(app).await;
+        let attempt = measure_speed(
+            &format!("http://{addr}/__down?bytes={{bytes}}"),
+            &format!("http://{addr}/down?bytes={{bytes}}"),
+            1024 * 1024,
+            Duration::from_millis(100),
+            &addr,
+        )
+        .await;
+
+        assert!(attempt.ok, "{:?}", attempt.error);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+        let AttemptValue::Speed(mbps) = attempt.value else {
+            panic!("expected a speed value");
+        };
+        assert!(mbps > 0.0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_backup_keeps_the_primary_failure() {
+        let app = Router::new().route(
+            "/__down",
+            get(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let addr = spawn_mock(app).await;
+        let attempt = measure_speed(
+            &format!("http://{addr}/__down?bytes={{bytes}}"),
+            "",
+            1024,
+            Duration::from_secs(5),
+            &addr,
+        )
+        .await;
+
+        assert!(!attempt.ok);
+        assert!(attempt.error.unwrap().contains("429"));
     }
 
     /// The template expansion: `{bytes}` to the size, `{rand}` fresh per

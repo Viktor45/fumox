@@ -2302,6 +2302,7 @@ async fn measure_speed_and_trace(ctx: &Context, id: i64, port: u16, budget: Cycl
     let ceiling = Duration::from_secs(network_cfg.speed_time_ceiling_secs.max(1));
     match speed::measure_speed(
         &network_cfg.speed_url,
+        &network_cfg.speed_backup_url,
         network_cfg.speed_bytes,
         ceiling,
         &proxy_addr,

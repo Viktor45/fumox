@@ -959,6 +959,13 @@ static SETTINGS: &[Setting] = &[
         apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
     },
     Setting {
+        key: "network.speed_backup_url",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.speed_backup_url.clone());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
         key: "network.speed_bytes",
         render: |c, key, raw| {
             raw.insert(key.into(), c.network.speed_bytes.to_string());

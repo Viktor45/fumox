@@ -818,6 +818,8 @@
 "set.network_speed_enabled_hint" = "a proxy that passed the delay check downloads a payload through itself without writing to disk; a failed measurement never changes a status"
 "set.network_speed_url" = "Speed test payload URL"
 "set.network_speed_url_hint" = "absolute https URL; {bytes} is the payload size in bytes, {rand} is a fresh random number per request"
+"set.network_speed_backup_url" = "Backup speed test payload URL"
+"set.network_speed_backup_url_hint" = "absolute https URL with {bytes}; tried after a primary HTTP error (including 429) or connect/TLS/read failure; empty = no backup"
 "set.network_speed_bytes" = "Payload size for the speed test (bytes)"
 "set.network_speed_ceiling" = "Time ceiling of one download (sec)"
 "set.network_speed_concurrency" = "Parallel measurements"

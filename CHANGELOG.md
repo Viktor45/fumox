@@ -57,10 +57,13 @@ are stamped when the batch is published.
   filters and Egress/Speed columns; the **Probe** screen summarizes the
   measurements (how many proxies carry one, how many went stale, how many
   speed/trace attempts failed over 24 h).
-- Eight `[network]` settings for all of the above in `config/app.toml` and on
-  the settings edit page: `speed_enabled`, `speed_url`, `speed_bytes`,
-  `speed_time_ceiling_secs`, `speed_concurrency`, `speed_interval_secs`,
-  `trace_url`, `trace_fields`.
+- Speed measurements retry `[network].speed_backup_url` after a primary HTTP
+  error (including 429) or connect/TLS/read failure. The backup defaults to
+  `https://speed.edgecompute.app/down?bytes={bytes}`; an empty value disables it.
+- Nine `[network]` settings for all of the above in `config/app.toml` and on
+  the settings edit page: `speed_enabled`, `speed_url`, `speed_backup_url`,
+  `speed_bytes`, `speed_time_ceiling_secs`, `speed_concurrency`,
+  `speed_interval_secs`, `trace_url`, `trace_fields`.
 - `[database].allow_checksum_repair` (default `false`): the opt-in that
   lets the boot re-stamp an applied migration whose file changed since it
   was applied. Off by default, and the refusal is explicit: a mismatch

@@ -817,6 +817,8 @@
 "set.network_speed_enabled_hint" = "прокси, прошедший delay-проверку, скачивает через себя файл без записи на диск; провал замера статус не меняет"
 "set.network_speed_url" = "URL файла для замера скорости"
 "set.network_speed_url_hint" = "абсолютный https-URL; {bytes}: размер файла в байтах, {rand}: свежее случайное число на каждый запрос"
+"set.network_speed_backup_url" = "Резервный URL файла для замера скорости"
+"set.network_speed_backup_url_hint" = "абсолютный https-URL с {bytes}; используется после HTTP-ошибки основного запроса (включая 429) или сбоя connect/TLS/чтения; пусто = без резерва"
 "set.network_speed_bytes" = "Размер файла для замера (байт)"
 "set.network_speed_ceiling" = "Потолок времени одного скачивания (сек)"
 "set.network_speed_concurrency" = "Параллельных замеров"

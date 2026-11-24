@@ -135,6 +135,7 @@
         <tr><th>{{ self.t("set.network_dns_timeout") }}</th><td>{{ state.network_dns_timeout() }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("set.network_speed_enabled") }}</th><td>{{ self.bool_label(&state.network.speed_enabled) }}</td></tr>
         <tr><th>{{ self.t("set.network_speed_url") }}</th><td class="mono small">{{ state.network.speed_url }}</td></tr>
+        <tr><th>{{ self.t("set.network_speed_backup_url") }}</th><td class="mono small">{{ state.network.speed_backup_url }}</td></tr>
         <tr><th>{{ self.t("set.network_speed_bytes") }}</th><td>{{ self.fmt_bytes(&state.network.speed_bytes) }}</td></tr>
         <tr><th>{{ self.t("set.network_speed_ceiling") }}</th><td>{{ state.network.speed_time_ceiling_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("set.network_speed_concurrency") }}</th><td>{{ state.network.speed_concurrency }}</td></tr>

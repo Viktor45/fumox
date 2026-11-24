@@ -227,37 +227,50 @@ impl AppConfig {
         Ok(())
     }
 
-    /// The speed payload and the trace answer are fetched *through* the
-    /// proxy under test, so both URLs must be absolute `http(s)` — the same
-    /// bar the `test_url` deserializer enforces for the delay check. The
-    /// speed URL must carry `{bytes}` (the download needs a size to chase);
-    /// a `{…}` token that is neither `bytes` nor `rand` would be sent to the
-    /// endpoint literally, which is a typo worth refusing at load.
+    /// The speed payload URLs and the trace answer are fetched *through* the
+    /// proxy under test, so every URL must be absolute `http(s)` — the same
+    /// bar the `test_url` deserializer enforces for the delay check. Both
+    /// speed URLs must carry `{bytes}` (the download needs a size to chase);
+    /// a `{…}` token that is neither `bytes` nor `rand` would be sent to
+    /// the endpoint literally, which is a typo worth refusing at load.
     fn validate_network_speed_trace(&self) -> crate::Result<()> {
-        let speed = &self.network.speed_url;
-        if !speed.contains("{bytes}") {
-            return Err(crate::Error::Config(
-                "network.speed_url must contain the {bytes} placeholder: \
-                 without it the download has no size to chase"
-                    .to_string(),
-            ));
-        }
-        for token in speed.match_indices('{').filter_map(|(start, _)| {
-            let rest = &speed[start + 1..];
-            let end = rest.find('}')?;
-            Some(&rest[..end])
-        }) {
-            if token != "bytes" && token != "rand" {
+        for (key, speed) in [
+            ("network.speed_url", self.network.speed_url.as_str()),
+            (
+                "network.speed_backup_url",
+                self.network.speed_backup_url.as_str(),
+            ),
+        ] {
+            if !speed.is_empty() && !speed.contains("{bytes}") {
                 return Err(crate::Error::Config(format!(
-                    "network.speed_url has an unknown placeholder {{{token}}}: \
-                     only {{bytes}} and {{rand}} are expanded"
+                    "{key} must contain the {{bytes}} placeholder: \
+                     without it the download has no size to chase"
                 )));
+            }
+            for token in speed.match_indices('{').filter_map(|(start, _)| {
+                let rest = &speed[start + 1..];
+                let end = rest.find('}')?;
+                Some(&rest[..end])
+            }) {
+                if token != "bytes" && token != "rand" {
+                    return Err(crate::Error::Config(format!(
+                        "{key} has an unknown placeholder {{{token}}}: \
+                         only {{bytes}} and {{rand}} are expanded"
+                    )));
+                }
             }
         }
         for (key, url) in [
-            ("network.speed_url", speed.as_str()),
+            ("network.speed_url", self.network.speed_url.as_str()),
+            (
+                "network.speed_backup_url",
+                self.network.speed_backup_url.as_str(),
+            ),
             ("network.trace_url", self.network.trace_url.as_str()),
         ] {
+            if key == "network.speed_backup_url" && url.is_empty() {
+                continue;
+            }
             let Ok(parsed) = url::Url::parse(url) else {
                 return Err(crate::Error::Config(format!(
                     "{key} is not a valid URL: {url}"
@@ -1122,6 +1135,13 @@ pub struct NetworkConfig {
     /// `http(s)` URL.
     #[serde(default = "defaults::network_speed_url")]
     pub speed_url: String,
+    /// Fallback payload URL: tried only when the primary fails (a 429 or
+    /// any connect/read/TLS error). Same placeholder contract as
+    /// [`speed_url`][NetworkConfig::speed_url]. An empty string disables
+    /// the fallback, so an operator who wants a single endpoint can have
+    /// one without a dummy second URL.
+    #[serde(default = "defaults::network_speed_backup_url")]
+    pub speed_backup_url: String,
     /// The payload size in bytes the speed test asks for (the `{bytes}`
     /// placeholder). Measured with a time ceiling, so an undersized payload
     /// only costs a fast proxy some resolution, not the test itself.
@@ -1169,6 +1189,7 @@ impl Default for NetworkConfig {
             dns_timeout_secs: defaults::network_dns_timeout_secs(),
             speed_enabled: defaults::network_speed_enabled(),
             speed_url: defaults::network_speed_url(),
+            speed_backup_url: defaults::network_speed_backup_url(),
             speed_bytes: defaults::network_speed_bytes(),
             speed_time_ceiling_secs: defaults::network_speed_time_ceiling_secs(),
             speed_concurrency: defaults::network_speed_concurrency(),
@@ -2256,6 +2277,12 @@ mod defaults {
     pub fn network_speed_url() -> String {
         "https://speed.cloudflare.com/__down?measId={rand}&bytes={bytes}".to_string()
     }
+    /// Backup speed endpoint, tried when the primary answers 429 or the
+    /// request fails before a complete payload. An empty string disables it.
+    /// Same HTTPS bar as the primary: the download rides the proxy under test.
+    pub fn network_speed_backup_url() -> String {
+        "https://speed.edgecompute.app/down?bytes={bytes}".to_string()
+    }
     /// 25 MiB: with the 15 s ceiling this measures anything from ~14 Mbit/s
     /// up to link speed, and a partial download still yields a number.
     pub const fn network_speed_bytes() -> u64 {
@@ -2386,6 +2413,43 @@ mod tests {
         // priority-probe queue is enabled
         assert!(cfg.ingest.drop_gate);
         assert_eq!(cfg.ingest.refresh_check_limit, 50);
+    }
+
+    #[test]
+    fn the_backup_speed_url_defaults_to_edgecompute_and_can_be_disabled() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.network.speed_backup_url,
+            "https://speed.edgecompute.app/down?bytes={bytes}"
+        );
+        config
+            .validate()
+            .expect("the default backup URL must validate");
+
+        let mut config = AppConfig::default();
+        config.network.speed_backup_url.clear();
+        config
+            .validate()
+            .expect("an empty backup URL must disable the fallback");
+    }
+
+    #[test]
+    fn the_backup_speed_url_obeys_the_primary_url_contract() {
+        for backup_url in [
+            "https://speed.edgecompute.app/down",
+            "https://speed.edgecompute.app/down?bytes={bytez}",
+            "file:///tmp/payload?bytes={bytes}",
+            "https://",
+            "not a URL",
+        ] {
+            let mut config = AppConfig::default();
+            config.network.speed_backup_url = backup_url.to_string();
+            let error = config.validate().expect_err("invalid backup URL refused");
+            assert!(
+                error.to_string().contains("network.speed_backup_url"),
+                "{backup_url}: {error}"
+            );
+        }
     }
 
     #[test]

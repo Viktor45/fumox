@@ -40,15 +40,14 @@ otherwise have no accessible name at all (no label, no aria-label),
 so it announces itself with the ASN name; the op title beside it
 says which operation the field belongs to. -#}
 {% macro asn_controls() %}
-<input type="text" name="asn" placeholder="24940 / AS24940" autocomplete="off" aria-label="{{ self.t(" ped.target_asn")
-  }}" title="{{ self.t(" px.asn_input_hint") }}">
+<input type="text" name="asn" placeholder="24940 / AS24940" autocomplete="off" aria-label="{{ self.t("ped.target_asn") }}" title="{{ self.t("px.asn_input_hint") }}">
 {% endmacro %}
 
 {#- The control the country-based operations take. The placeholder
 option is not a control name, so the select carries the country
 name as its accessible label. -#}
 {% macro country_controls() %}
-<select name="country" aria-label="{{ self.t(" common.country") }}">
+<select name="country" aria-label="{{ self.t("common.country") }}">
   <option value="">{{ self.t("common.choose") }}</option>
   {% for country in countries %}
   <option value="{{ country }}">{{ country }}</option>
@@ -61,7 +60,7 @@ name as its accessible label. -#}
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
   <div class="row-actions">
     {% if detached_count > 0 %}
-    <span class="badge neutral" title="{{ self.t(" px.detached_title") }}">{{ self.t("px.detached_label") }}: {{
+    <span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}: {{
       detached_count }}</span>
     {% endif %}
     <button class="btn" type="button" data-dialog-open="revive-dialog" aria-haspopup="dialog"
@@ -247,7 +246,7 @@ instead of waiting for the random sample. #}
     </div>
     <div class="field">
       <label for="px-q">{{ self.t("common.search") }}</label>
-      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t(" px.search_placeholder") }}">
+      <input type="text" id="px-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
     </div>
   </div>
   <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
@@ -273,10 +272,10 @@ instead of waiting for the random sample. #}
           <th>{{ self.t("common.protocol") }}</th>
           <th>{{ self.t("px.address") }}</th>
           <th>{{ self.t("common.country") }}</th>
-          <th title="{{ self.t(" px.egress_hint") }}">{{ self.t("px.egress_label") }}</th>
+          <th title="{{ self.t("px.egress_hint") }}">{{ self.t("px.egress_label") }}</th>
           <th>{{ self.t("common.name") }}</th>
           <th>{{ self.t("common.latency") }}</th>
-          <th title="{{ self.t(" px.speed_filter_label") }}">{{ self.t("px.speed") }}</th>
+          <th title="{{ self.t("px.speed_filter_label") }}">{{ self.t("px.speed") }}</th>
           <th>{{ self.t("px.checks_label") }}</th>
         </tr>
       </thead>
@@ -284,21 +283,16 @@ instead of waiting for the random sample. #}
         {% for row in rows %}
         <tr>
           <td>
-            {% if row.status == "alive" %}<span class="badge alive status-icon" title="{{ self.t(" common.status_alive")
-              }}" aria-label="{{ self.t(" common.status_alive") }}">🟢</span>
-            {% else if row.status == "ready" %}<span class="badge ready status-icon" title="{{ self.t("
-              common.status_ready") }}" aria-label="{{ self.t(" common.status_ready") }}">🟣</span>
-            {% else if row.status == "quarantine" %}<span class="badge quarantine status-icon" title="{{ self.t("
-              common.status_quarantine") }}" aria-label="{{ self.t(" common.status_quarantine") }}">🟠</span>
-            {% else if row.status == "removed" %}<span class="badge removed status-icon" title="{{ self.t("
-              common.status_removed") }}" aria-label="{{ self.t(" common.status_removed") }}">🔴</span>
-            {% else %}<span class="badge unknown status-icon" title="{{ self.t(" common.status_unknown") }}"
-              aria-label="{{ self.t(" common.status_unknown") }}">⚪</span>{% endif %}
+            {% if row.status == "alive" %}<span class="badge alive status-icon" title="{{ self.t("common.status_alive") }}" aria-label="{{ self.t("common.status_alive") }}">🟢</span>
+            {% else if row.status == "ready" %}<span class="badge ready status-icon" title="{{ self.t("common.status_ready") }}" aria-label="{{ self.t("common.status_ready") }}">🟣</span>
+            {% else if row.status == "quarantine" %}<span class="badge quarantine status-icon" title="{{ self.t("common.status_quarantine") }}" aria-label="{{ self.t("common.status_quarantine") }}">🟠</span>
+            {% else if row.status == "removed" %}<span class="badge removed status-icon" title="{{ self.t("common.status_removed") }}" aria-label="{{ self.t("common.status_removed") }}">🔴</span>
+            {% else %}<span class="badge unknown status-icon" title="{{ self.t("common.status_unknown") }}"
+              aria-label="{{ self.t("common.status_unknown") }}">⚪</span>{% endif %}
           </td>
           <td class="mono small">
             {{ row.scheme }}
-            {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t(" px.unprobeable_title")
-              }}">{{ self.t("px.unprobeable") }}</span>{% endif %}
+            {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">{{ self.t("px.unprobeable") }}</span>{% endif %}
           </td>
           <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
           <td class="small">{{ self.flag(row.geo_country) }}
@@ -318,7 +312,7 @@ instead of waiting for the random sample. #}
             {% when None %}<span class="muted">–</span>
             {% endmatch %}
             {% if let Some(colo) = row.cf_colo %}
-            <span class="muted mono" title="{{ self.t(" px.cf_colo") }}">· {{ colo }}</span>
+            <span class="muted mono" title="{{ self.t("px.cf_colo") }}">· {{ colo }}</span>
             {% endif %}
             {% else %}
             <span class="muted">–</span>
@@ -326,7 +320,7 @@ instead of waiting for the random sample. #}
           </td>
           <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{
               self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
-            {% if row.detached %}<span class="badge neutral" title="{{ self.t(" px.detached_title") }}">{{
+            {% if row.detached %}<span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{
               self.t("px.detached_label") }}</span>{% endif %}
           </td>
           <td class="num small">
@@ -352,7 +346,7 @@ instead of waiting for the random sample. #}
   {# Keyset navigation: the links carry the cursor of the page they
   lead to, so the browser seeks straight to it. #}
   {% if nav_first.is_some() || nav_prev.is_some() || nav_next.is_some() %}
-  <nav class="pagination" aria-label="{{ self.t(" px.pagination_label") }}">
+  <nav class="pagination" aria-label="{{ self.t("px.pagination_label") }}">
     {% if let Some(link) = nav_first %}<a class="page" href="{{ link }}">{{ self.t("px.page_first") }}</a>{% endif %}
     {% if let Some(link) = nav_prev %}<a class="page" href="{{ link }}" rel="prev">{{ self.t("px.page_prev") }}</a>{%
     endif %}

@@ -2156,7 +2156,7 @@ mod tests {
         let no_direct = |_: &Path, _: &[u8]| -> std::io::Result<()> {
             Err(std::io::Error::other("direct write refused"))
         };
-        let err = tracing::subscriber::with_default(subscriber, || {
+        let err = crate::logging::capture::with_default(subscriber, || {
             commit_save(&path, &tmp, updated, no_rename, no_direct).unwrap_err()
         });
 
@@ -2407,7 +2407,7 @@ mod tests {
         let always_fails = |_: &Path| -> std::io::Result<()> {
             Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem))
         };
-        let result = tracing::subscriber::with_default(subscriber, || {
+        let result = crate::logging::capture::with_default(subscriber, || {
             is_writable_with(&path, &always_fails, &create_probe_file)
         });
 

@@ -1136,7 +1136,7 @@ mod unix_db_tests {
             .with_max_level(tracing::Level::WARN)
             .with_writer(make_writer)
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        crate::logging::capture::with_default(subscriber, || {
             restrict_file_permissions(&path).unwrap();
         });
         let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();

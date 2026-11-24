@@ -59,7 +59,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(make_writer)
             .finish();
-        tracing::subscriber::with_default(subscriber, event);
+        capture::with_default(subscriber, event);
         !captured.lock().unwrap().is_empty()
     }
 
@@ -119,6 +119,42 @@ mod tests {
             assert!(!event_passes(filter(), event_sqlx_query_debug));
         }
     }
+
+    #[test]
+    fn capture_observes_a_callsite_first_seen_on_another_thread() {
+        fn emit_marker() {
+            tracing::info!(
+                target: "fumox_core::logging::tests::parallel_capture",
+                "capture marker"
+            );
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let capture = std::thread::spawn(move || {
+            let (make_writer, captured) = capture::captured_writer();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(make_writer)
+                .finish();
+            capture::with_default(subscriber, || {
+                ready_tx.send(()).unwrap();
+                seen_rx.recv().unwrap();
+                emit_marker();
+            });
+            String::from_utf8(captured.lock().unwrap().clone()).unwrap()
+        });
+
+        ready_rx.recv().unwrap();
+        emit_marker();
+        seen_tx.send(()).unwrap();
+        let log = capture.join().unwrap();
+        assert!(
+            log.contains("capture marker"),
+            "the capture must observe a callsite registered on another thread: {log}"
+        );
+    }
 }
 
 /// Test-support helper for the log-capturing test modules of the workspace
@@ -127,6 +163,35 @@ mod tests {
 /// `cfg(test)` never applies (same reasoning as [`crate::db::tempdir_lite`]).
 pub mod capture {
     use std::sync::{Arc, Mutex};
+
+    /// Run with a scoped subscriber without parallel tests starving tracing's
+    /// process-global callsite cache.
+    pub fn with_default<S, T>(subscriber: S, run: impl FnOnce() -> T) -> T
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        stabilize_callsite_interests();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        })
+    }
+
+    fn stabilize_callsite_interests() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Two live registrars keep first-seen callsites on subscriber-less
+            // threads from being cached as disabled for the whole process.
+            for _ in 0..2 {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(std::io::sink)
+                    .finish();
+                std::mem::forget(tracing::Dispatch::new(subscriber));
+            }
+        });
+    }
 
     /// The writer half of [`captured_writer`]: appends everything the
     /// subscriber emits into the shared buffer.

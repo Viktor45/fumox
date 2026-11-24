@@ -1531,7 +1531,7 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(buffer.clone())
                 .finish();
-            tracing::subscriber::with_default(subscriber, run);
+            crate::logging::capture::with_default(subscriber, run);
             String::from_utf8(buffer.0.lock().unwrap().clone()).expect("log output is utf-8")
         };
 

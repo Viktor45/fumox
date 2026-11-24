@@ -1284,11 +1284,14 @@ live inside the stack network and are never published.
    other configured fields (`[network].trace_fields`) into `trace_json`. A
    failed trace skips the speed measurement of that cycle: a tunnel that
    cannot carry a few hundred bytes will not carry the payload either.
-2. **Speed** (`[network].speed_url`): a streamed download without writing to
-   disk, the payload size `[network].speed_bytes` (25 MiB), the time ceiling
+2. **Speed** (`[network].speed_url` and `[network].speed_backup_url`): a
+   streamed download without writing to disk, the payload size
+   `[network].speed_bytes` (25 MiB), the time ceiling
    `[network].speed_time_ceiling_secs` (15 s) — an interrupted download yields
    an honest number over the bytes actually read. The result is Mbps in the
-   `speed_mbps` column with the `speed_at` stamp.
+   `speed_mbps` column with the `speed_at` stamp. If the primary endpoint
+   answers with an HTTP error (including 429) or the request fails at
+   connect/TLS/read, the probe retries once against the backup URL.
 
 **The measurement is a metric only**: a failure writes its reason to the
 probe history (the *Speed test* / *Cloudflare trace* kinds on the proxy

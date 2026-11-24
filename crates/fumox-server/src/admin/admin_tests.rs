@@ -4394,6 +4394,109 @@ async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing()
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// The card's *Measure speed now* button clears the row's measurement
+/// stamps and answers with a toast; the status machine is untouched.
+#[tokio::test]
+async fn measure_speed_button_forces_due_without_touching_status() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let id = insert_proxy_seeded(
+        &pool,
+        "fp-measure-speed",
+        "vless",
+        "n",
+        "ready",
+        ProxySeed::default(),
+    )
+    .await
+    .unwrap();
+    // The T2 lane only offers rows linked to a source
+    sqlx::query(
+        "INSERT INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
+             VALUES ('src-measure', 'm', 'http://m.example/list', 1, 3600, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'src-measure', 1)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE proxies SET speed_at = 100, last_t2_checked_at = 100 WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let session = format!("{cookie}; fumox_lang=en");
+    let mut req = request(
+        "POST",
+        &format!("/admin/proxies/{id}/measure-speed"),
+        &format!("_csrf={csrf}"),
+        Some(&session),
+    );
+    req.headers_mut()
+        .insert("HX-Request", "true".parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let trigger = response
+        .headers()
+        .get("HX-Trigger")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let en = state.locales.resolve("en");
+    assert!(
+        percent_decode(&trigger).contains(en.t("px.speed_request_toast")),
+        "{trigger}"
+    );
+
+    let (status, speed_at, t2_at): (String, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT status, speed_at, last_t2_checked_at FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "ready");
+    assert_eq!(speed_at, None);
+    assert_eq!(t2_at, None);
+
+    // A row no T2 lane can reach is refused with an error toast and left alone
+    let orphan = insert_proxy_seeded(
+        &pool,
+        "fp-measure-orphan",
+        "vless",
+        "n",
+        "quarantine",
+        ProxySeed::default(),
+    )
+    .await
+    .unwrap();
+    let mut req = request(
+        "POST",
+        &format!("/admin/proxies/{orphan}/measure-speed"),
+        &format!("_csrf={csrf}"),
+        Some(&session),
+    );
+    req.headers_mut()
+        .insert("HX-Request", "true".parse().unwrap());
+    let response = app.oneshot(req).await.unwrap();
+    let trigger = response
+        .headers()
+        .get("HX-Trigger")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(trigger.contains("\"level\": \"error\""), "{trigger}");
+    assert!(percent_decode(&trigger).contains(en.t("px.speed_request_unreachable")));
+}
+
 #[tokio::test]
 async fn cleanup_htmx_answer_carries_toast_and_fragment() {
     let (_dir, state) = test_state(1000).await;

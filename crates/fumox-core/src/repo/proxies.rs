@@ -2139,6 +2139,45 @@ pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
     Ok(true)
 }
 
+/// Manual speed re-measurement from the proxy card: make the row the first
+/// candidate of the next T2 batch and force it into the speed plan.
+///
+/// The probe's due test is `speed_at IS NULL OR age >= speed_interval_secs`
+/// ([`crate::repo::proxies::ProxyRow::speed_at`] in the probe's `speed_plan`),
+/// and the T2 batch is ordered by `last_t2_checked_at ASC`. Clearing both
+/// stamps is therefore enough: the row cannot be skipped as fresh and it is
+/// drawn ahead of the rest of the batch. The status machine is untouched —
+/// a measurement is a metric, never a verdict, so a ready proxy stays ready
+/// while the measurement runs. A later failed attempt leaves the row due
+/// (`speed_at` keeps its NULL) and the next cycle retries it.
+///
+/// Only a row the T2 lane can actually tunnel is accepted: a live/ready
+/// status, a T2-supported scheme and a source link. A refused row is left
+/// untouched and the function reports `false`.
+pub async fn request_speed_measurement(pool: &DbPool, id: i64) -> crate::Result<bool> {
+    let now = crate::models::now_ts();
+    let supported = vec!["?"; T2_SCHEMES.len()].join(", ");
+    let sql = format!(
+        "UPDATE proxies SET
+             speed_at = NULL,
+             last_t2_checked_at = NULL,
+             updated_at = ?
+         WHERE id = ?
+           AND status IN ('alive', 'ready')
+           AND scheme IN ({supported})
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)"
+    );
+    // sqlx 0.9 SqlSafeStr: the format! only expands a `?` placeholder
+    // list, every value flows through .bind()
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(now)
+        .bind(id);
+    for scheme in T2_SCHEMES {
+        query = query.bind(scheme);
+    }
+    Ok(query.execute(pool).await?.rows_affected() > 0)
+}
+
 /// Opt-in revival (`[ingest].removed_as_unknown`): a `removed` proxy the
 /// feed still carries returns to the probe state machine. Every row whose
 /// fingerprint is listed, whose status is `removed` and that is still

@@ -1387,6 +1387,40 @@ pub async fn proxy_reset(
     )
 }
 
+/// Manual "measure speed now": make the row the first candidate of the
+/// next T2 batch and force it into the speed plan by clearing its
+/// measurement stamps. The status is not touched — a measurement is a
+/// metric, never a verdict.
+pub async fn proxy_measure_speed(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    match proxies::request_speed_measurement(&state.pool, id).await {
+        Ok(true) => {
+            tracing::info!(proxy_id = id, "proxy speed measurement requested");
+            action_response(
+                is_htmx(&headers),
+                &format!("/admin/proxies/{id}"),
+                String::new(),
+                lang.t("px.speed_request_toast"),
+            )
+        }
+        Ok(false) => match proxies::get_by_id(&state.pool, id).await {
+            Ok(Some(_)) => action_response_err(
+                is_htmx(&headers),
+                &format!("/admin/proxies/{id}"),
+                String::new(),
+                lang.t("px.speed_request_unreachable"),
+            ),
+            Ok(None) => not_found(lang, "err.proxy_not_found"),
+            Err(err) => server_error(&state, &headers, "proxies.measure_speed", &err),
+        },
+        Err(err) => server_error(&state, &headers, "proxies.measure_speed", &err),
+    }
+}
+
 /// Refresh the geo facts of one proxy (Country, City, ASN, every GeoLite2
 /// database in `[geo].db_dir` contributes, the same merge the pipeline
 /// resolver uses) and store them.

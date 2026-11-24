@@ -1646,6 +1646,74 @@ async fn reset_status_clears_the_t2_block_and_queues_a_check() {
     assert_eq!(pending, 1);
 }
 
+/// The manual *Measure speed now* action makes the row due and puts it
+/// first in the T2 queue without touching the status machine: a metric is
+/// never a verdict, so a ready proxy stays ready while it is measured.
+#[tokio::test]
+async fn request_speed_measurement_forces_due_and_first_in_queue() {
+    let (_dir, pool) = temp_pool().await;
+    let id = seed_proxy(&pool, "vless", "measure.example.com").await;
+    set_status_columns_by_id(&pool, id, "ready", &[]).await;
+    sqlx::query("UPDATE proxies SET speed_at = 100, speed_mbps = 42.0, last_t2_checked_at = 500 WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(request_speed_measurement(&pool, id).await.unwrap());
+
+    let row = get_by_id(&pool, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status, "ready",
+        "a measurement must not change the status"
+    );
+    assert_eq!(row.speed_at, None, "the row must be due for measurement");
+    let t2_at: Option<i64> =
+        sqlx::query_scalar("SELECT last_t2_checked_at FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        t2_at, None,
+        "a NULL T2 stamp sorts first in select_t2_candidates"
+    );
+    // The forced row is drawn ahead of another ready proxy that was
+    // checked earlier but still has a fresh measurement
+    let other = seed_proxy(&pool, "vless", "fresh.example.com").await;
+    set_status_columns_by_id(&pool, other, "ready", &[]).await;
+    sqlx::query("UPDATE proxies SET speed_at = 100, last_t2_checked_at = 100 WHERE id = ?")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first = select_t2_candidates(&pool, 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].id, id,
+        "the forced row must lead the next T2 batch"
+    );
+
+    // A quarantine row is not T2-measurable and is left untouched
+    let quarantined = seed_proxy(&pool, "vless", "quarantine-measure.example.com").await;
+    set_status_columns_by_id(&pool, quarantined, "quarantine", &[]).await;
+    sqlx::query("UPDATE proxies SET speed_at = 100, last_t2_checked_at = 100 WHERE id = ?")
+        .bind(quarantined)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!request_speed_measurement(&pool, quarantined).await.unwrap());
+    let unchanged = get_by_id(&pool, quarantined).await.unwrap().unwrap();
+    let unchanged_t2: Option<i64> =
+        sqlx::query_scalar("SELECT last_t2_checked_at FROM proxies WHERE id = ?")
+            .bind(quarantined)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unchanged.speed_at, Some(100));
+    assert_eq!(unchanged_t2, Some(100));
+}
+
 /// A reset that no probe lane can pick up must not report success and
 /// must not half-apply: a reconcile-retired row (retired and unlinked in
 /// one transaction) and a row whose scheme no lane judges (`tuic`,

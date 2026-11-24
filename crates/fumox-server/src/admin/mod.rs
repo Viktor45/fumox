@@ -652,6 +652,10 @@ fn proxy_routes() -> axum::Router<AdminState> {
         .route("/proxies/{id}", get(handlers::proxy_detail))
         .route("/proxies/{id}/reset", post(handlers::proxy_reset))
         .route(
+            "/proxies/{id}/measure-speed",
+            post(handlers::proxy_measure_speed),
+        )
+        .route(
             "/proxies/{id}/probe-history",
             get(handlers::proxy_probe_history),
         )

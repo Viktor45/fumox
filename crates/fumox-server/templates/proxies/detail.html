@@ -32,6 +32,14 @@
         the profile card: a network failure (htmx:sendError) never
         reaches the server, so no toast comes back and the action would
         stay silent without a slot of its own. -#}
+    <form method="post" action="/admin/proxies/{{ proxy.id }}/measure-speed"
+          hx-post="/admin/proxies/{{ proxy.id }}/measure-speed" hx-target="#speed-request-status" hx-swap="innerHTML"
+          hx-disabled-elt="find button" data-error-target="speed-request-error">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn" type="submit">{{ self.t("px.measure_speed") }}</button>
+    </form>
+    <span id="speed-request-status" aria-live="polite" aria-atomic="true"></span>
+    <span id="speed-request-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
     <form method="post" action="/admin/proxies/{{ proxy.id }}/reset"
           hx-post="/admin/proxies/{{ proxy.id }}/reset" hx-target="#status-badge" hx-swap="outerHTML"
           data-error-target="reset-error">

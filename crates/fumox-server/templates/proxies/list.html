@@ -276,7 +276,7 @@
             {#- Egress facts: the derived egress country with
                 the Cloudflare datacenter; `–` until the first trace and
                 the server backfill both wrote their facts. -#}
-            <td class="small">
+            <td class="small egress">
               {% if row.egress_country.is_some() || row.cf_colo.is_some() %}
                 {{ self.flag(row.egress_country) }}
                 {% match row.egress_country %}

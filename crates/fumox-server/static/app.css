@@ -455,6 +455,9 @@ table.data td.mono.cell-wrap { white-space: normal; }
    leave a dead gap before the counter column. */
 table.data.failures td.cell-wrap { max-width: none; }
 table.data td.addr { overflow-wrap: anywhere; white-space: normal; }
+/* The Egress cell carries a country flag/code and a CF datacenter on one
+   line; a squeezed table must scroll, not split "SFO" or "US" mid-token. */
+table.data td.egress { white-space: nowrap; }
 /* Probe quarantine queue: the address is an atomic inline box; under
    width pressure it drops to its own line whole instead of splitting
    "9.9.9.9:" / "8388" at the <wbr>. A box wider than the cell (long

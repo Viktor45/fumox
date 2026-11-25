@@ -181,8 +181,8 @@ check sends it back to `alive` (see
 
 Three ways to run Fumox. **Docker Compose is the recommended path**: one
 command gives you the server, the probe daemon and the meow-rs kernel wired
-together. On Podman instead of Docker? The same stack deploys as a
-systemd-managed podman pod via quadlet units (see
+together. On Podman, the same files work with `podman-compose`, or the stack
+deploys as a systemd-managed podman pod via quadlet units (see
 [`docker/README.md`](./docker/README.md)).
 
 ### Option A – Docker Compose (recommended)
@@ -201,6 +201,13 @@ cp .env.example .env
 
 docker compose up -d          # prebuilt images from GHCR, the fastest path
 docker compose up -d --build  # ...or build server + the meow wrapper from source
+```
+
+With `podman-compose`, use the same files:
+
+```bash
+podman-compose up -d
+podman-compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 The first command pulls the published images, pinned by digest: compose takes
@@ -1132,7 +1139,7 @@ deduplicate by fingerprint". `"version": 1` is required.
     { "match": "server1\\.tr$", "replace": "invalid.tr", "target": "host" },
     { "match": "^123$", "replace": "456", "target": "port" }
   ],
-  "geo": { "enabled": true, "template": "{flag} {country} · {name} · {speed} Mbps" },
+  "geo": { "enabled": true, "template": "{flag} {egress_flag} {loc} · {speed} · {asn} {egress_asn} · {colo}" },
   "health": { "exclude_statuses": ["quarantine", "removed"] },
   "dedup": { "by": "fingerprint" },
   "sort": { "by": "speed", "desc": false },
@@ -1146,7 +1153,7 @@ deduplicate by fingerprint". `"version": 1` is required.
 | `filter` | Keep/drop protocols, trace facts and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `colo` / `exclude_colo`: lists of Cloudflare datacenter codes (case-insensitive) matched against the stored trace fact; `loc` / `exclude_loc`: lists of datacenter countries; `warp`: a list of `on` / `off` / `plus` states (a proxy with another state or no fact is dropped); `egress_countries` / `egress_asns`: an allowlist over the egress geo the server derived from the egress IP — a proxy without the fact is dropped (confirmed facts only); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`; a row that carries none is resolved once at serving time, but only when an ASN rule is actually in play (an ASN filter or an ASN drop rule): only a host that genuinely cannot be resolved stays unknown — the allowlist drops it, an exclude list keeps it (both `"24940"` and `"AS24940"` spellings work). A pipeline without an ASN rule resolves nothing at serving time: the ingest and the geo backfill fill the number in; `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle |
 | `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`, `asn`); an `asn` rule takes no `match`/`flags` and instead requires a non-empty per-rule `asns` list (`"24940"` and `"AS24940"` both work) matched against the proxy's resolved AS number; rules are OR-ed; default `[]` |
 | `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` default, `host`, `port`, `param:KEY`); default `[]` |
-| `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
+| `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {egress_flag} {loc} · {speed} · {asn} {egress_asn} · {colo}"`; placeholders in [section 11](#11-geo-enrichment))   |
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`; the accepted values are the five statuses: `unknown`, `alive`, `ready`, `quarantine`, `removed`            |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
 | `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` \| `speed` (null latencies, unknown countries and unmeasured rows go last; for `speed` the default order is fastest first, `desc` reverses it); `desc`: default `false`                               |
@@ -1305,7 +1312,7 @@ Where this is useful — the [pipeline](#9-the-processing-pipeline): the
 `speed.min_mbps` threshold with its measurement age, the
 `colo`/`loc`/`warp`/`egress_countries`/`egress_asns` filters, the
 `sort.by = "speed"` ordering and the `{speed}` `{colo}` `{loc}` `{warp}`
-`{egress_country}` `{egress_asn}` name placeholders ([section
+`{egress_flag}` `{egress_country}` `{egress_asn}` name placeholders ([section
 11](#11-geo-enrichment)). In the admin panel the measurements are summarized
 on the **Probe** screen, the facts of one proxy live on its card, and the
 filters over the measurement and the egress country are in the *Proxies*
@@ -1653,7 +1660,7 @@ profile and no City database aborts the start with a message naming the
 state and the directory.
 
 **Name templates.** The `geo.template` pipeline setting (default
-`"{flag} {country} · {name}"`) supports these placeholders; all of them
+`"{flag} {egress_flag} {loc} · {speed} · {asn} {egress_asn} · {colo}"`) supports these placeholders; all of them
 work in one template at the same time, each drawing on its own database:
 
 | Placeholder | Meaning                               | Data source              |
@@ -1668,21 +1675,23 @@ work in one template at the same time, each drawing on its own database:
 | `{colo}`    | The Cloudflare datacenter from the trace (`FRA`) | Probe trace facts |
 | `{loc}`     | The datacenter country from the trace (`DE`) | Probe trace facts |
 | `{warp}`    | The WARP state from the trace (`on`/`off`/`plus`) | Probe trace facts |
+| `{egress_flag}` | The flag emoji of the egress IP's country | Server egress geo |
 | `{egress_country}` | The ISO code of the egress IP's country | Server egress geo |
 | `{egress_asn}`     | The egress IP's AS number, rendered as `AS12345` | Server egress geo |
 
 A placeholder with no data behind it collapses to nothing: extra whitespace
 and dangling separators are cleaned up, so `"{flag} {country} {city} · {name}"`
-still looks right when the city is unknown. The name is left completely
-untouched only when there is no geo data at all. DNS and geo lookups are
-cached (hosts repeat a lot): a name that did not resolve is cached for ten
-minutes only, a host the databases do not know for the same six hours as a
-known one.
+still looks right when the city is unknown. DNS and geo lookups are cached
+(hosts repeat a lot): a name that did not resolve is cached for ten minutes
+only, a host the databases do not know for the same six hours as a known one.
 
 An unknown placeholder is refused where the template is saved: the panel and
 the config loader both reject it, so a typo cannot turn into a literal
-`{foo}` in every proxy name. A template without `{name}` gets the original
-name appended, and an empty template renders the name alone.
+`{foo}` in every proxy name. `{name}` inserts the original display name
+exactly where it appears; it is never appended automatically. A template
+without `{name}` uses only its literal text and available facts, even when
+no geo or trace facts exist, so an all-missing template can render an empty
+name. Pipeline validation rejects empty templates.
 
 **Stored geo facts.** The country, city and ASN resolved for each proxy are
 persisted to the database at ingest time (and a background pass at startup
@@ -1703,9 +1712,9 @@ leaves from, the one Cloudflare sees in the probe's trace request ([section
 (`egress_country`, `egress_asn`, `egress_asn_org`) are derived by the server
 in a background pass over the same GeoLite2 databases, with the same
 six-hour retry window for unresolvable addresses and the same never-erase
-semantics. The egress filters and the `{egress_country}`/`{egress_asn}`
-placeholders run on these facts; they stay empty until the first trace
-request wrote an `egress_ip`.
+semantics. The egress filters and the `{egress_flag}`/`{egress_country}`/
+`{egress_asn}` placeholders run on these facts; they stay empty until the first
+trace request wrote an `egress_ip`.
 
 ## 12. Data, backups, retention
 

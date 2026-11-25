@@ -32,9 +32,10 @@ cargo run -p fumox-server   # сервер подписок + админка (ht
 cargo run -p fumox-probe    # демон проверки живучести прокси
 ```
 
-Используете Podman вместо Docker? [`docker/README.ru.md`](./docker/README.ru.md)
-разворачивает тот же стек как podman-под под управлением systemd (quadlet-юниты
-или kube-play манифест).
+Используете Podman вместо Docker? Запустите `podman-compose up -d` с теми же
+Compose-файлами или разверните стек как podman-под под управлением systemd
+(quadlet-юниты или kube-play манифест) по инструкции
+[`docker/README.ru.md`](./docker/README.ru.md).
 
 Конфигурация: [`config/app.toml`](./config/app.toml); все ключи имеют
 дефолты, переопределение через окружение: `FUMOX_SECTION__KEY`

@@ -1830,7 +1830,7 @@ mod tests {
         s.protocols = vec!["ss".into()];
         s.forbid_insecure = true; // default, not emitted
         s.geo_set = true;
-        s.geo_template = "{flag} {country} · {name}".into(); // default, not emitted
+        s.geo_template = DEFAULT_GEO_TEMPLATE.into(); // default, not emitted
         s.rename = vec![
             RenameRow::default(), // empty, skipped
             RenameRow {
@@ -2498,7 +2498,7 @@ mod tests {
             "version": 1,
             "filter": {},
             "rename": [],
-            "geo": { "enabled": true, "template": "{flag} {country} · {name}" },
+            "geo": { "enabled": true, "template": DEFAULT_GEO_TEMPLATE },
             "health": { "exclude_statuses": ["quarantine", "removed"] },
             "sort": { "by": "source" }
         });
@@ -2529,7 +2529,7 @@ mod tests {
     fn ingest_hides_the_default_template_inside_a_set_section() {
         let json = json!({
             "version": 1,
-            "geo": { "enabled": false, "template": "{flag} {country} · {name}" }
+            "geo": { "enabled": false, "template": DEFAULT_GEO_TEMPLATE }
         });
         let Ingest::Builder(s) = BuilderState::ingest(Some(&json)) else {
             panic!("must parse");
@@ -2934,6 +2934,11 @@ mod tests {
             "{speed}",
             "the trace placeholders follow the geo ones"
         );
+        assert_eq!(
+            Schema::geo_placeholders()[10..],
+            ["{egress_flag}", "{egress_country}", "{egress_asn}"],
+            "the egress placeholders stay grouped in the hint"
+        );
     }
 
     #[test]
@@ -3134,6 +3139,10 @@ mod tests {
         // notice a copy change)
         assert!(html.contains(r#"value="builder""#), "{html}");
         assert!(html.contains("ped_filter_protocols"), "{html}");
+        assert!(
+            html.contains(&format!(r#"placeholder="{}""#, DEFAULT_GEO_TEMPLATE)),
+            "{html}"
+        );
         // The preview area and its live title come from the same catalog
         // the fragment renders
         assert!(html.contains(lang.t("ped.preview_title")), "{html}");

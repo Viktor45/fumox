@@ -43,8 +43,9 @@ are stamped when the batch is published.
   `filter.warp` (`on`/`off`/`plus`), `filter.egress_countries` and
   `filter.egress_asns` over the trace facts (allowlists drop unmeasured
   proxies: confirmed facts only), `sort.by = "speed"` (fastest first by
-  default), and six new name placeholders: `{speed}`, `{colo}`, `{loc}`,
-  `{warp}`, `{egress_country}`, `{egress_asn}`.
+  default), and seven new name placeholders: `{speed}`, `{colo}`, `{loc}`,
+  `{warp}`, `{egress_flag}`, `{egress_country}`, `{egress_asn}`.
+  `{egress_flag}` renders the flag of the server-resolved egress country.
 - Egress geo backfill: the server derives `egress_country`/`egress_asn`/
   `egress_asn_org` from `egress_ip` through the GeoLite2 databases in a
   background pass (at startup and on the six-hour geo-backfill tick) — the
@@ -170,6 +171,9 @@ are stamped when the batch is published.
 
 ### Fixed
 
+- `docker-compose.yml` declares its `default` network explicitly, so
+  `podman-compose` no longer fails with `RuntimeError: missing networks:
+  default`. The network remains project-scoped.
 - Trace requests (and speed measurements) through ready proxies no longer
   fail with `trace request failed: error sending request`. meow-rs v0.29.0
   treats `listeners:` as a startup snapshot that `PUT /configs` cannot
@@ -199,6 +203,13 @@ are stamped when the batch is published.
 
 ### Changed
 
+- The default geo name template is now
+  `"{flag} {egress_flag} {loc} · {speed} · {asn} {egress_asn} · {colo}"`.
+  `{name}` is explicit-only: the original display name is inserted exactly
+  where it appears and is no longer appended when it is absent, including
+  when no geo or trace facts exist. **Migration:** add `{name}` to a custom
+  template if the old node name must remain visible; saved templates that
+  omit it now render without that name.
 - The image is Alpine-based now: the builder and the runtime move from
   Debian (glibc) to Alpine (musl), the shipped binaries are statically
   linked, and the runtime carries no C library for the app itself. The

@@ -32,9 +32,9 @@ cargo run -p fumox-server   # subscription server + admin panel (http://127.0.0.
 cargo run -p fumox-probe    # proxy health-check daemon
 ```
 
-On Podman instead of Docker? [`docker/README.md`](./docker/README.md) deploys
-the same stack as a systemd-managed podman pod (quadlet units or a kube-play
-manifest).
+On Podman instead of Docker? Run `podman-compose up -d` with the same Compose
+files, or use [`docker/README.md`](./docker/README.md) to deploy the stack as a
+systemd-managed podman pod (quadlet units or a kube-play manifest).
 
 Configuration lives in [`config/app.toml`](./config/app.toml); every key has a
 default and can be overridden through the environment: `FUMOX_SECTION__KEY`

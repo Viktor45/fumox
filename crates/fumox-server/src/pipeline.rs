@@ -24,7 +24,8 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 
-pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
+pub(crate) const DEFAULT_GEO_TEMPLATE: &str =
+    "{flag} {egress_flag} {loc} · {speed} · {asn} {egress_asn} · {colo}";
 
 /// Raw pipeline configuration, deserialized with `deny_unknown_fields` at
 /// every level. `pub(crate)` so the admin pipeline editor's ingest parses
@@ -1806,8 +1807,8 @@ pub struct Candidate {
 
 impl Candidate {
     /// The trace facts in the shape the name template renders: the value
-    /// of the `{speed}`, `{colo}`, `{loc}`, `{warp}`, `{egress_country}`
-    /// and `{egress_asn}` placeholders.
+    /// of the `{speed}`, `{colo}`, `{loc}`, `{warp}`, `{egress_flag}`,
+    /// `{egress_country}` and `{egress_asn}` placeholders.
     fn trace_facts(&self) -> fumox_core::geo::TraceNameFacts {
         fumox_core::geo::TraceNameFacts {
             speed_mbps: self.speed_mbps,
@@ -3047,6 +3048,24 @@ mod tests {
         )];
         let out = compiled.apply(candidates, &inactive_geo()).await;
         assert_eq!(out[0].entry.params[0].value, "chrome");
+    }
+
+    #[tokio::test]
+    async fn default_geo_template_uses_facts_without_appending_the_original_name() {
+        assert_eq!(
+            DEFAULT_GEO_TEMPLATE,
+            "{flag} {egress_flag} {loc} · {speed} · {asn} {egress_asn} · {colo}"
+        );
+        let compiled = CompiledPipeline::from_json(None).unwrap();
+        let geo = FakeGeo {
+            asn: Some(15169),
+            active: true,
+            ..Default::default()
+        };
+        let out = compiled
+            .apply_per_source(vec![candidate_with_asn("Node-1", Some(15169))], &geo)
+            .await;
+        assert_eq!(out[0].entry.name, "AS15169");
     }
 
     #[tokio::test]

@@ -7,6 +7,10 @@
 #   docker compose up -d        # pull the pinned images and start
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 #                               # ...or build server + meow locally from source
+#   podman-compose up -d
+#   podman-compose -f docker-compose.yml -f docker-compose.build.yml \
+#     up -d --build
+#                               # the same files work with podman-compose
 #   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
 #
 # Images are pinned by digest (`image:` lines): one immutable manifest, so a
@@ -261,6 +265,8 @@ volumes:
   fumox-meow:
 
 networks:
+  # podman-compose does not infer default when other networks are declared.
+  default: {}
   # Probe ↔ kernel traffic only; the server is not on it, so it cannot
   # reach the controller at all
   meow:
